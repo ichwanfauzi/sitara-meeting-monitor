@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1
+ARG SITARA_WORKER_IMAGE=sitara_clamav_worker_implementation-evidence-scanner:latest
+FROM ${SITARA_WORKER_IMAGE}
+
+USER root
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "pytest>=9.0.3,<10.0" "httpx>=0.28,<1.0"
+
+USER 10001:10001
