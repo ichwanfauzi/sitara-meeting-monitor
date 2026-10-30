@@ -6,7 +6,7 @@ This workspace uses the clean starter as the technical foundation and preserves 
 
 ## Original starter guide
 
-SITARA (Sistem Informasi Tindak Lanjut dan Arsip Rapat) — clean starter repository for a new implementation.
+SITARA (sistem informasi tindak lanjut rapat dan arahan) — clean starter repository for a new implementation.
    
 > **Important:** This is not a production-ready system. Backend foundations include Argon2id authentication, server-side sessions, login/logout/current-user endpoints, role-scoped Rapim metadata APIs, and Secretariat-only meeting transitions. Minutes revisions are append-only; a Secretariat review names the exact active revision, and `LIVE` to `FINAL` rejects a missing, invalid, or stale review. The first-stage revision editor is available for permitted users; real-time collaboration, decisions, task workflows, private document storage, and production deployment remain incomplete.
 
