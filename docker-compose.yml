@@ -6,8 +6,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-sitara_dev}
       POSTGRES_USER: ${POSTGRES_USER:-sitara_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - sitara_postgres_data:/var/lib/postgresql/data
     healthcheck:

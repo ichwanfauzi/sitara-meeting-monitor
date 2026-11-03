@@ -75,12 +75,79 @@ def test_compose_defines_integrated_runtime_services(
     assert {"postgres", "api", "clamav", "evidence-scanner"} <= services.keys()
 
 
-def test_postgres_host_port_and_data_volume_are_preserved(
+def test_postgres_has_no_host_port_and_preserves_data_volume(
     compose_config: dict[str, Any],
 ) -> None:
     postgres = compose_config["services"]["postgres"]
 
-    assert any(port["published"] == "5432" and port["target"] == 5432 for port in postgres["ports"])
+    assert not postgres.get("ports")
+    assert any(
+        volume["source"] == "sitara_postgres_data"
+        and volume["target"] == "/var/lib/postgresql/data"
+        for volume in postgres["volumes"]
+    )
+
+
+@pytest.fixture(scope="module")
+def dev_compose_config() -> dict[str, Any]:
+    if shutil.which("docker") is None:
+        pytest.skip("Docker Compose v2 is required to validate the development override")
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in _COMPOSE_ENV_KEYS and not key.upper().startswith("COMPOSE_")
+    }
+    environment["POSTGRES_PORT"] = "55432"
+    command = [
+        "docker",
+        "compose",
+        "--project-directory",
+        str(_REPOSITORY_ROOT),
+        "--file",
+        str(_REPOSITORY_ROOT / "docker-compose.yml"),
+        "--file",
+        str(_REPOSITORY_ROOT / "docker-compose.dev.yml"),
+        "--env-file",
+        str(_REPOSITORY_ROOT / ".env.example"),
+        "--project-name",
+        "sitara-dev-config-test",
+        "config",
+        "--format",
+        "json",
+    ]
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+    if result.returncode:
+        pytest.fail(
+            "docker compose development override config returned a non-zero exit code; "
+            "command output suppressed"
+        )
+    return json.loads(result.stdout)
+
+
+def test_dev_compose_publishes_postgres_on_loopback_only(
+    dev_compose_config: dict[str, Any],
+) -> None:
+    services = dev_compose_config["services"]
+    postgres = services["postgres"]
+    published_ports = postgres.get("ports", [])
+
+    assert len(published_ports) == 1
+    assert published_ports[0]["host_ip"] == "127.0.0.1"
+    assert published_ports[0]["published"] == "55432"
+    assert published_ports[0]["target"] == 5432
+    assert (
+        services["api"]["environment"]["DATABASE_URL"]
+        == (services["evidence-scanner"]["environment"]["DATABASE_URL"])
+    )
+    assert "@postgres:5432/" in services["api"]["environment"]["DATABASE_URL"]
+    assert set(services["postgres"]["networks"]) == {"api-db", "scanner-db"}
     assert any(
         volume["source"] == "sitara_postgres_data"
         and volume["target"] == "/var/lib/postgresql/data"
@@ -383,6 +450,8 @@ def e2e_compose_config() -> dict[str, Any]:
         str(_REPOSITORY_ROOT),
         "--file",
         str(_REPOSITORY_ROOT / "docker-compose.e2e.yml"),
+        "--env-file",
+        str(_REPOSITORY_ROOT / ".env.example"),
         "config",
         "--format",
         "json",
@@ -437,6 +506,7 @@ def test_e2e_compose_uses_owned_clamav_and_unique_images(
         "worker-db",
         "migration-db",
     }
+    assert not services["sitara-clamav-e2e-postgres"].get("ports")
 
     assert e2e_compose_config["networks"]["api-db"]["external"] is True
     assert e2e_compose_config["networks"]["worker-db"]["external"] is True

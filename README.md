@@ -30,12 +30,38 @@ SITARA (Sistem Informasi Tindak Lanjut dan Arsip Rapat) — clean starter reposi
 
 > `frontend/package-lock.json` is committed for reproducible installs. Use `npm ci` for local and CI setup; update the lockfile whenever `frontend/package.json` changes.
 
+### PostgreSQL connection profiles
+
+The main Compose configuration does not publish PostgreSQL to the host. Start
+the container stack with:
+
+```powershell
+docker compose up -d
+```
+
+The API and evidence scanner connect to PostgreSQL over their internal Compose
+networks using the service hostname `postgres` and port `5432`.
+
+For local development with the backend running directly on the host, opt in to
+the development-only override:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+```
+
+This publishes PostgreSQL only on `127.0.0.1`; `POSTGRES_PORT` selects that
+host-side development port. Host-run backend processes use `DATABASE_URL` with
+hostname `localhost`. If you change `POSTGRES_PORT` from its default of `5432`,
+also update the port in the host-run `DATABASE_URL` to match. Containerized API
+and worker processes use `DATABASE_URL_CONTAINER` with hostname `postgres`. Do
+not use the development override for production.
+
 1. Copy `.env.example` to `.env`. The values are local development placeholders only.
    Generate a private limiter key with `python -c "import secrets; print(secrets.token_urlsafe(32))"`
    and set `LOGIN_RATE_LIMIT_HMAC_KEY` in `.env`. Login returns `503` until this key is set.
 2. Start PostgreSQL:
    ```powershell
-   docker compose up -d postgres
+   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
    docker compose ps
    ```
 3. Backend setup from the repository root:

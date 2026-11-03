@@ -4,9 +4,19 @@ The main `docker-compose.yml` runs PostgreSQL, the FastAPI API, ClamAV, and one
 `evidence-scanner` process. The API and scanner use the same `DATABASE_URL` and
 private `sitara_action_item_evidence` named volume. The API mounts that volume
 read/write; the scanner mounts it read-only. The API is published on loopback
-only. ClamAV port 3310 is available on the Compose network and is not published
-to the host. Uploads are limited to 10 MiB per file and 11 MiB per multipart
-request; each file starts in quarantine as `PENDING`.
+only. PostgreSQL has no host port publication in the main Compose file;
+container services reach it at `postgres:5432` over internal networks. For
+host-run local development only, combine `docker-compose.yml` with
+`docker-compose.dev.yml` to bind the database port to `127.0.0.1`. Do not use
+that override in production. ClamAV port 3310 is available on the Compose
+network and is not published to the host. Uploads are limited to 10 MiB per
+file and 11 MiB per multipart request; each file starts in quarantine as
+`PENDING`.
+
+The Compose configuration retains local-development fallback credentials.
+Removing the host port publication does not make those credentials suitable
+for deployment; replace them through the approved secret process before any
+non-local runtime.
 
 Compose uses explicit isolated networks rather than the implicit default:
 API/PostgreSQL and worker/PostgreSQL use separate internal database networks;
@@ -309,9 +319,12 @@ HTTP E2E remains the latest successful end-to-end integration evidence.
   16 image. Main ClamAV remains healthy on
   `sitara-clamav:1.5.4-ubuntu24.04`, with its existing signature volume.
   API and worker remain absent; no disposable resources were created.
-- The Compose PostgreSQL port is published on all host interfaces at 5432.
-  This pre-existing exposure was not changed; restrict it to loopback or a
-  trusted network if this is not intended for the local development host.
+- At the time of this Stage 7.2 assessment, the Compose PostgreSQL port was
+  published on all host interfaces at 5432. Stage 7.13 removes that
+  publication from the main Compose configuration and provides an opt-in
+  loopback-only development override. This static configuration change does
+  not reconfigure already-running containers; any runtime change requires a
+  separately approved operation.
 - No `.env` was read or changed. No commit, push, database migration, or
   volume removal occurred. Existing unrelated dirty worktree changes remain.
 
@@ -351,18 +364,25 @@ and `git diff --check` passed.
 
 The main evidence volume `sitara_merged_workspace_sitara_action_item_evidence`
 is still absent. The API and scanner remain unstarted; live integration is
-**NOT VERIFIED**. PostgreSQL's existing host port is bound to all interfaces
-(`0.0.0.0` and `::`); this was not changed and should be restricted to loopback
-or a trusted network if broad host exposure is unintended. Keep the API/worker
-startup blocked until the migration is explicitly approved, the exact backup
-is retained and restore-tested, and evidence storage ownership/permissions
-are provisioned and verified. Do not scale the scanner above one replica.
+**NOT VERIFIED**. In the pre-remediation baseline assessed for Stage 7.3,
+PostgreSQL's host port was bound to all interfaces (`0.0.0.0` and `::`). Stage
+7.13 corrected the Compose source configuration: the main Compose file no
+longer publishes PostgreSQL to the host, and the opt-in development override
+binds it only to `127.0.0.1`. The API and evidence scanner continue to use the
+internal `postgres:5432` service connection. This source change does not
+reconfigure already-running containers, so their runtime exposure remains
+**NOT VERIFIED**. Keep the API/worker startup blocked until the migration is
+explicitly approved, the exact backup is retained and restore-tested, and
+evidence storage ownership/permissions are provisioned and verified. Do not
+scale the scanner above one replica.
 
 ## Local startup and one-time migration
 
 1. Copy `.env.example` to `.env` and set local development values. Keep
    `DATABASE_URL_CONTAINER` pointed at `postgres:5432` in this Compose project,
    and make its database, username, and password match the `POSTGRES_*` values.
+   The main container stack does not publish PostgreSQL; use the development
+   override only when a backend process runs directly on the host.
    Do not point this local migration procedure at a production database.
 2. Start the local database and scanner daemon and wait for their healthchecks:
 
