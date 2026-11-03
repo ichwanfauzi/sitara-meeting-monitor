@@ -1,6 +1,6 @@
 # Product Requirements Document (PRD) — SITARA
 
-**Produk:** SITARA — Sistem Informasi Tindak Lanjut dan Arsip Rapat  
+**Produk:** SITARA — Sistem Informasi Tindak Lanjut Rapat dan Arahan
 **Versi dokumen:** 1.0-draft  
 **Tanggal:** 14 Oktober 2026  
 **Status:** Draft untuk validasi pemilik proses  

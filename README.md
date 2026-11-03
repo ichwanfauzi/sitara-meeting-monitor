@@ -6,7 +6,7 @@ This workspace uses the clean starter as the technical foundation and preserves 
 
 ## Original starter guide
 
-SITARA (sistem informasi tindak lanjut rapat dan arahan) — clean starter repository for a new implementation.
+SITARA (Sistem Informasi Tindak Lanjut Rapat dan Arahan) — clean starter repository for a new implementation.
    
 > **Important:** This is not a production-ready system. Backend foundations include Argon2id authentication, server-side sessions, role-scoped Rapim APIs, structured minutes and Decision Brief drafts, plus Action Item APIs for assignments, progress, and evidence. File evidence uses private storage and a single ClamAV scanner worker in Docker Compose. The dashboard remains synthetic; complete Action Item frontend workflows, Decision Brief approval/finalization, production rollout, and backup/restore readiness remain incomplete.
 
