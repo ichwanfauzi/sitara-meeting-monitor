@@ -176,7 +176,7 @@ Layout desktop disarankan memiliki:
 
 Meskipun disebut live, satu notulis adalah satu-satunya editor selama sesi live. Pengguna lain yang berwenang mendapat tampilan baca. Perubahan harus disimpan secara andal; notifikasi perubahan dapat menggunakan polling atau mekanisme push setelah kebutuhan teknis diputuskan.
 
-Implementasi editor saat ini menampilkan field pembahasan dan putusan per agenda dan mengirim seluruh isi sebagai satu snapshot revisi. Snapshot teks versi lama tetap dapat dibaca; perpindahan ke format terstruktur tidak menetapkan teks lama ke agenda secara otomatis. Pengguna menyalin catatan ke agenda yang sesuai secara sadar. Putusan menyimpan teks, output yang diharapkan, target tanggal, dan penanda kebutuhan tindak lanjut; penetapan PIC, pembuatan tugas, dan workflow action item berada di tahap berikutnya. API notulensi belum menerima identitas PIC untuk putusan; pengiriman field itu ditolak sebagai input tambahan.
+Implementasi editor saat ini menampilkan field pembahasan dan putusan per agenda dan mengirim seluruh isi sebagai satu snapshot revisi. Snapshot teks versi lama tetap dapat dibaca; perpindahan ke format terstruktur tidak menetapkan teks lama ke agenda secara otomatis. Pengguna menyalin catatan ke agenda yang sesuai secara sadar. Putusan menyimpan teks, output yang diharapkan, target tanggal, dan penanda kebutuhan tindak lanjut. Backend Action Item memiliki API terpisah untuk pembuatan tugas, assignment, progres, dan bukti; workflow UI Action Item masih tahap berikutnya. API notulensi tetap tidak menerima identitas PIC untuk putusan; pengiriman field itu ditolak sebagai input tambahan.
 
 ### 7.5 Putusan dan detail action item
 

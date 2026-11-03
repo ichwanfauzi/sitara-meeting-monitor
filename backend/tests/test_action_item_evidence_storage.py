@@ -7,6 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 from app.services.action_item_evidence_storage import (
     MAX_EVIDENCE_FILE_BYTES,
+    EvidenceStorageError,
     detect_evidence_file_type,
     evidence_file_path,
     remove_evidence_file,
@@ -161,6 +162,24 @@ def test_private_storage_uses_opaque_key_and_supports_cleanup(tmp_path) -> None:
 
     remove_evidence_file(tmp_path / "private", storage_key)
     assert not stored_path.exists()
+
+
+def test_cleanup_refuses_symlinked_storage_root(tmp_path) -> None:
+    storage_root = tmp_path / "private"
+    storage_root.mkdir()
+    storage_key = "a" * 32
+    stored_path = storage_root / storage_key
+    stored_path.write_bytes(b"synthetic evidence")
+    symlinked_root = tmp_path / "private-link"
+    try:
+        symlinked_root.symlink_to(storage_root, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable in this environment: {error}")
+
+    with pytest.raises(EvidenceStorageError, match="symbolic links"):
+        remove_evidence_file(symlinked_root, storage_key)
+
+    assert stored_path.read_bytes() == b"synthetic evidence"
 
 
 def test_failed_private_file_creation_leaves_no_partial_file(

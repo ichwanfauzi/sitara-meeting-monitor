@@ -8,7 +8,7 @@ This workspace uses the clean starter as the technical foundation and preserves 
 
 SITARA (Sistem Informasi Tindak Lanjut dan Arsip Rapat) — clean starter repository for a new implementation.
    
-> **Important:** This is not a production-ready system. Backend foundations include Argon2id authentication, server-side sessions, login/logout/current-user endpoints, role-scoped Rapim metadata APIs, and Secretariat-only meeting transitions. Minutes revisions are append-only; a Secretariat review names the exact active revision, and `LIVE` to `FINAL` rejects a missing, invalid, or stale review. The first-stage revision editor is available for permitted users; real-time collaboration, decisions, task workflows, private document storage, and production deployment remain incomplete.
+> **Important:** This is not a production-ready system. Backend foundations include Argon2id authentication, server-side sessions, role-scoped Rapim APIs, structured minutes and Decision Brief drafts, plus Action Item APIs for assignments, progress, and evidence. File evidence uses private storage and a single ClamAV scanner worker in Docker Compose. The dashboard remains synthetic; complete Action Item frontend workflows, Decision Brief approval/finalization, production rollout, and backup/restore readiness remain incomplete.
 
 ## Stack
 
@@ -146,12 +146,13 @@ Read these before implementing a feature:
 - [`docs/PRD.md`](docs/PRD.md) — problem statement, actors, business flows, functional requirements, business rules, and acceptance criteria.
 - [`docs/system_design.md`](docs/system_design.md) — visual direction, color/typography tokens, role-aware navigation, UI components, page states, and document-export guidance.
 - [`docs/architecture.md`](docs/architecture.md) — stack, module boundaries, data model, auth/security, API conventions, deployment, and recovery.
+- [`docs/CLAMAV_EVIDENCE_SCANNING.md`](docs/CLAMAV_EVIDENCE_SCANNING.md) — private evidence scanning runtime, ClamAV image security decision, and operational verification.
 - [`docs/agents.md`](docs/agents.md) — detailed AI coding-agent workflow, tools, security, test, and reporting rules. The root [`AGENTS.md`](AGENTS.md) is the mandatory concise entrypoint.
 
 These are draft v1.0 documents. Review explicit open decisions in each document before implementing policy-sensitive behavior.
 
 ## Current scope
 
-Included: dashboard UI with clearly labeled synthetic data, FastAPI health and auth routes, role-scoped Rapim metadata API, identity/meeting/agenda/participant/versioned and structured minutes/review models, immutable Decision Brief draft versions and Alembic migrations, PostgreSQL-backed login rate limiting, tests, linter/type-check/test configuration, Docker PostgreSQL service, secret hook, and CI workflow.
+Included: dashboard UI with clearly labeled synthetic data; FastAPI health, auth, meeting, Decision Brief, and Action Item APIs; structured minutes and organization-scope foundations; source-bound tasks, assignments, progress, verification, and private evidence storage; one ClamAV evidence-scanner worker in Docker Compose; PostgreSQL-backed login rate limiting; tests and quality tooling; and CI workflow.
 
-Not included yet: account provisioning, complete authorization/RBAC, production migration rollout verification, real-time collaboration, Decision Brief review/approval/finalization, action item workflows, notifications, OCR, exports, final document templates, production Docker image, VPS deployment, and backup automation. The minutes editor loads agenda-bound discussions and decisions and appends complete immutable snapshots; legacy text revisions remain readable and are never auto-assigned to an agenda. Decision Brief drafts append immutable versions linked to the exact structured minutes revision and source decisions; stale state is derived at read time. Secretariat and leadership scoped to a meeting may create drafts, while PIC and Super Admin cannot read full minutes or briefs. During `LIVE`, only the designated notetaker may append a minutes revision. Super Admin also cannot use Secretariat review or lifecycle permissions.
+Not included yet: supported account and organization provisioning, complete production-wide authorization/RBAC, production migration rollout verification, real-time collaboration, Decision Brief review/approval/finalization, Action Item frontend workflows, notifications, OCR, exports, final document templates, production deployment, and backup/restore automation. The dashboard still displays synthetic data and is not connected to these APIs. Minutes revisions and Decision Brief drafts are immutable and revision-bound. PIC and Super Admin cannot read full minutes or briefs; during `LIVE`, only the designated notetaker may append a minutes revision. Super Admin also cannot use Secretariat review or lifecycle permissions.

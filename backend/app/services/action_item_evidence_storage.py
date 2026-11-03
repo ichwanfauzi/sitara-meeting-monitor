@@ -310,7 +310,7 @@ def remove_evidence_file(storage_root: Path, storage_key: str) -> None:
     try:
         if not storage_root.is_absolute():
             raise EvidenceStorageError("Evidence storage root must be an absolute path")
-            _reject_symlink_path_components(storage_root)
+        _reject_symlink_path_components(storage_root)
         root = storage_root.resolve(strict=True)
         path = root / storage_key
         if path.is_symlink() or path.parent != root:
