@@ -255,6 +255,8 @@ def _create_sqlite_guards() -> None:
         """
     )
     for operation in ("UPDATE", "DELETE"):
+        # The operation comes only from this fixed migration tuple.
+        # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
         op.execute(
             f"""
             CREATE TRIGGER trg_action_item_evidence_no_{operation.lower()}
@@ -309,6 +311,8 @@ def downgrade() -> None:
             "trg_action_item_evidence_no_delete",
             "trg_action_item_evidence_limit",
         ):
+            # The trigger name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER {trigger_name}")
 
     op.drop_index("ix_action_item_evidence_progress_time", table_name="action_item_evidence")

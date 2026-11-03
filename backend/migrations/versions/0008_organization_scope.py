@@ -141,6 +141,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     connection = op.get_bind()
     records = {
+        # The table name comes only from the fixed migration tuple below.
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         table_name: connection.execute(sa.text(f"SELECT count(*) FROM {table_name}")).scalar_one()
         for table_name in ("reporting_lines", "user_unit_memberships", "organization_units")
     }

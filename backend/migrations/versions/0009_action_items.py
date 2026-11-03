@@ -374,6 +374,8 @@ def downgrade() -> None:
     populated = [
         name
         for name in table_names
+        # The table name comes only from the fixed migration tuple above.
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         if connection.execute(sa.text(f"SELECT count(*) FROM {name}")).scalar_one()
     ]
     if populated:
@@ -412,6 +414,8 @@ def _create_integrity_guards() -> None:
             """
         )
         for table in ("progress_updates", "completion_verifications", "status_histories"):
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(
                 f"""
                 CREATE TRIGGER trg_{table}_append_only
@@ -631,6 +635,8 @@ def _create_integrity_guards() -> None:
             "completion_verifications",
             "status_histories",
         ):
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(
                 f"""
                 CREATE TRIGGER trg_{table}_no_truncate
@@ -640,6 +646,8 @@ def _create_integrity_guards() -> None:
             )
     elif dialect == "sqlite":
         for table in ("progress_updates", "completion_verifications", "status_histories"):
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(
                 f"""
                 CREATE TRIGGER trg_{table}_no_update
@@ -649,6 +657,8 @@ def _create_integrity_guards() -> None:
                 END
                 """
             )
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(
                 f"""
                 CREATE TRIGGER trg_{table}_no_delete
@@ -823,6 +833,8 @@ def _drop_integrity_guards() -> None:
             "completion_verifications",
             "status_histories",
         ):
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table}_no_truncate ON {table}")
         op.execute("DROP TRIGGER trg_status_histories_guard ON status_histories")
         op.execute("DROP TRIGGER trg_completion_verifications_report ON completion_verifications")
@@ -835,6 +847,8 @@ def _drop_integrity_guards() -> None:
         op.execute("DROP FUNCTION guard_assignment_history()")
         op.execute("DROP FUNCTION guard_action_item_write()")
         for table in ("progress_updates", "completion_verifications", "status_histories"):
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table}_append_only ON {table}")
         op.execute("DROP FUNCTION reject_action_item_history_mutation()")
     elif dialect == "sqlite":
@@ -848,7 +862,13 @@ def _drop_integrity_guards() -> None:
             "trg_action_items_update_guard",
             "trg_action_items_insert_guard",
         ):
+            # The trigger name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER {trigger}")
         for table in ("progress_updates", "completion_verifications", "status_histories"):
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table}_no_delete")
+            # The table name comes only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table}_no_update")

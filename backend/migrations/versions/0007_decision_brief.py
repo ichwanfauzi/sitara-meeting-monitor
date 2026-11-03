@@ -171,11 +171,19 @@ def _drop_immutability_guards() -> None:
     table_names = ("decision_brief_versions", "decision_brief_decisions")
     if dialect_name == "postgresql":
         for table_name in table_names:
+            # The identifiers come only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table_name}_no_truncate ON {table_name}")
+            # The identifiers come only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table_name}_append_only ON {table_name}")
     elif dialect_name == "sqlite":
         for table_name in table_names:
+            # The identifiers come only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table_name}_no_update")
+            # The identifiers come only from the fixed migration tuple above.
+            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
             op.execute(f"DROP TRIGGER trg_{table_name}_no_delete")
 
 
