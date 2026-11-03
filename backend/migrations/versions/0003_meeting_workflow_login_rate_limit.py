@@ -47,9 +47,7 @@ def upgrade() -> None:
         sa.Column("window_started_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("attempt_count", sa.Integer(), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint(
-            "attempt_count > 0", name="ck_login_rate_limit_attempt_count_positive"
-        ),
+        sa.CheckConstraint("attempt_count > 0", name="ck_login_rate_limit_attempt_count_positive"),
         sa.CheckConstraint(
             "expires_at > window_started_at", name="ck_login_rate_limit_window_order"
         ),

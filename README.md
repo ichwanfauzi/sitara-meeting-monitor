@@ -6,9 +6,9 @@ This workspace uses the clean starter as the technical foundation and preserves 
 
 ## Original starter guide
 
-SITARA (sistem informasi tindak lanjut rapat dan arahan) — clean starter repository for a new implementation.
+SITARA (Sistem Informasi Tindak Lanjut Rapat dan Arahan) — clean starter repository for a new implementation.
    
-> **Important:** This is not a production-ready system. Backend foundations include Argon2id authentication, server-side sessions, login/logout/current-user endpoints, role-scoped Rapim metadata APIs, and Secretariat-only meeting transitions. Minutes revisions are append-only; a Secretariat review names the exact active revision, and `LIVE` to `FINAL` rejects a missing, invalid, or stale review. The first-stage revision editor is available for permitted users; real-time collaboration, decisions, task workflows, private document storage, and production deployment remain incomplete.
+> **Important:** This is not a production-ready system. Backend foundations include Argon2id authentication, server-side sessions, role-scoped Rapim APIs, structured minutes and Decision Brief drafts, plus Action Item APIs for assignments, progress, and evidence. File evidence uses private storage and a single ClamAV scanner worker in Docker Compose. The dashboard remains synthetic; complete Action Item frontend workflows, Decision Brief approval/finalization, production rollout, and backup/restore readiness remain incomplete.
 
 ## Stack
 
@@ -30,12 +30,38 @@ SITARA (sistem informasi tindak lanjut rapat dan arahan) — clean starter repos
 
 > `frontend/package-lock.json` is committed for reproducible installs. Use `npm ci` for local and CI setup; update the lockfile whenever `frontend/package.json` changes.
 
+### PostgreSQL connection profiles
+
+The main Compose configuration does not publish PostgreSQL to the host. Start
+the container stack with:
+
+```powershell
+docker compose up -d
+```
+
+The API and evidence scanner connect to PostgreSQL over their internal Compose
+networks using the service hostname `postgres` and port `5432`.
+
+For local development with the backend running directly on the host, opt in to
+the development-only override:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+```
+
+This publishes PostgreSQL only on `127.0.0.1`; `POSTGRES_PORT` selects that
+host-side development port. Host-run backend processes use `DATABASE_URL` with
+hostname `localhost`. If you change `POSTGRES_PORT` from its default of `5432`,
+also update the port in the host-run `DATABASE_URL` to match. Containerized API
+and worker processes use `DATABASE_URL_CONTAINER` with hostname `postgres`. Do
+not use the development override for production.
+
 1. Copy `.env.example` to `.env`. The values are local development placeholders only.
    Generate a private limiter key with `python -c "import secrets; print(secrets.token_urlsafe(32))"`
    and set `LOGIN_RATE_LIMIT_HMAC_KEY` in `.env`. Login returns `503` until this key is set.
 2. Start PostgreSQL:
    ```powershell
-   docker compose up -d postgres
+   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
    docker compose ps
    ```
 3. Backend setup from the repository root:
@@ -146,12 +172,13 @@ Read these before implementing a feature:
 - [`docs/PRD.md`](docs/PRD.md) — problem statement, actors, business flows, functional requirements, business rules, and acceptance criteria.
 - [`docs/system_design.md`](docs/system_design.md) — visual direction, color/typography tokens, role-aware navigation, UI components, page states, and document-export guidance.
 - [`docs/architecture.md`](docs/architecture.md) — stack, module boundaries, data model, auth/security, API conventions, deployment, and recovery.
+- [`docs/CLAMAV_EVIDENCE_SCANNING.md`](docs/CLAMAV_EVIDENCE_SCANNING.md) — private evidence scanning runtime, ClamAV image security decision, and operational verification.
 - [`docs/agents.md`](docs/agents.md) — detailed AI coding-agent workflow, tools, security, test, and reporting rules. The root [`AGENTS.md`](AGENTS.md) is the mandatory concise entrypoint.
 
 These are draft v1.0 documents. Review explicit open decisions in each document before implementing policy-sensitive behavior.
 
 ## Current scope
 
-Included: dashboard UI with clearly labeled synthetic data, FastAPI health and auth routes, role-scoped Rapim metadata API, identity/meeting/agenda/participant/versioned and structured minutes/review models, immutable Decision Brief draft versions and Alembic migrations, PostgreSQL-backed login rate limiting, tests, linter/type-check/test configuration, Docker PostgreSQL service, secret hook, and CI workflow.
+Included: dashboard UI with clearly labeled synthetic data; FastAPI health, auth, meeting, Decision Brief, and Action Item APIs; structured minutes and organization-scope foundations; source-bound tasks, assignments, progress, verification, and private evidence storage; one ClamAV evidence-scanner worker in Docker Compose; PostgreSQL-backed login rate limiting; tests and quality tooling; and CI workflow.
 
-Not included yet: account provisioning, complete authorization/RBAC, production migration rollout verification, real-time collaboration, Decision Brief review/approval/finalization, action item workflows, notifications, OCR, exports, final document templates, production Docker image, VPS deployment, and backup automation. The minutes editor loads agenda-bound discussions and decisions and appends complete immutable snapshots; legacy text revisions remain readable and are never auto-assigned to an agenda. Decision Brief drafts append immutable versions linked to the exact structured minutes revision and source decisions; stale state is derived at read time. Secretariat and leadership scoped to a meeting may create drafts, while PIC and Super Admin cannot read full minutes or briefs. During `LIVE`, only the designated notetaker may append a minutes revision. Super Admin also cannot use Secretariat review or lifecycle permissions.
+Not included yet: supported account and organization provisioning, complete production-wide authorization/RBAC, production migration rollout verification, real-time collaboration, Decision Brief review/approval/finalization, Action Item frontend workflows, notifications, OCR, exports, final document templates, production deployment, and backup/restore automation. The dashboard still displays synthetic data and is not connected to these APIs. Minutes revisions and Decision Brief drafts are immutable and revision-bound. PIC and Super Admin cannot read full minutes or briefs; during `LIVE`, only the designated notetaker may append a minutes revision. Super Admin also cannot use Secretariat review or lifecycle permissions.

@@ -90,3 +90,79 @@ These helpers are authorization primitives, not Action Item endpoints. A future 
 - Root `AGENTS.md` is the tool-discoverable concise instruction entrypoint and links to `docs/agents.md`; a lower-case root `agents.md` is intentionally not created because Windows filesystems are commonly case-insensitive.
 - Important schema correction before implementation: product requirements allow one decision to generate multiple action items. The draft SQL currently marks `action_items.decision_id` as unique, so that constraint must be removed in the final ORM/Alembic schema.
 - The styling/PDF implementation details remain explicitly provisional where the starter does not yet have the associated dependencies or where official template fidelity needs a proof-of-concept.
+
+## ADR-011: ClamAV image uses vendor-patched Ubuntu packages
+
+**Decision (2026-10-30):** Build the ClamAV daemon image from the digest-pinned
+Ubuntu 24.04 base and the signed Ubuntu snapshot `20261030T000000Z`. Install
+Ubuntu's ClamAV 1.5.4 and FreshClam packages together with Ubuntu's fixed
+`libxml2 2.9.14+dfsg-1.3ubuntu3.10` package. Do not replace libxml2 alone or
+silence the CVE finding. Keep ClamAV as a separate non-root daemon, internal
+TCP port 3310, persistent signature volume, and one existing scanner worker.
+
+**Reason:** The official ClamAV Alpine 1.4.6/1.5.4 and Debian 13 1.4.6/1.5.4
+images still contain a Scout-reported CVE-2026-86140 package. Ubuntu's
+[security status](https://ubuntu.com/security/CVE-2026-86140) and
+[USN-8787-1](https://ubuntu.com/security/notices/USN-8787-1) confirm a
+distribution backport fixed Noble at `2.9.14+dfsg-1.3ubuntu3.9`. Ubuntu's
+ClamAV and libxml2 packages are built for the same ABI and retain
+`libxml2.so.2`; the final image was checked with `ldd`, ClamAV PING, FreshClam,
+signature-version equality, daemon outage recovery, EICAR, HTTP upload, and
+Docker Scout.
+
+**Reproducibility and impact:** `backend/Dockerfile.clamav` pins the Ubuntu
+base digest, package versions, and apt snapshot. No API, worker protocol,
+database schema, migration, worker replica, or evidence-volume path changes.
+The image's `clamav` UID/GID (100:101) matches the existing signature volume.
+Update the snapshot/package/base inputs through review and repeat the scan and
+E2E checks for future security updates. The signature healthcheck still does
+not measure database freshness.
+
+## ADR-012: Coordinated encrypted SITARA backups (specification)
+
+**Decision (2026-10-31):** Specify PostgreSQL and private evidence as one
+recovery point, captured while database writers, evidence uploads, and scan
+result writes are quiesced. Use a binary-safe PostgreSQL custom-format dump
+and a complete private evidence archive; record a recovery-point manifest and
+SHA-256 checksums; encrypt artifacts before transfer; and verify restore of
+the exact destination copy in an isolated disposable environment.
+
+The planned priority medium is an external HDD for an offline copy; campus
+Microsoft 365 OneDrive is a fallback/last resort. A dedicated SITARA
+SharePoint Document Library is unavailable, and IT has not provided an
+Entra ID application for Microsoft Graph. If approved, OneDrive upload is
+manual by the designated operator, ciphertext-only, to a folder with
+restricted access. HDD availability/capacity/custody and campus OneDrive
+retention, capacity, recovery, audit, and failure-domain properties remain
+unverified. Neither destination is asserted available or approved for
+production. The future VPS is the source and is not yet available.
+
+The proposed portable encryption method is recipient-based `age` with
+institution-controlled key custody; an approved managed-key service may be
+considered instead after a restore rehearsal. This is not a selected policy,
+installed dependency, or generated key. Encrypt before writing/transferring;
+hold the decryption identity separately under a formally appointed recovery
+key custodian; and verify plaintext sizes/digests after authorized decryption.
+Define recovery, rotation/revocation, and retained-backup compatibility before
+operation. The Director Sekretariat/Rektorat approves backup policy and
+production recovery; Super Admin is responsible for operations/monitoring; IT
+is responsible for infrastructure/storage; the formally appointed custodian
+controls key recovery. No operator self-approves production recovery or
+retention deletion.
+
+Proposed retention is 14 daily, 8 weekly, and 12 monthly recovery points, with
+a monthly restore test. These are **PROPOSED** pending approval. Do not enable
+automatic pruning. Retention, capacity, campus recovery policy, access audit,
+RPO/RTO, and production restore require owner/IT decisions.
+
+**Reason:** PostgreSQL metadata and private evidence files are separate
+storage systems. A database-only snapshot cannot prove evidence recovery;
+writer coordination, artifact integrity checks, and metadata/file
+reconciliation are needed to preserve PENDING quarantine, REJECTED denial,
+and CLEAN digest association.
+
+**Status and impact:** This ADR records a technical specification only.
+Backup scripts, encryption keys, destination integration, automated pruning,
+and restore automation are not implemented. Existing main database,
+Compose, schema, API contract, and volumes are unchanged. Stage 7.4.12 details
+and acceptance gates are in [`MIGRATION_PLAN.md`](./MIGRATION_PLAN.md).

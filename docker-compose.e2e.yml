@@ -1,0 +1,164 @@
+services:
+  clamav:
+    image: ${SITARA_CLAMAV_HTTP_E2E_CLAMAV_IMAGE:?required}
+    user: clamav
+    environment:
+      CLAMAV_PORT: ${SITARA_CLAMAV_HTTP_E2E_CLAMAV_PORT:?required}
+    restart: "no"
+    expose:
+      - ${SITARA_CLAMAV_HTTP_E2E_CLAMAV_PORT:?required}
+    tmpfs:
+      - /var/lib/clamav:rw,nosuid,nodev,noexec,size=512m,uid=${SITARA_CLAMAV_HTTP_E2E_CLAMAV_UID:?required},gid=${SITARA_CLAMAV_HTTP_E2E_CLAMAV_GID:?required},mode=2755
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/clamav-healthcheck"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 4m
+    networks:
+      - scanner
+      - egress
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      sitara.test: clamav-http-uvicorn-e2e
+      sitara.test.project: ${SITARA_CLAMAV_HTTP_E2E_PROJECT:?required}
+
+  sitara-clamav-e2e-postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_DB: sitara_clamav_e2e
+      POSTGRES_USER: sitara_e2e
+      POSTGRES_PASSWORD: ${SITARA_CLAMAV_HTTP_E2E_DB_PASSWORD:?required}
+    tmpfs:
+      - /var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=768m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sitara_e2e -d sitara_clamav_e2e"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      - api-db
+      - worker-db
+      - migration-db
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      sitara.test: clamav-http-uvicorn-e2e
+      sitara.test.project: ${SITARA_CLAMAV_HTTP_E2E_PROJECT:?required}
+
+  migration:
+    image: ${SITARA_CLAMAV_HTTP_E2E_BACKEND_IMAGE:?required}
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      DATABASE_URL: ${SITARA_CLAMAV_HTTP_E2E_DATABASE_URL:?required}
+    depends_on:
+      sitara-clamav-e2e-postgres:
+        condition: service_healthy
+    networks:
+      - migration-db
+    labels:
+      sitara.test: clamav-http-uvicorn-e2e
+      sitara.test.project: ${SITARA_CLAMAV_HTTP_E2E_PROJECT:?required}
+
+  api:
+    image: ${SITARA_CLAMAV_HTTP_E2E_BACKEND_IMAGE:?required}
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]
+    restart: "no"
+    environment:
+      DATABASE_URL: ${SITARA_CLAMAV_HTTP_E2E_DATABASE_URL:?required}
+      ACTION_ITEM_EVIDENCE_STORAGE_PATH: /var/lib/sitara/evidence
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      LOGIN_RATE_LIMIT_HMAC_KEY: ${SITARA_CLAMAV_HTTP_E2E_LIMITER_KEY:?required}
+    volumes:
+      - type: volume
+        source: evidence
+        target: /var/lib/sitara/evidence
+    depends_on:
+      sitara-clamav-e2e-postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    networks:
+      - api-db
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      sitara.test: clamav-http-uvicorn-e2e
+      sitara.test.project: ${SITARA_CLAMAV_HTTP_E2E_PROJECT:?required}
+
+  evidence-scanner:
+    image: ${SITARA_CLAMAV_HTTP_E2E_BACKEND_IMAGE:?required}
+    command: ["python", "-m", "app.evidence_scanner_worker"]
+    restart: "no"
+    environment:
+      DATABASE_URL: ${SITARA_CLAMAV_HTTP_E2E_DATABASE_URL:?required}
+      ACTION_ITEM_EVIDENCE_STORAGE_PATH: /var/lib/sitara/evidence
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: ${SITARA_CLAMAV_HTTP_E2E_CLAMAV_PORT:?required}
+      CLAMAV_TIMEOUT_SECONDS: "5"
+      EVIDENCE_SCAN_POLL_SECONDS: "1"
+      APP_ENV: development
+      LOG_LEVEL: INFO
+    volumes:
+      - type: volume
+        source: evidence
+        target: /var/lib/sitara/evidence
+        read_only: true
+    depends_on:
+      sitara-clamav-e2e-postgres:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    networks:
+      - worker-db
+      - scanner
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      sitara.test: clamav-http-uvicorn-e2e
+      sitara.test.project: ${SITARA_CLAMAV_HTTP_E2E_PROJECT:?required}
+
+networks:
+  api-db:
+    external: true
+    name: ${SITARA_CLAMAV_HTTP_E2E_NETWORK:?required}
+  worker-db:
+    external: true
+    name: ${SITARA_CLAMAV_HTTP_E2E_WORKER_DB_NETWORK:?required}
+  migration-db:
+    external: true
+    name: ${SITARA_CLAMAV_HTTP_E2E_MIGRATION_DB_NETWORK:?required}
+  scanner:
+    external: true
+    name: ${SITARA_CLAMAV_HTTP_E2E_SCANNER_NETWORK:?required}
+  egress:
+    external: true
+    name: ${SITARA_CLAMAV_HTTP_E2E_EGRESS_NETWORK:?required}
+
+volumes:
+  evidence:
+    name: ${SITARA_CLAMAV_HTTP_E2E_EVIDENCE_VOLUME:?required}
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=64m,uid=10001,gid=10001,mode=0700
+    labels:
+      sitara.test: clamav-http-uvicorn-e2e
+      sitara.test.project: ${SITARA_CLAMAV_HTTP_E2E_PROJECT:?required}

@@ -1,8 +1,13 @@
+import hashlib
+import os
+import time
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from io import BytesIO
+from pathlib import Path
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from app.core.config import get_settings
 from app.core.security import hash_password
@@ -26,7 +31,8 @@ from app.models.meeting import (
 )
 from app.models.organization import OrganizationUnit, ReportingLine, UserUnitMembership
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -34,22 +40,61 @@ from sqlalchemy.pool import StaticPool
 
 @pytest.fixture
 def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, UUID]]]:
-    engine = create_engine(
-        "sqlite+pysqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    event.listen(
-        engine,
-        "connect",
-        lambda connection, _: connection.execute("PRAGMA foreign_keys=ON"),
-    )
-    Base.metadata.create_all(engine)
+    daemon_e2e = os.environ.get("SITARA_CLAMAV_DAEMON_E2E") == "1"
+    if daemon_e2e:
+        database_url = os.environ.get("SITARA_CLAMAV_E2E_DATABASE_URL")
+        if not database_url:
+            pytest.fail("Disposable ClamAV E2E database URL is required", pytrace=False)
+        try:
+            database_target = make_url(database_url)
+        except Exception:
+            pytest.fail("Disposable ClamAV E2E database URL is invalid", pytrace=False)
+        if (
+            database_target.database != "sitara_clamav_e2e"
+            or database_target.username != "sitara_e2e"
+            or database_target.host != "sitara-clamav-e2e-postgres"
+        ):
+            pytest.fail(
+                "Refusing a ClamAV E2E database outside the disposable target", pytrace=False
+            )
+        engine = create_engine(database_url, pool_pre_ping=True)
+        with engine.connect() as connection:
+            current_database = connection.scalar(text("SELECT current_database()"))
+            current_user = connection.scalar(text("SELECT current_user"))
+            migration_head = connection.scalar(text("SELECT version_num FROM alembic_version"))
+        if (
+            current_database != "sitara_clamav_e2e"
+            or current_user != "sitara_e2e"
+            or migration_head != "0011_evidence_scan_quarantine"
+        ):
+            engine.dispose()
+            pytest.fail(
+                "Disposable ClamAV E2E database identity or migration head is invalid",
+                pytrace=False,
+            )
+    else:
+        engine = create_engine(
+            "sqlite+pysqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        event.listen(
+            engine,
+            "connect",
+            lambda connection, _: connection.execute("PRAGMA foreign_keys=ON"),
+        )
+        Base.metadata.create_all(engine)
     session = Session(engine, expire_on_commit=False)
 
     role_codes = {"SEKRETARIAT", "REKTOR", "WAREK", "PIC", "SUPER_ADMIN"}
-    roles = {code: Role(role_code=code, role_name=code) for code in role_codes}
-    session.add_all(roles.values())
+    roles = {
+        role.role_code: role
+        for role in session.scalars(select(Role).where(Role.role_code.in_(role_codes)))
+    }
+    missing_roles = role_codes - roles.keys()
+    for code in missing_roles:
+        roles[code] = Role(role_code=code, role_name=code)
+    session.add_all(roles[code] for code in missing_roles)
     users: dict[str, User] = {}
     role_assignments = {
         "secretariat": ("SEKRETARIAT",),
@@ -797,6 +842,364 @@ def test_progress_evidence_upload_download_is_private_and_authorized(
 
     assert not (tmp_path / "private-evidence" / "hasil.pdf").exists()
     get_settings.cache_clear()
+
+
+@pytest.mark.skipif(
+    os.environ.get("SITARA_CLAMAV_DAEMON_E2E") != "1",
+    reason="requires the isolated disposable ClamAV daemon harness",
+)
+def test_clamav_daemon_retries_pending_evidence_after_scanner_recovery(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control_path = Path(os.environ["SITARA_CLAMAV_E2E_CONTROL_PATH"])
+    storage_root = Path(os.environ["ACTION_ITEM_EVIDENCE_STORAGE_PATH"])
+    safe_path = control_path / "daemon-safe.pdf"
+    safe_content = b"%PDF-1.7\nSynthetic ClamAV evidence\n%%EOF\n"
+    eicar_content = bytes(
+        (
+            88,
+            53,
+            79,
+            33,
+            80,
+            37,
+            64,
+            65,
+            80,
+            91,
+            52,
+            92,
+            80,
+            90,
+            88,
+            53,
+            52,
+            40,
+            80,
+            94,
+            41,
+            55,
+            67,
+            67,
+            41,
+            55,
+            125,
+            36,
+            69,
+            73,
+            67,
+            65,
+            82,
+            45,
+            83,
+            84,
+            65,
+            78,
+            68,
+            65,
+            82,
+            68,
+            45,
+            65,
+            78,
+            84,
+            73,
+            86,
+            73,
+            82,
+            85,
+            83,
+            45,
+            84,
+            69,
+            83,
+            84,
+            45,
+            70,
+            73,
+            76,
+            69,
+            33,
+            36,
+            72,
+            43,
+            72,
+            42,
+        )
+    )
+    assert len(eicar_content) == 68
+    safe_path.write_bytes(safe_content)
+    monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(storage_root))
+    get_settings.cache_clear()
+
+    session, users, refs = action_item_context
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        other_task = _create_task(client, refs, users["pic_main"])
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        progress = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={"report_text": "Bukti untuk pengujian daemon ClamAV"},
+        )
+        assert progress.status_code == 201, progress.text
+        upload_path = (
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{progress.json()['id']}/evidence/files"
+        )
+        safe_upload = client.post(
+            upload_path,
+            files={"file": (safe_path.name, BytesIO(safe_path.read_bytes()), "application/pdf")},
+        )
+        assert safe_upload.status_code == 201, safe_upload.text
+        safe_evidence_id = UUID(safe_upload.json()["id"])
+        assert safe_upload.json()["scan_status"] == "PENDING"
+        assert "storage_key" not in safe_upload.json()
+
+        safe_download_path = f"/api/v1/action-items/{created['id']}/evidence/{safe_evidence_id}"
+        assert client.get(safe_download_path).status_code == 423
+        cross_task_download = client.get(
+            f"/api/v1/action-items/{other_task['id']}/evidence/{safe_evidence_id}"
+        )
+        assert cross_task_download.status_code == 404
+
+        (control_path / "safe-pending").touch()
+        recovery_marker = control_path / "recovery-ready"
+        recovery_deadline = time.monotonic() + 60
+        while not recovery_marker.is_file() and time.monotonic() < recovery_deadline:
+            time.sleep(0.1)
+        assert recovery_marker.is_file(), "ClamAV recovery was not signalled by the harness"
+
+        def wait_for_scan_status(evidence_id: UUID, expected_status: str) -> ActionItemEvidenceScan:
+            scan_deadline = time.monotonic() + 90
+            while time.monotonic() < scan_deadline:
+                with Session(session.get_bind()) as poll_session:
+                    scan = poll_session.scalar(
+                        select(ActionItemEvidenceScan)
+                        .where(ActionItemEvidenceScan.evidence_id == evidence_id)
+                        .order_by(ActionItemEvidenceScan.event_number.desc())
+                        .limit(1)
+                    )
+                if scan is not None and scan.scan_status == expected_status:
+                    return scan
+                time.sleep(0.1)
+            pytest.fail(f"Evidence did not reach the {expected_status} scan status")
+
+        safe_scan = wait_for_scan_status(safe_evidence_id, "CLEAN")
+        assert safe_scan.scan_status == "CLEAN"
+        assert safe_scan.scanned_sha256 == safe_upload.json()["sha256"]
+        assert safe_scan.scanned_sha256 == hashlib.sha256(safe_content).hexdigest()
+        assert safe_scan.scanner_name == "ClamAV"
+        assert safe_scan.scanner_version and safe_scan.scanner_version.startswith("ClamAV 1.5.4/")
+
+        eicar_upload = client.post(
+            upload_path,
+            files={"file": ("daemon-eicar.txt", BytesIO(eicar_content), "text/plain")},
+        )
+        assert eicar_upload.status_code == 201, eicar_upload.text
+        eicar_evidence_id = UUID(eicar_upload.json()["id"])
+        assert eicar_upload.json()["scan_status"] == "PENDING"
+        assert "storage_key" not in eicar_upload.json()
+        eicar_download_path = f"/api/v1/action-items/{created['id']}/evidence/{eicar_evidence_id}"
+        assert client.get(eicar_download_path).status_code == 423
+
+        eicar_scan = wait_for_scan_status(eicar_evidence_id, "REJECTED")
+        assert eicar_scan.scan_status == "REJECTED"
+        assert eicar_scan.scanned_sha256 == eicar_upload.json()["sha256"]
+        assert eicar_scan.scanned_sha256 == hashlib.sha256(eicar_content).hexdigest()
+        assert eicar_scan.scanner_name == "ClamAV"
+        assert eicar_scan.scanner_version == safe_scan.scanner_version
+
+        client.cookies.clear()
+        client.headers.clear()
+        unauthenticated_download = client.get(safe_download_path)
+        assert unauthenticated_download.status_code == 401
+
+        _login(client, users["other_rector"])
+        out_of_scope_download = client.get(safe_download_path)
+        assert out_of_scope_download.status_code == 404
+
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["rector"])
+        clean_download = client.get(safe_download_path)
+        rejected_download = client.get(eicar_download_path)
+
+    assert clean_download.status_code == 200
+    assert clean_download.content == safe_content
+    assert clean_download.headers["cache-control"] == "private, no-store"
+    assert rejected_download.status_code == 423
+    assert rejected_download.content != eicar_content
+    assert storage_root.stat().st_mode & 0o777 == 0o700
+    assert not (storage_root / safe_path.name).exists()
+    get_settings.cache_clear()
+
+
+@pytest.mark.skipif(
+    os.environ.get("SITARA_CLAMAV_HTTP_E2E") != "1",
+    reason="requires the isolated Uvicorn/ClamAV Docker Compose harness",
+)
+def test_clamav_http_upload_is_scanned_by_compose_worker(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    api_url = os.environ["SITARA_CLAMAV_HTTP_E2E_BASE_URL"]
+    control_path = Path(os.environ["SITARA_CLAMAV_HTTP_E2E_CONTROL_PATH"])
+    control_path.mkdir(parents=True, exist_ok=True)
+    session, users, refs = action_item_context
+    evidence_content = b"%PDF-1.7\nSynthetic Uvicorn evidence\n%%EOF\n"
+    eicar_content = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+    assert len(eicar_content) == 68
+
+    with httpx.Client(base_url=api_url, timeout=10.0) as client:
+        health = client.get("/api/v1/health")
+        assert health.status_code == 200
+        assert health.json() == {"status": "ok", "service": "sitara-api"}
+
+        def login(user: User) -> None:
+            response = client.post(
+                "/api/v1/auth/login",
+                json={"email": user.email, "password": "synthetic-password"},
+            )
+            assert response.status_code == 200, response.text
+            csrf_token = client.cookies.get("sitara_csrf")
+            assert csrf_token
+            client.headers["X-CSRF-Token"] = csrf_token
+
+        login(users["secretariat"])
+        created_response = client.post(
+            "/api/v1/action-items",
+            json=_task_payload(refs, main_pic_user_id=str(users["pic_main"].id)),
+        )
+        assert created_response.status_code == 201, created_response.text
+        created = created_response.json()
+        other_task_response = client.post(
+            "/api/v1/action-items",
+            json=_task_payload(refs, main_pic_user_id=str(users["pic_main"].id)),
+        )
+        assert other_task_response.status_code == 201, other_task_response.text
+        other_task = other_task_response.json()
+
+        client.cookies.clear()
+        client.headers.clear()
+        login(users["pic_main"])
+        progress = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={"report_text": "Bukti melalui HTTP Uvicorn"},
+        )
+        assert progress.status_code == 201, progress.text
+        upload = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{progress.json()['id']}/evidence/files",
+            files={"file": ("http-safe.pdf", BytesIO(evidence_content), "application/pdf")},
+        )
+        assert upload.status_code == 201, upload.text
+        assert upload.json()["scan_status"] == "PENDING"
+        assert "storage_key" not in upload.json()
+        evidence_id = UUID(upload.json()["id"])
+        evidence_url = f"/api/v1/action-items/{created['id']}/evidence/{evidence_id}"
+        assert client.get(evidence_url).status_code == 423
+        assert (
+            client.get(
+                f"/api/v1/action-items/{other_task['id']}/evidence/{evidence_id}"
+            ).status_code
+            == 404
+        )
+
+        eicar_upload = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{progress.json()['id']}/evidence/files",
+            files={"file": ("http-eicar.txt", BytesIO(eicar_content), "text/plain")},
+        )
+        assert eicar_upload.status_code == 201, eicar_upload.text
+        assert eicar_upload.json()["scan_status"] == "PENDING"
+        assert "storage_key" not in eicar_upload.json()
+        eicar_id = UUID(eicar_upload.json()["id"])
+        eicar_url = f"/api/v1/action-items/{created['id']}/evidence/{eicar_id}"
+        assert client.get(eicar_url).status_code == 423
+
+        pending_scan = session.scalar(
+            select(ActionItemEvidenceScan)
+            .where(ActionItemEvidenceScan.evidence_id == evidence_id)
+            .order_by(ActionItemEvidenceScan.event_number.desc())
+            .limit(1)
+        )
+        assert pending_scan is not None
+        assert pending_scan.scan_status == "PENDING"
+        eicar_pending_scan = session.scalar(
+            select(ActionItemEvidenceScan)
+            .where(ActionItemEvidenceScan.evidence_id == eicar_id)
+            .order_by(ActionItemEvidenceScan.event_number.desc())
+            .limit(1)
+        )
+        assert eicar_pending_scan is not None
+        assert eicar_pending_scan.scan_status == "PENDING"
+        (control_path / "upload-pending").touch()
+
+        worker_ready = control_path / "worker-started"
+        worker_deadline = time.monotonic() + 60
+        while not worker_ready.is_file() and time.monotonic() < worker_deadline:
+            time.sleep(0.1)
+        assert worker_ready.is_file(), "Compose worker was not started by the harness"
+
+        clean_scan = None
+        rejected_scan = None
+        scan_deadline = time.monotonic() + 45
+        with Session(session.get_bind()) as poll_session:
+            while time.monotonic() < scan_deadline:
+                clean_scan = poll_session.scalar(
+                    select(ActionItemEvidenceScan)
+                    .where(ActionItemEvidenceScan.evidence_id == evidence_id)
+                    .order_by(ActionItemEvidenceScan.event_number.desc())
+                    .limit(1)
+                )
+                rejected_scan = poll_session.scalar(
+                    select(ActionItemEvidenceScan)
+                    .where(ActionItemEvidenceScan.evidence_id == eicar_id)
+                    .order_by(ActionItemEvidenceScan.event_number.desc())
+                    .limit(1)
+                )
+                if (
+                    clean_scan is not None
+                    and clean_scan.scan_status == "CLEAN"
+                    and rejected_scan is not None
+                    and rejected_scan.scan_status == "REJECTED"
+                ):
+                    break
+                time.sleep(0.1)
+
+        assert clean_scan is not None
+        assert clean_scan.scan_status == "CLEAN"
+        assert clean_scan.scanned_sha256 == upload.json()["sha256"]
+        assert clean_scan.scanned_sha256 == hashlib.sha256(evidence_content).hexdigest()
+        assert clean_scan.scanner_name == "ClamAV"
+        assert rejected_scan is not None
+        assert rejected_scan.scan_status == "REJECTED"
+        assert rejected_scan.scanned_sha256 == eicar_upload.json()["sha256"]
+        assert rejected_scan.scanned_sha256 == hashlib.sha256(eicar_content).hexdigest()
+        assert rejected_scan.scanner_name == "ClamAV"
+        assert client.get(eicar_url).status_code == 423
+
+        client.cookies.clear()
+        client.headers.clear()
+        assert client.get(evidence_url).status_code == 401
+
+        login(users["other_rector"])
+        assert client.get(evidence_url).status_code == 404
+
+        client.cookies.clear()
+        client.headers.clear()
+        login(users["rector"])
+        download = client.get(evidence_url)
+        rejected_download = client.get(eicar_url)
+
+    assert download.status_code == 200
+    assert download.content == evidence_content
+    assert download.headers["cache-control"] == "private, no-store"
+    assert rejected_download.status_code == 423
+    assert rejected_download.content != eicar_content
 
 
 def test_super_admin_cannot_upload_or_download_evidence(

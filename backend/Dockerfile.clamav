@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+
+FROM ${UBUNTU_IMAGE} AS certificate-bundle
+ARG CA_CERTIFICATES_VERSION=20260816ubuntu0.24.04.1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends "ca-certificates=${CA_CERTIFICATES_VERSION}" \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM ${UBUNTU_IMAGE}
+ARG UBUNTU_SNAPSHOT=20261030T000000Z
+ARG CLAMAV_VERSION=1.5.4+dfsg-0ubuntu0.24.04.1
+ARG LIBXML2_VERSION=2.9.14+dfsg-1.3ubuntu3.10
+ARG CLAMAV_PORT=3310
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY --from=certificate-bundle /etc/ssl/certs/ /etc/ssl/certs/
+
+RUN rm -f /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' \
+        'Types: deb' \
+        "URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/" \
+        'Suites: noble noble-updates noble-security' \
+        'Components: main universe' \
+        'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
+        > /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        "clamav=${CLAMAV_VERSION}" \
+        "clamav-daemon=${CLAMAV_VERSION}" \
+        "clamav-freshclam=${CLAMAV_VERSION}" \
+        "clamdscan=${CLAMAV_VERSION}" \
+        "libxml2=${LIBXML2_VERSION}" \
+    && install -d -o clamav -g clamav -m 2755 /var/lib/clamav \
+    && install -d -o clamav -g clamav -m 0755 /run/clamav \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY clamav/clamd.conf /etc/clamav/clamd.conf
+COPY clamav/freshclam.conf /etc/clamav/freshclam.conf
+COPY clamav/entrypoint.sh /usr/local/bin/clamav-entrypoint
+COPY clamav/healthcheck.sh /usr/local/bin/clamav-healthcheck
+COPY clamav/port.sh /usr/local/bin/port.sh
+RUN sed -i 's/\r$//' \
+        /etc/clamav/clamd.conf \
+        /etc/clamav/freshclam.conf \
+        /usr/local/bin/clamav-entrypoint \
+        /usr/local/bin/clamav-healthcheck \
+        /usr/local/bin/port.sh \
+    && chmod 0555 /usr/local/bin/clamav-entrypoint /usr/local/bin/clamav-healthcheck
+
+USER clamav:clamav
+EXPOSE ${CLAMAV_PORT}
+ENTRYPOINT ["/usr/local/bin/clamav-entrypoint"]

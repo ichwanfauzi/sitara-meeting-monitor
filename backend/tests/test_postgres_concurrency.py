@@ -12,6 +12,10 @@ from app.core.config import get_settings
 from app.models.action_item import (
     ActionItem,
     ActionItemAssignment,
+    ActionItemEvidence,
+    ActionItemEvidenceKind,
+    ActionItemEvidenceScan,
+    ActionItemEvidenceScanStatus,
     ActionItemStatus,
     ProgressUpdate,
 )
@@ -41,8 +45,10 @@ from app.schemas.meetings import (
 )
 from app.services.action_items import (
     ActionItemConcurrencyConflict,
+    ActionItemEvidenceScanResultInvalid,
     change_action_item_status,
     create_action_item,
+    record_evidence_scan_result,
 )
 from app.services.meetings import (
     InvalidMeetingTransition,
@@ -1481,3 +1487,84 @@ def test_postgres_concurrent_action_item_status_changes_use_optimistic_version(
         assert stored is not None
         assert stored.official_status == ActionItemStatus.TERKENDALA
         assert stored.version == 2
+
+
+def test_postgres_concurrent_evidence_scan_results_append_only_one_terminal_event(
+    postgres_sessions: sessionmaker[Session],
+) -> None:
+    digest = "a" * 64
+    with postgres_sessions() as session:
+        _, pic, action_item = _seed_postgres_action_item(session)
+        assignment = session.scalar(
+            select(ActionItemAssignment).where(
+                ActionItemAssignment.action_item_id == action_item.id,
+                ActionItemAssignment.ended_at.is_(None),
+            )
+        )
+        assert assignment is not None
+        progress = ProgressUpdate(
+            action_item_id=action_item.id,
+            assignment_id=assignment.id,
+            actor_user_id=pic.id,
+            report_text="Synthetic evidence scan concurrency",
+        )
+        session.add(progress)
+        session.flush()
+        evidence = ActionItemEvidence(
+            action_item_id=action_item.id,
+            progress_update_id=progress.id,
+            evidence_kind=ActionItemEvidenceKind.FILE,
+            storage_key=uuid4().hex,
+            original_filename="concurrency.pdf",
+            content_type="application/pdf",
+            size_bytes=1,
+            sha256=digest,
+            uploaded_by_user_id=pic.id,
+        )
+        session.add(evidence)
+        session.flush()
+        session.add(
+            ActionItemEvidenceScan(
+                evidence_id=evidence.id,
+                event_number=1,
+                scan_status=ActionItemEvidenceScanStatus.PENDING,
+            )
+        )
+        session.commit()
+        evidence_id = evidence.id
+
+    barrier = Barrier(2)
+
+    def record_duplicate_result(_: int) -> bool:
+        with postgres_sessions() as session:
+            barrier.wait(timeout=10)
+            try:
+                record_evidence_scan_result(
+                    session,
+                    evidence_id,
+                    clean=True,
+                    scanner_name="ClamAV",
+                    scanner_version="ClamAV synthetic concurrency test",
+                    scanned_sha256=digest,
+                )
+            except ActionItemEvidenceScanResultInvalid:
+                return False
+            return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(record_duplicate_result, range(2)))
+
+    assert sum(outcomes) == 1
+    with postgres_sessions() as session:
+        scans = list(
+            session.scalars(
+                select(ActionItemEvidenceScan)
+                .where(ActionItemEvidenceScan.evidence_id == evidence_id)
+                .order_by(ActionItemEvidenceScan.event_number)
+            )
+        )
+
+    assert [scan.event_number for scan in scans] == [1, 2]
+    assert scans[0].scan_status == ActionItemEvidenceScanStatus.PENDING
+    assert scans[1].scan_status == ActionItemEvidenceScanStatus.CLEAN
+    assert scans[1].scanned_sha256 == digest
