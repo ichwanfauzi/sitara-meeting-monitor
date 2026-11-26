@@ -20,13 +20,13 @@
 
 ## ADR-004: Official status is controlled by Secretariat
 
-**Decision:** Only authorized Secretariat users may change an action item's official status. PIC and leaders submit progress updates; they do not directly change the official status.
+**Decision:** Only authorized Secretariat and Manager Legal users may change an action item's official status. PIC and other leaders submit progress updates; they do not directly change the official status.
 
-**Reason:** Establishes a single accountable workflow for official monitoring status. This must be enforced server-side and tested.
+**Reason:** Gives the two operational managers shared authority for official monitoring status. This must be enforced server-side and tested.
 
 ## ADR-005: Meeting lifecycle and login attempt storage
 
-**Decision:** Secretariat alone may transition a meeting. Persist each successful transition in `meeting_status_events` in the same transaction as the meeting update, with a row lock to serialize concurrent transitions. Permit `DRAFT → LIVE`, `LIVE → FINAL` after the latest valid review of the active minutes revision, and `FINAL → ARCHIVED`; reject all other transitions.
+**Decision:** Authorized Secretariat or Manager Legal users may transition a meeting. Persist each successful transition in `meeting_status_events` in the same transaction as the meeting update, with a row lock to serialize concurrent transitions. Permit `DRAFT → LIVE`, `LIVE → FINAL` after the latest valid review of the active minutes revision, and `FINAL → ARCHIVED`; reject all other transitions.
 
 **Reason:** Status changes need attributable history. Minutes-review data and its limits are defined in ADR-006.
 
@@ -36,7 +36,7 @@
 
 ## ADR-006: Minutes review attestation and finalization
 
-**Decision:** Only an active user with the `SEKRETARIAT` role and without `SUPER_ADMIN` may record a minutes review. A reviewer may also finalize the meeting. Store each review as a separate record with the meeting, reviewer, sequence number, result, UTC timestamp, and optional note. The newest review controls finalization; `INVALID` blocks finalization until another review records `VALID`. Review and finalization lock the meeting row. Each review insert commits as one transaction; finalization commits the meeting update and status event together.
+**Decision:** Only an active user with the `SEKRETARIAT` or `MANAGER_LEGAL` role and without `SUPER_ADMIN` may record a minutes review. A reviewer may also finalize the meeting. Store each review as a separate record with the meeting, reviewer, sequence number, result, UTC timestamp, and optional note. The newest review controls finalization; `INVALID` blocks finalization until another review records `VALID`. Review and finalization lock the meeting row. Each review insert commits as one transaction; finalization commits the meeting update and status event together.
 
 **Historical limitation (addressed by ADR-007):** Migration `0004` review records predate versioned minutes and have no revision reference. They remain in history after `0005`, but cannot satisfy finalization.
 
@@ -48,7 +48,7 @@ At adoption, during `LIVE` only the designated notetaker could append a revision
 
 For version 2, each discussion points to one agenda and one revision from the same meeting using composite foreign keys. Each decision points to a discussion within that exact revision. Child rows are complete snapshot records and have immutable update/delete/truncate guards. Revisions, discussions, and decisions are inserted in one transaction. Revisions do not copy prior child row IDs; a future action item can point to the exact decision snapshot that authorized its creation. Legacy text content is never migrated into an agenda automatically.
 
-Each new review includes `minutes_revision_id`. A composite foreign key binds `(meeting_id, minutes_revision_id)` to a revision of that same meeting. Review creation locks the meeting and accepts only its active revision. Finalization takes the same lock and requires the latest review to be `VALID` and bound to the active revision. A later revision therefore invalidates prior reviews without changing the review history. Final status and its status event remain one transaction. The reviewer may finalize; only Secretariat without `SUPER_ADMIN` may review, start (`DRAFT → LIVE`), finalize, or archive (`FINAL → ARCHIVED`).
+Each new review includes `minutes_revision_id`. A composite foreign key binds `(meeting_id, minutes_revision_id)` to a revision of that same meeting. Review creation locks the meeting and accepts only its active revision. Finalization takes the same lock and requires the latest review to be `VALID` and bound to the active revision. A later revision therefore invalidates prior reviews without changing the review history. Final status and its status event remain one transaction. The reviewer may finalize; authorized Secretariat or Manager Legal users without `SUPER_ADMIN` may review, start (`DRAFT → LIVE`), finalize, or archive (`FINAL → ARCHIVED`).
 
 At adoption, full minutes content was limited to authorized Secretariat or leadership users within meeting scope. ADR-018 expands read access for all Secretariat, Rektor, and Warek users. PIC and Super Admin are denied even if they also hold another role. The editor uses the existing revision endpoint for legacy text and complete agenda-structured snapshots. Real-time collaboration is still out of scope.
 
@@ -280,14 +280,14 @@ unit choices without exposing email or credential data. Downgrade refuses
 when provenance has been recorded. No database migration was run as part of
 implementation.
 
-**Implementation amendment (2026-11-25):** New Action Items require an active
-responsible unit. User-account PIC assignments require an explicit origin unit
+**Implementation amendment (2026-11-26):** New Action Items do not require a
+responsible unit; the field remains nullable and existing values are preserved.
+If a client supplies a responsible unit, the backend validates that it is
+active. User-account PIC assignments still require an explicit origin unit
 selected from that PIC's active memberships; named PIC assignments remain
 available without a verified origin unit, as there is no account membership to
-validate. Legacy rows remain nullable. The PIC directory returns active units
-and membership-scoped origins to authorized meeting officials. This amendment
-supersedes the later draft statement that new forms do not request unit
-provenance.
+validate. The PIC directory returns active units and membership-scoped origins
+to authorized meeting officials.
 
 ## ADR-017: Redacted Action Item assignment audit events
 
@@ -415,10 +415,10 @@ the append-only guards; downgrade is refused if blank-priority rows exist.
 Wareks, Director of Secretariat, and Manager Legal. Active Secretariat,
 Manager Legal, Rektor, and Warek users may read all Rapim records. Secretariat,
 Manager Legal, and Warek may create/manage meetings; active Secretariat,
-Manager Legal, Rektor, and Warek users may edit LIVE minutes. Only Secretariat
-controls meeting status. Only Secretariat and Manager Legal may create/manage
-Action Items; Warek may not create follow-ups. Existing official task-status
-authority remains with Secretariat.
+Manager Legal, Rektor, and Warek users may edit LIVE minutes. Secretariat and
+Manager Legal control meeting status. Only Secretariat and Manager Legal may
+create/manage Action Items; Warek may not create follow-ups. Official
+task-status authority is shared by Secretariat and Manager Legal.
 
 Meeting chair identity, handover, disposition, and lifecycle panel are removed
 from the user flow. Notetaker is optional and selected from the active core-user
@@ -438,7 +438,7 @@ Every source decision must be represented in the linked Decision Brief. Action
 Item PICs may be selected from eligible active core-roster accounts or entered
 as free text. Only Secretariat and Manager Legal may create/manage tasks or
 assign PICs; Rektor and Warek are eligible assignees but not assigners. New
-tasks require a responsible unit; account PIC assignments require a
+tasks do not require a responsible unit; account PIC assignments require a
 membership-validated origin unit, while named PICs have no verified origin.
 Assignment reasons remain optional and are kept out of the audit event.
 
@@ -609,3 +609,22 @@ attempt, and retry fields to notifications. The opt-in Compose profile
 credentials out of the API service. Gmail trials use `smtp.gmail.com:587` and
 a locally configured Google App Password. No sender credential is stored in
 the repository; actual delivery requires local SMTP account configuration.
+
+## ADR-028: Named external meeting participants
+
+**Decision (2026-11-26):** Meeting editors may record attendees who do not
+have SITARA accounts by entering a name through the `Lainnya` participant
+option. Store these entries separately from `users` and `meeting_participants`.
+They are visible only through the existing authorized meeting response and do
+not create an account, role, login, or additional meeting access. Add/remove
+operations use the same meeting-edit authorization, version check, and audit
+event as registered participants; audit payloads identify the external record
+without copying its name.
+
+**Reason:** Meeting participant records should represent actual attendees
+without requiring an account or inventing an identity. Keeping guest names
+separate prevents them from being mistaken for authenticated users.
+
+**Impact:** Migration `0028_meeting_external_attendees` adds
+`meeting_external_participants` with a guarded downgrade when entries exist.
+The API returns these names separately from account-backed participants.

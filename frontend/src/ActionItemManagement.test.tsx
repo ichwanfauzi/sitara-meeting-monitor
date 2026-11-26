@@ -485,7 +485,7 @@ describe('ActionItemManagement', () => {
     await user.type(screen.getByLabelText('Output yang diharapkan'), 'Hasil laporan');
     await user.type(screen.getByLabelText('Tenggat waktu'), '2026-12-20');
     await user.selectOptions(screen.getByLabelText('Prioritas'), 'Segera');
-    await user.selectOptions(screen.getByLabelText('Unit penanggung jawab'), unitId);
+    expect(screen.queryByLabelText('Unit penanggung jawab')).not.toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText('PIC utama'), picId);
     await user.selectOptions(screen.getByLabelText('Unit asal PIC utama'), unitId);
     await user.click(screen.getByRole('button', { name: 'Simpan Action Item' }));
@@ -499,7 +499,6 @@ describe('ActionItemManagement', () => {
       source_minutes_revision_id: revisionId,
       source_decision_id: decisionId,
       disposition_id: null,
-      responsible_unit_id: unitId,
       title: 'Laporan baru sintetis',
       description: 'Deskripsi tugas sintetis',
       output_expected: 'Hasil laporan',
@@ -546,7 +545,6 @@ describe('ActionItemManagement', () => {
     await user.type(screen.getByLabelText('Judul tugas'), 'Tugas PIC bernama');
     await user.type(screen.getByLabelText('Deskripsi tugas'), 'Deskripsi sintetis');
     await user.selectOptions(screen.getByLabelText('Prioritas'), 'Segera');
-    await user.selectOptions(screen.getByLabelText('Unit penanggung jawab'), unitId);
     expect(
       within(screen.getByLabelText('PIC utama')).getByRole('option', { name: 'Analis Uji' }),
     ).toBeInTheDocument();
@@ -625,7 +623,6 @@ describe('ActionItemManagement', () => {
     await user.type(screen.getByLabelText('Judul tugas'), 'Tugas dari keputusan');
     await user.type(screen.getByLabelText('Deskripsi tugas'), 'Deskripsi sintetis');
     await user.selectOptions(screen.getByLabelText('Prioritas'), 'Segera');
-    await user.selectOptions(screen.getByLabelText('Unit penanggung jawab'), unitId);
     await user.selectOptions(screen.getByLabelText('PIC utama'), picId);
     await user.selectOptions(screen.getByLabelText('Unit asal PIC utama'), unitId);
     await user.click(screen.getByRole('button', { name: 'Simpan Action Item' }));

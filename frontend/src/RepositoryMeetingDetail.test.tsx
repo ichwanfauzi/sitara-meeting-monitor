@@ -115,7 +115,10 @@ const briefs = [
   },
 ];
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.history.replaceState(null, '', '/');
+});
 
 describe('RepositoryMeetingDetail', () => {
   it('shows only print actions for the latest minutes and Decision Brief', async () => {
@@ -193,5 +196,40 @@ describe('RepositoryMeetingDetail', () => {
     ]);
     expect(printTable.closest('[data-print-target="true"]')).not.toBeNull();
     expect(print).toHaveBeenCalledOnce();
+  });
+
+  it('scrolls to repository sections without replacing the active app route', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith('/minutes-revisions')) return Response.json([]);
+      if (url.endsWith('/decision-briefs')) return Response.json([]);
+      if (url.includes('/action-items?')) return Response.json([]);
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.replaceState(null, '', `#search/${meeting.id}`);
+
+    render(<RepositoryMeetingDetail meeting={meeting} />);
+
+    const sections = [
+      ['Agenda', 'repo-agenda'],
+      ['Notulensi', 'repo-minutes'],
+      ['Decision Brief', 'repo-briefs'],
+      ['Tindak lanjut', 'repo-actions'],
+    ] as const;
+    for (const [label, sectionId] of sections) {
+      const target = document.getElementById(sectionId);
+      expect(target).not.toBeNull();
+      const scrollIntoView = vi.fn();
+      Object.defineProperty(target, 'scrollIntoView', {
+        configurable: true,
+        value: scrollIntoView,
+      });
+
+      await userEvent.click(screen.getByRole('link', { name: label }));
+
+      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+      expect(window.location.hash).toBe(`#search/${meeting.id}`);
+    }
   });
 });

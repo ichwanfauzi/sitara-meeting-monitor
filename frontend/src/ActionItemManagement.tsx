@@ -259,7 +259,6 @@ function ActionItemManagement({
     null,
   );
   const [creationPicDirectoryLoading, setCreationPicDirectoryLoading] = useState(false);
-  const [creationResponsibleUnitId, setCreationResponsibleUnitId] = useState('');
   const [mainPicUserId, setMainPicUserId] = useState('');
   const [mainPicDisplayName, setMainPicDisplayName] = useState('');
   const [mainPicOriginUnitId, setMainPicOriginUnitId] = useState('');
@@ -487,7 +486,6 @@ function ActionItemManagement({
       .then((directory) => {
         if (active) {
           setCreationPicDirectory(directory);
-          setCreationResponsibleUnitId('');
         }
       })
       .catch((error: unknown) => {
@@ -530,7 +528,6 @@ function ActionItemManagement({
     setCreateError(null);
     setCreateNotice(null);
     setCreationPicDirectory(null);
-    setCreationResponsibleUnitId('');
     setMainPicUserId('');
     setMainPicDisplayName('');
     setMainPicOriginUnitId('');
@@ -559,10 +556,6 @@ function ActionItemManagement({
       setCreateError('Pilih jabatan PIC utama atau isi PIC lainnya.');
       return;
     }
-    if (!creationResponsibleUnitId) {
-      setCreateError('Pilih unit penanggung jawab.');
-      return;
-    }
     if (mainPicUserId !== '__OTHER__' && !mainPicOriginUnitId) {
       setCreateError('Pilih unit asal PIC utama dari keanggotaan aktifnya.');
       return;
@@ -581,7 +574,6 @@ function ActionItemManagement({
         source_minutes_revision_id: selectedSource.revision.id,
         source_decision_id: selectedSource.decisionId,
         disposition_id: null,
-        responsible_unit_id: creationResponsibleUnitId,
         title: String(formData.get('title')).trim(),
         description: String(formData.get('description')).trim(),
         output_expected: String(formData.get('output_expected')).trim() || null,
@@ -627,7 +619,6 @@ function ActionItemManagement({
       setSupportingPicUserId('');
       setSupportingPicDisplayName('');
       setSupportingPicOriginUnitId('');
-      setCreationResponsibleUnitId('');
       setCreateNotice(notice);
     } catch (error) {
       setCreateError(errorText(error));
@@ -1782,7 +1773,6 @@ function ActionItemManagement({
                 onSelect={(meetingId) => {
                   setCreationMeetingId(meetingId);
                   setCreationDecisionId('');
-                  setCreationResponsibleUnitId('');
                   setMainPicUserId('');
                   setMainPicDisplayName('');
                   setMainPicOriginUnitId('');
@@ -1838,22 +1828,6 @@ function ActionItemManagement({
                   Sumber: {selectedSource.meeting.meeting_number} · {selectedSource.decisionText}
                 </p>
               )}
-              <label>
-                Unit penanggung jawab
-                <select
-                  value={creationResponsibleUnitId}
-                  onChange={(event) => setCreationResponsibleUnitId(event.target.value)}
-                  disabled={creationPicDirectoryLoading || createSaving}
-                  required
-                >
-                  <option value="">Pilih unit</option>
-                  {(creationPicDirectory?.units ?? []).map((unit) => (
-                    <option key={unit.id} value={unit.id}>
-                      {unit.unit_code} · {unit.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
               <label>
                 Judul tugas
                 <input name="title" maxLength={300} required />
@@ -1977,7 +1951,6 @@ function ActionItemManagement({
                     createSaving ||
                     !selectedSource ||
                     creationPicDirectoryLoading ||
-                    !creationResponsibleUnitId ||
                     (!mainPicUserId && !mainPicDisplayName.trim()) ||
                     (mainPicUserId !== '__OTHER__' &&
                       Boolean(mainPicUserId) &&

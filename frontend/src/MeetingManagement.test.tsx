@@ -46,6 +46,7 @@ const meeting: MeetingRecord = {
       participant_title: 'Wakil Rektor',
     },
   ],
+  external_participants: [],
 };
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -588,6 +589,67 @@ describe('Meeting management', () => {
         body: JSON.stringify({
           expected_version: 1,
           user_id: newParticipant.user_id,
+        }),
+      }),
+    );
+  });
+
+  it('adds a named external participant from the Lainnya option', async () => {
+    const user = userEvent.setup();
+    document.cookie = 'sitara_csrf=csrf-test-token; Path=/';
+    const externalParticipant = {
+      id: '32000000-0000-4000-8000-000000000001',
+      participant_name: 'Narasumber Eksternal',
+    };
+    let participantAdded = false;
+    const fetchMock = stubFetch((url, init) => {
+      if (url === '/api/v1/meetings?limit=20&offset=0') return jsonResponse([meeting]);
+      if (url === '/api/v1/meetings/participant-options') {
+        return jsonResponse([
+          {
+            id: '20000000-0000-4000-8000-000000000004',
+            full_name: 'Pengguna Lain',
+            job_title: 'Dekan Uji',
+            roles: ['WAREK'],
+          },
+        ]);
+      }
+      if (url === `/api/v1/meetings/${meeting.id}`) {
+        return jsonResponse({
+          ...meeting,
+          external_participants: participantAdded ? [externalParticipant] : [],
+        });
+      }
+      if (url === `/api/v1/meetings/${meeting.id}/minutes-revisions`) return jsonResponse([]);
+      if (url === `/api/v1/meetings/${meeting.id}/minutes-reviews`) return jsonResponse([]);
+      if (
+        url === `/api/v1/meetings/${meeting.id}/participants/external` &&
+        init?.method === 'POST'
+      ) {
+        participantAdded = true;
+        return jsonResponse(externalParticipant, 201);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    render(<MeetingManagement authenticatedUser={secretary} />);
+    await user.click(
+      await screen.findByRole('button', { name: 'Lihat detail Rapat Evaluasi Sintetis' }),
+    );
+    await user.click(await screen.findByRole('button', { name: 'Tambah peserta' }));
+    await user.selectOptions(screen.getByLabelText('Pilih peserta'), 'other');
+
+    const nameInput = screen.getByLabelText('Nama peserta lainnya');
+    await user.type(nameInput, externalParticipant.participant_name);
+    await user.click(screen.getByRole('button', { name: 'Tambahkan peserta' }));
+
+    expect(await screen.findByText('Narasumber Eksternal')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/meetings/${meeting.id}/participants/external`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          expected_version: 1,
+          participant_name: 'Narasumber Eksternal',
         }),
       }),
     );

@@ -121,6 +121,8 @@ class AuditEventCreate(BaseModel):
             return self._validate_meeting_child_event(
                 allowed_fields={
                     "participant_user_id",
+                    "external_participant_id",
+                    "participant_type",
                     "operation",
                     "attendance_status",
                     "participant_title",

@@ -30,6 +30,14 @@ Set-Location frontend
 npm run dev -- --host 127.0.0.1
 ```
 
+Proxy API bawaan mengarah ke `http://127.0.0.1:8000`. Untuk API lokal terisolasi
+di port lain, atur target sebelum menjalankan Vite, misalnya:
+
+```powershell
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8001"
+npm.cmd run dev -- --host 127.0.0.1 --port 5174
+```
+
 Buka `http://127.0.0.1:5173/`. Pastikan API sehat dengan:
 
 ```powershell

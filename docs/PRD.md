@@ -89,11 +89,11 @@ Aktor teknis yang dikelola secara terpisah dari akun operasional Sekretariat. Be
 ## 6. Proses bisnis utama
 
 1. Sekretariat, Manager Legal, dan Warek dapat membuat rapat. Nomor rapat dapat diubah kapan saja oleh peran pengelola rapat; perubahan metadata lain hanya saat `DRAFT` atau `LIVE`. Status rapat dikelola Sekretariat atau Manager Legal.
-2. Agenda diberi nomor otomatis. Peserta dipilih dari daftar pengguna aktif; formulir tidak meminta ID, jabatan, atau status kehadiran. PIC dan PIC pendukung agenda adalah teks usulan.
+2. Agenda diberi nomor otomatis. Peserta dapat dipilih dari daftar pengguna aktif atau ditambahkan sebagai peserta lainnya dengan nama saja; peserta lainnya tidak mendapat akun atau akses SITARA. Formulir tidak meminta ID atau status kehadiran. PIC dan PIC pendukung agenda adalah teks usulan.
 3. Saat status rapat `LIVE`, pengguna aktif Sekretariat, Manager Legal, Rektor, dan Warek dapat mengedit isi notulen. Identitas notulis dapat dipilih saat rapat dibuat untuk atribusi, tetapi bukan gerbang hak edit dan tidak ada serah terima notulis. Pengiriman `base_revision_id` mencegah revisi usang menimpa perubahan terbaru.
 4. Pengguna inti yang menyunting notulen memasukkan agenda, pembahasan, putusan/arahan, PIC yang disarankan, output, dan target penyelesaian.
 5. Untuk setiap putusan, pengguna memilih `apakah_menjadi_action_item` (`Ya`/`Tidak`). `Tidak` berarti putusan tetap disimpan sebagai bagian notulen tetapi tidak membuat tugas. `Ya` memungkinkan pembuatan satu atau lebih action item.
-6. Sekretariat dan Manager Legal dapat membuat tindak lanjut, mengelola metadata/assignment, mengubah status resmi, dan memverifikasi penyelesaian. PIC dipilih dari tujuh pengguna inti aktif (Sekretariat, Manager Legal, Rektor, dan empat Warek) yang memiliki keanggotaan unit aktif; Rektor/Warek dapat menjadi PIC tetapi tidak dapat membuat atau menetapkan tindak lanjut. Tidak ada akun PIC tambahan di roster operasional. Pengguna yang ditetapkan sebagai PIC dapat mengirim progres; PIC dan Super Admin tidak dapat mengubah status resmi atau mewarisi kewenangan pengelola pada akun campuran. Setiap tindak lanjut baru memerlukan unit penanggung jawab. PIC akun memilih unit asal dari keanggotaannya; PIC nama bebas tetap dapat digunakan tanpa unit asal terverifikasi. Alasan assignment bersifat opsional dan tidak dimasukkan ke audit umum. Tindak lanjut dapat terhubung ke disposisi hanya jika sumber putusan dan revisinya sama.
+6. Sekretariat dan Manager Legal dapat membuat tindak lanjut, mengelola metadata/assignment, mengubah status resmi, dan memverifikasi penyelesaian. PIC dipilih dari tujuh pengguna inti aktif (Sekretariat, Manager Legal, Rektor, dan empat Warek) yang memiliki keanggotaan unit aktif; Rektor/Warek dapat menjadi PIC tetapi tidak dapat membuat atau menetapkan tindak lanjut. Tidak ada akun PIC tambahan di roster operasional. Pengguna yang ditetapkan sebagai PIC dapat mengirim progres; PIC dan Super Admin tidak dapat mengubah status resmi atau mewarisi kewenangan pengelola pada akun campuran. Unit penanggung jawab tugas tidak wajib; data unit yang sudah tercatat tetap dipertahankan. PIC akun memilih unit asal dari keanggotaannya; PIC nama bebas tetap dapat digunakan tanpa unit asal terverifikasi. Alasan assignment bersifat opsional dan tidak dimasukkan ke audit umum. Tindak lanjut dapat terhubung ke disposisi hanya jika sumber putusan dan revisinya sama.
 7. Setiap putusan sumber dicantumkan pada Decision Brief yang terhubung ke rapat dan revisi notulensi yang tepat. Ringkasan editorial tidak menggantikan notulensi.
 8. SITARA tidak menerima atau mengunggah rekaman rapat. Integrasi AI eksternal memerlukan persetujuan institusi; hasil yang dimasukkan ke SITARA tetap harus diperiksa manusia.
 9. PIC yang memiliki akses dapat mengirim update progres, catatan, kendala, serta bukti. Update tidak otomatis mengubah status resmi.
@@ -109,7 +109,7 @@ Prioritas: **P0** = wajib untuk MVP; **P1** = setelah alur inti berjalan; **P2**
 |---|---|---|---|
 | FR-001 | P0 | Autentikasi | Pengguna aktif dapat login/logout; kredensial salah dan akun nonaktif ditolak. |
 | FR-002 | P0 | RBAC dan pembatasan objek | API memeriksa peran dan kewenangan atas setiap objek; akses terlarang ditolak di server. |
-| FR-003 | P0 | Manajemen rapat | Pengguna berwenang dapat membuat, memperbarui metadata, dan melihat rapat sesuai izin. |
+| FR-003 | P0 | Manajemen rapat | Pengguna berwenang dapat membuat, memperbarui metadata, mengelola peserta pengguna, dan mencatat peserta non-pengguna sebagai nama tanpa memberi akses SITARA. |
 | FR-004 | P0 | Nomor rapat | Nomor unik dapat diubah oleh pengelola rapat pada semua status. |
 | FR-005 | P0 | Agenda dan pembahasan | Nomor agenda otomatis; tiap agenda memiliki PIC/PIC pendukung bebas serta beberapa pembahasan dan putusan. |
 | FR-006 | P0 | Edit notulensi saat live | Sekretariat, Manager Legal, Rektor, dan Warek dapat mengedit notulen LIVE; konflik revisi tidak menimpa data terbaru. |
@@ -147,6 +147,7 @@ Prioritas: **P0** = wajib untuk MVP; **P1** = setelah alur inti berjalan; **P2**
 14. Setiap ekspor dokumen terbatas harus melalui pemeriksaan akses dan dicatat pada audit log.
 15. Tidak ada aksi AI yang boleh mengubah status tugas atau mengesahkan dokumen secara otomatis.
 16. Decision Brief hanya dapat diajukan setelah rapat `FINAL` dan notulensi sumber memiliki review `VALID`. Pengguna aktif dalam cakupan rapat dengan role Sekretariat, Manager Legal, Rektor, atau Warek dapat menyetujui/menolak versi yang diajukan, tetapi tidak dapat meninjau versi yang dibuatnya sendiri. PIC dan Super Admin tidak berwenang.
+17. Peserta rapat yang bukan pengguna SITARA dicatat sebagai nama eksternal terpisah dari akun pengguna; catatan ini tidak membuat akun, peran, atau akses aplikasi.
 
 ## 9. Model status tugas
 

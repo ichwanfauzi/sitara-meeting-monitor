@@ -155,6 +155,9 @@ class Meeting(Base):
     participants: Mapped[list["MeetingParticipant"]] = relationship(
         back_populates="meeting", cascade="all, delete-orphan"
     )
+    external_participants: Mapped[list["MeetingExternalParticipant"]] = relationship(
+        back_populates="meeting", cascade="all, delete-orphan"
+    )
     minutes_reviews: Mapped[list["MinutesReview"]] = relationship(
         back_populates="meeting", order_by="MinutesReview.review_number"
     )
@@ -619,6 +622,27 @@ class MeetingParticipant(Base):
 
     meeting: Mapped[Meeting] = relationship(back_populates="participants")
     user: Mapped["User"] = relationship(back_populates="meeting_participations")
+
+
+class MeetingExternalParticipant(Base):
+    __tablename__ = "meeting_external_participants"
+    __table_args__ = (
+        CheckConstraint(
+            "length(trim(participant_name)) > 0",
+            name="ck_meeting_external_participants_name_not_blank",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    meeting_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("meetings.id", ondelete="CASCADE"), nullable=False
+    )
+    participant_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False
+    )
+
+    meeting: Mapped[Meeting] = relationship(back_populates="external_participants")
 
 
 class Agenda(Base):

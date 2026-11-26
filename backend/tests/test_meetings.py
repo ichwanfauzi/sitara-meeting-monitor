@@ -349,6 +349,88 @@ def test_secretariat_can_create_and_read_meeting_agenda_and_participants(
         assert session.query(MeetingParticipant).count() == 1
 
 
+def test_secretariat_can_add_and_remove_named_external_meeting_participants(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client, users["rector"].id)
+
+        response = client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/participants/external",
+            json={
+                "expected_version": meeting_data["version"],
+                "participant_name": "  Narasumber Eksternal  ",
+            },
+        )
+        assert response.status_code == 201
+        external_participant = response.json()
+        assert external_participant["participant_name"] == "Narasumber Eksternal"
+
+        detail = client.get(f"/api/v1/meetings/{meeting_data['id']}")
+        assert detail.status_code == 200
+        assert detail.json()["external_participants"] == [external_participant]
+        assert session.query(User).count() == 7
+
+        with TestClient(app) as pic_client:
+            login(pic_client, users["pic"])
+            hidden = pic_client.post(
+                f"/api/v1/meetings/{meeting_data['id']}/participants/external",
+                json={
+                    "expected_version": detail.json()["version"],
+                    "participant_name": "Peserta Tidak Berwenang",
+                },
+            )
+        assert hidden.status_code == 404
+
+        invalid_name = client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/participants/external",
+            json={
+                "expected_version": detail.json()["version"],
+                "participant_name": "   ",
+            },
+        )
+        assert invalid_name.status_code == 422
+
+        removed = client.delete(
+            f"/api/v1/meetings/{meeting_data['id']}/participants/external/"
+            f"{external_participant['id']}",
+            params={"expected_version": detail.json()["version"]},
+        )
+        assert removed.status_code == 204
+        assert (
+            client.get(f"/api/v1/meetings/{meeting_data['id']}").json()["external_participants"]
+            == []
+        )
+        participant_events = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "meeting.participant_changed",
+                AuditEvent.object_id == UUID(meeting_data["id"]),
+            )
+        ).all()
+        assert any(
+            event.after_values
+            == {
+                "external_participant_id": external_participant["id"],
+                "participant_type": "EXTERNAL",
+                "operation": "ADDED",
+                "changed_fields": "participant_name",
+            }
+            for event in participant_events
+        )
+        assert any(
+            event.before_values
+            == {
+                "external_participant_id": external_participant["id"],
+                "participant_type": "EXTERNAL",
+                "operation": "REMOVED",
+                "changed_fields": "participant_name",
+            }
+            for event in participant_events
+        )
+
+
 def test_authorized_meeting_metadata_update_is_versioned_and_audited(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:

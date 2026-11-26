@@ -18,6 +18,7 @@ from app.models.meeting import (
     DecisionBriefDecision,
     DecisionBriefVersion,
     Meeting,
+    MeetingExternalParticipant,
     MeetingParticipant,
     MinutesDecision,
     MinutesDiscussion,
@@ -33,6 +34,8 @@ from app.schemas.meetings import (
     DecisionBriefVersionCreate,
     DecisionBriefVersionResponse,
     MeetingCreate,
+    MeetingExternalParticipantCreate,
+    MeetingExternalParticipantResponse,
     MeetingMetadataUpdate,
     MeetingParticipantCreate,
     MeetingParticipantOptionResponse,
@@ -72,6 +75,7 @@ from app.services.meetings import (
     MinutesRevisionConflict,
     MinutesRevisionEditDenied,
     StaleMeetingVersion,
+    add_external_meeting_participant,
     add_meeting_participant,
     can_create_decision_brief,
     can_create_meeting,
@@ -87,6 +91,7 @@ from app.services.meetings import (
     create_minutes_revision,
     decision_brief_approval_state,
     delete_agenda,
+    delete_external_meeting_participant,
     delete_meeting_participant,
     get_meeting,
     list_decision_brief_approval_events,
@@ -131,6 +136,15 @@ def _serialize_participant(participant: MeetingParticipant) -> MeetingParticipan
     )
 
 
+def _serialize_external_participant(
+    participant: MeetingExternalParticipant,
+) -> MeetingExternalParticipantResponse:
+    return MeetingExternalParticipantResponse(
+        id=participant.id,
+        participant_name=participant.participant_name,
+    )
+
+
 def _serialize_meeting(meeting: Meeting) -> MeetingResponse:
     return MeetingResponse(
         id=meeting.id,
@@ -149,6 +163,9 @@ def _serialize_meeting(meeting: Meeting) -> MeetingResponse:
         updated_at=meeting.updated_at,
         agendas=[_serialize_agenda(agenda) for agenda in meeting.agendas],
         participants=[_serialize_participant(item) for item in meeting.participants],
+        external_participants=[
+            _serialize_external_participant(item) for item in meeting.external_participants
+        ],
     )
 
 
@@ -579,6 +596,74 @@ def delete_participant_route(
             session,
             meeting_id,
             participant_user_id,
+            user,
+            expected_version=expected_version,
+            correlation_id=request.state.correlation_id,
+        )
+    except (
+        MeetingMutationDenied,
+        MeetingMutationPersistenceError,
+        MeetingNotEditable,
+        MeetingParticipantNotFound,
+        StaleMeetingVersion,
+    ) as error:
+        _raise_meeting_mutation_error(error, request.state.correlation_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/{meeting_id}/participants/external",
+    response_model=MeetingExternalParticipantResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_external_participant(
+    meeting_id: UUID,
+    data: MeetingExternalParticipantCreate,
+    request: Request,
+    identity: CurrentIdentity,
+    session: DatabaseSession,
+    _csrf: Annotated[None, Depends(require_csrf)],
+) -> MeetingExternalParticipantResponse:
+    user = identity[1]
+    _load_visible_meeting(session, meeting_id, user)
+    try:
+        participant = add_external_meeting_participant(
+            session,
+            meeting_id,
+            user,
+            data,
+            correlation_id=request.state.correlation_id,
+        )
+    except (
+        MeetingMutationDenied,
+        MeetingMutationPersistenceError,
+        MeetingNotEditable,
+        StaleMeetingVersion,
+    ) as error:
+        _raise_meeting_mutation_error(error, request.state.correlation_id)
+    return _serialize_external_participant(participant)
+
+
+@router.delete(
+    "/{meeting_id}/participants/external/{external_participant_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_external_participant_route(
+    meeting_id: UUID,
+    external_participant_id: UUID,
+    request: Request,
+    identity: CurrentIdentity,
+    session: DatabaseSession,
+    expected_version: Annotated[int, Query(gt=0)],
+    _csrf: Annotated[None, Depends(require_csrf)],
+) -> Response:
+    user = identity[1]
+    _load_visible_meeting(session, meeting_id, user)
+    try:
+        delete_external_meeting_participant(
+            session,
+            meeting_id,
+            external_participant_id,
             user,
             expected_version=expected_version,
             correlation_id=request.state.correlation_id,
