@@ -35,6 +35,7 @@ const meeting: MeetingRecord = {
   updated_at: '2026-11-01T10:00:00Z',
   agendas: [],
   participants: [],
+  external_participants: [],
 };
 
 const revision: MinutesRevision = {

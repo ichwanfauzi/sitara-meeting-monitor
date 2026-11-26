@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import {
   getActionItems,
   getDecisionBriefHistory,
@@ -31,6 +31,13 @@ function dateTimeLabel(value: string): string {
   return Number.isNaN(parsed.getTime())
     ? value
     : new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium', timeStyle: 'short' }).format(parsed);
+}
+
+function scrollToRepositorySection(event: ReactMouseEvent<HTMLAnchorElement>): void {
+  event.preventDefault();
+  document
+    .getElementById(event.currentTarget.hash.slice(1))
+    ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function RepositoryMeetingDetail({ meeting }: { meeting: MeetingSummary }) {
@@ -126,10 +133,18 @@ function RepositoryMeetingDetail({ meeting }: { meeting: MeetingSummary }) {
       </header>
 
       <nav className="repository-section-nav" aria-label="Bagian rapat">
-        <a href="#repo-agenda">Agenda</a>
-        <a href="#repo-minutes">Notulensi</a>
-        <a href="#repo-briefs">Decision Brief</a>
-        <a href="#repo-actions">Tindak lanjut</a>
+        <a href="#repo-agenda" onClick={scrollToRepositorySection}>
+          Agenda
+        </a>
+        <a href="#repo-minutes" onClick={scrollToRepositorySection}>
+          Notulensi
+        </a>
+        <a href="#repo-briefs" onClick={scrollToRepositorySection}>
+          Decision Brief
+        </a>
+        <a href="#repo-actions" onClick={scrollToRepositorySection}>
+          Tindak lanjut
+        </a>
       </nav>
 
       <section className="surface-panel repository-detail-section" aria-labelledby="repo-agenda">

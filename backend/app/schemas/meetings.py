@@ -141,6 +141,21 @@ class MeetingParticipantCreate(BaseModel):
     user_id: UUID
 
 
+class MeetingExternalParticipantCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(gt=0)
+    participant_name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("participant_name")
+    @classmethod
+    def strip_participant_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("participant_name cannot be blank")
+        return value
+
+
 class NotetakerHandoverCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -372,6 +387,11 @@ class MeetingParticipantResponse(BaseModel):
     participant_title: str | None
 
 
+class MeetingExternalParticipantResponse(BaseModel):
+    id: UUID
+    participant_name: str
+
+
 class MeetingParticipantOptionResponse(BaseModel):
     id: UUID
     full_name: str
@@ -408,6 +428,7 @@ class MeetingResponse(BaseModel):
     updated_at: datetime
     agendas: list[AgendaResponse]
     participants: list[MeetingParticipantResponse]
+    external_participants: list[MeetingExternalParticipantResponse]
 
 
 class MinutesReviewResponse(BaseModel):

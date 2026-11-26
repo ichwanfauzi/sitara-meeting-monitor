@@ -42,7 +42,7 @@ class ActionItemCreate(BaseModel):
     source_minutes_revision_id: UUID
     source_decision_id: UUID
     disposition_id: UUID | None = None
-    responsible_unit_id: UUID
+    responsible_unit_id: UUID | None = None
     title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=20_000)
     output_expected: str | None = Field(default=None, max_length=20_000)

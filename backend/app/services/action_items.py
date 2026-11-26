@@ -545,15 +545,16 @@ def create_action_item(
         session.rollback()
         raise ActionItemSourceNotActive
     now = datetime.now(UTC)
-    responsible_unit_is_active = session.scalar(
-        select(OrganizationUnit.id).where(
-            OrganizationUnit.id == data.responsible_unit_id,
-            OrganizationUnit.is_active.is_(True),
+    if data.responsible_unit_id is not None:
+        responsible_unit_is_active = session.scalar(
+            select(OrganizationUnit.id).where(
+                OrganizationUnit.id == data.responsible_unit_id,
+                OrganizationUnit.is_active.is_(True),
+            )
         )
-    )
-    if responsible_unit_is_active is None:
-        session.rollback()
-        raise ActionItemUnitInvalid
+        if responsible_unit_is_active is None:
+            session.rollback()
+            raise ActionItemUnitInvalid
     if data.main_pic_user_id is not None and not can_assign_pic(
         session, actor, data.main_pic_user_id, at=now
     ):

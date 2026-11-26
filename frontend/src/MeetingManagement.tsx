@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import {
   ApiError,
+  addExternalMeetingParticipant,
   addMeetingParticipant,
   canAccessMinutes,
   createAgenda,
   createMinutesReview,
   createMeeting,
   deleteAgenda,
+  deleteExternalMeetingParticipant,
   deleteMeetingParticipant,
   getMeeting,
   getMeetingParticipantOptions,
@@ -111,6 +113,7 @@ function MeetingManagement({ authenticatedUser }: { authenticatedUser: Authentic
   const [saving, setSaving] = useState(false);
   const [options, setOptions] = useState<MeetingParticipantOption[]>([]);
   const [participantId, setParticipantId] = useState('');
+  const [externalParticipantName, setExternalParticipantName] = useState('');
   const [metadataOpen, setMetadataOpen] = useState(false);
   const [agendaOpen, setAgendaOpen] = useState(false);
   const [participantOpen, setParticipantOpen] = useState(false);
@@ -345,11 +348,19 @@ function MeetingManagement({ authenticatedUser }: { authenticatedUser: Authentic
     setSaving(true);
     setFormError(null);
     try {
-      await addMeetingParticipant(detail.id, {
-        expected_version: detail.version,
-        user_id: participantId,
-      });
+      if (participantId === 'other') {
+        await addExternalMeetingParticipant(detail.id, {
+          expected_version: detail.version,
+          participant_name: externalParticipantName.trim(),
+        });
+      } else {
+        await addMeetingParticipant(detail.id, {
+          expected_version: detail.version,
+          user_id: participantId,
+        });
+      }
       setParticipantId('');
+      setExternalParticipantName('');
       setParticipantOpen(false);
       await reloadDetail(detail.id);
     } catch (error) {
@@ -364,6 +375,19 @@ function MeetingManagement({ authenticatedUser }: { authenticatedUser: Authentic
     setSaving(true);
     try {
       await deleteMeetingParticipant(detail.id, userId, detail.version);
+      await reloadDetail(detail.id);
+    } catch (error) {
+      setFormError(message(error, 'Peserta gagal dihapus.'));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeExternalParticipant(participantId: string) {
+    if (!detail || !window.confirm('Hapus peserta dari rapat ini?')) return;
+    setSaving(true);
+    try {
+      await deleteExternalMeetingParticipant(detail.id, participantId, detail.version);
       await reloadDetail(detail.id);
     } catch (error) {
       setFormError(message(error, 'Peserta gagal dihapus.'));
@@ -868,7 +892,7 @@ function MeetingManagement({ authenticatedUser }: { authenticatedUser: Authentic
               </button>
             )}
           </div>
-          {detail.participants.length === 0 ? (
+          {detail.participants.length === 0 && detail.external_participants.length === 0 ? (
             <p className="dashboard-empty">Belum ada peserta.</p>
           ) : (
             <ul className="meeting-participant-list">
@@ -893,6 +917,22 @@ function MeetingManagement({ authenticatedUser }: { authenticatedUser: Authentic
                   </li>
                 );
               })}
+              {detail.external_participants.map((participant) => (
+                <li key={participant.id}>
+                  <strong>{participant.participant_name}</strong>
+                  <span className="meeting-participant-type">Lainnya</span>
+                  {editable && (
+                    <button
+                      type="button"
+                      className="text-button"
+                      disabled={saving}
+                      onClick={() => void removeExternalParticipant(participant.id)}
+                    >
+                      Hapus
+                    </button>
+                  )}
+                </li>
+              ))}
             </ul>
           )}
           {participantOpen && editable && (
@@ -910,9 +950,30 @@ function MeetingManagement({ authenticatedUser }: { authenticatedUser: Authentic
                       {option.job_title?.trim() || option.full_name}
                     </option>
                   ))}
+                  <option value="other">Lainnya</option>
                 </select>
               </label>
-              <button type="submit" className="primary-button" disabled={saving || !participantId}>
+              {participantId === 'other' && (
+                <label>
+                  Nama peserta lainnya
+                  <input
+                    type="text"
+                    maxLength={200}
+                    value={externalParticipantName}
+                    onChange={(event) => setExternalParticipantName(event.currentTarget.value)}
+                    required
+                  />
+                </label>
+              )}
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={
+                  saving ||
+                  !participantId ||
+                  (participantId === 'other' && !externalParticipantName.trim())
+                }
+              >
                 {saving ? 'Menyimpan…' : 'Tambahkan peserta'}
               </button>
             </form>

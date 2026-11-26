@@ -12,6 +12,7 @@ from app.models.meeting import (
     DecisionBriefApprovalEvent,
     DecisionBriefVersion,
     Meeting,
+    MeetingExternalParticipant,
     MeetingStatus,
     MinutesRevision,
 )
@@ -27,6 +28,64 @@ def test_alembic_revision_identifiers_fit_version_column() -> None:
 
     assert revisions
     assert all(len(revision.revision) <= 32 for revision in revisions)
+
+
+def test_external_meeting_participants_migration_creates_reversible_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "external-meeting-participants.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+
+    try:
+        command.upgrade(config, "0027_brief_optional_priority")
+        command.upgrade(config, "head")
+
+        assert "meeting_external_participants" in inspect(engine).get_table_names()
+        columns = {
+            column["name"]
+            for column in inspect(engine).get_columns("meeting_external_participants")
+        }
+        assert {"id", "meeting_id", "participant_name", "created_at"} <= columns
+
+        with Session(engine) as session:
+            creator = User(
+                email="external-attendee-migration@example.test",
+                full_name="Synthetic Meeting Creator",
+                password_hash="synthetic-only-not-used",
+            )
+            meeting = Meeting(
+                meeting_number="RAPIM-EXTERNAL-TEST",
+                title="Synthetic external attendee migration",
+                meeting_date=date(2026, 11, 26),
+                creator=creator,
+            )
+            attendee = MeetingExternalParticipant(
+                meeting=meeting,
+                participant_name="Synthetic External Attendee",
+            )
+            session.add_all((creator, meeting, attendee))
+            session.commit()
+
+            with pytest.raises(
+                RuntimeError,
+                match="Cannot downgrade while external meeting participants are recorded",
+            ):
+                command.downgrade(config, "0027_brief_optional_priority")
+
+            session.delete(attendee)
+            session.commit()
+
+        command.downgrade(config, "0027_brief_optional_priority")
+        assert "meeting_external_participants" not in inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
 
 
 def test_decision_brief_priority_migration_allows_blank_and_keeps_append_only_guards(
@@ -1131,7 +1190,7 @@ def test_user_job_title_migration_preserves_rows_and_blocks_data_loss(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
         assert user == ("Synthetic Existing User", None)
-        assert migration_head == "0027_brief_optional_priority"
+        assert migration_head == "0028_meeting_external_attendees"
 
         with engine.begin() as connection:
             connection.execute(
@@ -1207,7 +1266,7 @@ def test_audit_event_migration_is_append_only_and_refuses_data_loss(
         with engine.connect() as connection:
             assert (
                 connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-                == "0027_brief_optional_priority"
+                == "0028_meeting_external_attendees"
             )
             connection.execute(
                 text(
@@ -1550,7 +1609,7 @@ def test_evidence_quarantine_migration_backfills_existing_files(
             ).scalar_one()
 
         assert scan_event == (1, "PENDING")
-        assert migration_head == "0027_brief_optional_priority"
+        assert migration_head == "0028_meeting_external_attendees"
     finally:
         engine.dispose()
         get_settings.cache_clear()
@@ -2189,7 +2248,7 @@ def test_structured_minutes_migration_preserves_legacy_text_and_bound_review(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
 
-        assert migration_head == "0027_brief_optional_priority"
+        assert migration_head == "0028_meeting_external_attendees"
         assert (revision.format_version, revision.content) == (1, original_text)
         assert (review.minutes_revision_id, review.result) == (revision_id, "VALID")
         assert {

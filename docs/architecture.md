@@ -144,7 +144,7 @@ Folder `features` membatasi komponen/domain agar modul tidak saling mengimpor im
 Entitas inti:
 
 - Organisasi/akses: `users`, `roles`, `permissions`, `user_roles`, `role_permissions`, `units`, `user_units`, `reporting_lines`, `user_sessions`.
-- Rapat: `meetings`, `meeting_participants`, `agendas`, `meeting_status_events`, `minutes_revisions`, `minutes_reviews`, `minutes_discussions`, `minutes_decisions`, `decision_brief_versions`, `decision_brief_decisions`, `document_versions`.
+- Rapat: `meetings`, `meeting_participants`, `meeting_external_participants`, `agendas`, `meeting_status_events`, `minutes_revisions`, `minutes_reviews`, `minutes_discussions`, `minutes_decisions`, `decision_brief_versions`, `decision_brief_decisions`, `document_versions`.
 - Tindak lanjut: `action_items`, `assignments`, `progress_updates`, `approvals`, `status_histories`, `task_notes`.
 - Dokumen dan aktivitas: `documents`, `notifications`, `audit_logs`, `document_templates`; login attempt counters use `login_rate_limit_buckets`.
 
@@ -179,7 +179,7 @@ Simpan perubahan dalam `status_histories` dengan `old_status`, `new_status`, `ch
 
 ### 6.2 Assignment dan delegasi
 
-Satu tugas memiliki satu PIC utama aktif dan dapat memiliki beberapa PIC pendukung. `assignments` menyimpan penerima akun atau `assignee_display_name` untuk PIC yang tidak memiliki akun. Sekretariat dan Manager Legal aktif tanpa `SUPER_ADMIN` dapat membuat atau mengelola tindak lanjut dan menetapkan PIC dari roster inti tujuh pengguna yang memiliki keanggotaan unit aktif; Rektor/Warek dapat menjadi PIC tetapi tidak dapat membuat atau menetapkan tindak lanjut. PIC dan Super Admin tidak mewarisi kewenangan pengelola pada akun campuran. Tugas baru memerlukan unit penanggung jawab aktif; PIC akun memilih unit asal dari keanggotaan aktifnya, sedangkan PIC nama bebas tidak memiliki unit asal terverifikasi. Alasan penugasan opsional dan tidak dicatat dalam audit umum. Kolom provenance nullable dipertahankan untuk riwayat legacy. Migration `0019_assignment_audit` mencatat assignment, penggantian PIC utama, dan pengakhiran PIC pendukung sebagai event dalam transaksi yang sama. Sekretariat dan Manager Legal yang berwenang dapat mengubah status resmi tugas.
+Satu tugas memiliki satu PIC utama aktif dan dapat memiliki beberapa PIC pendukung. `assignments` menyimpan penerima akun atau `assignee_display_name` untuk PIC yang tidak memiliki akun. Sekretariat dan Manager Legal aktif tanpa `SUPER_ADMIN` dapat membuat atau mengelola tindak lanjut dan menetapkan PIC dari roster inti tujuh pengguna yang memiliki keanggotaan unit aktif; Rektor/Warek dapat menjadi PIC tetapi tidak dapat membuat atau menetapkan tindak lanjut. PIC dan Super Admin tidak mewarisi kewenangan pengelola pada akun campuran. Unit penanggung jawab tidak wajib untuk tugas baru; nilai yang sudah tersimpan tetap dipertahankan. PIC akun memilih unit asal dari keanggotaan aktifnya, sedangkan PIC nama bebas tidak memiliki unit asal terverifikasi. Alasan penugasan opsional dan tidak dicatat dalam audit umum. Kolom provenance nullable dipertahankan untuk riwayat legacy. Migration `0019_assignment_audit` mencatat assignment, penggantian PIC utama, dan pengakhiran PIC pendukung sebagai event dalam transaksi yang sama. Sekretariat dan Manager Legal yang berwenang dapat mengubah status resmi tugas.
 
 ### 6.3 Fondasi organisasi aktif
 

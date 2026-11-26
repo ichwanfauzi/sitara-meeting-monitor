@@ -127,7 +127,7 @@ export interface ActionItemCreateInput {
   source_minutes_revision_id: string;
   source_decision_id: string;
   disposition_id: string | null;
-  responsible_unit_id: string;
+  responsible_unit_id?: string | null;
   title: string;
   description: string;
   output_expected: string | null;
@@ -264,6 +264,11 @@ export interface MeetingParticipant {
   participant_title?: string | null;
 }
 
+export interface MeetingExternalParticipant {
+  id: string;
+  participant_name: string;
+}
+
 export interface MeetingParticipantOption {
   id: string;
   full_name: string;
@@ -286,6 +291,7 @@ export interface MeetingSummary {
   created_by_id?: string;
   notetaker_id?: string | null;
   participants?: MeetingParticipant[];
+  external_participants?: MeetingExternalParticipant[];
 }
 
 export interface MeetingRecord extends MeetingSummary {
@@ -297,6 +303,7 @@ export interface MeetingRecord extends MeetingSummary {
   created_at: string;
   updated_at: string;
   participants: MeetingParticipant[];
+  external_participants: MeetingExternalParticipant[];
 }
 
 export interface MeetingCreateInput {
@@ -326,6 +333,11 @@ export interface AgendaUpdateInput extends Omit<AgendaCreateInput, 'expected_ver
 export interface MeetingParticipantCreateInput {
   expected_version: number;
   user_id: string;
+}
+
+export interface MeetingExternalParticipantCreateInput {
+  expected_version: number;
+  participant_name: string;
 }
 
 export interface MeetingMetadataUpdateInput {
@@ -901,6 +913,16 @@ export function addMeetingParticipant(
   );
 }
 
+export function addExternalMeetingParticipant(
+  meetingId: string,
+  data: MeetingExternalParticipantCreateInput,
+): Promise<MeetingExternalParticipant> {
+  return requestJson<MeetingExternalParticipant>(
+    `/api/v1/meetings/${encodeURIComponent(meetingId)}/participants/external`,
+    { method: 'POST', body: JSON.stringify(data) },
+  );
+}
+
 export async function deleteMeetingParticipant(
   meetingId: string,
   participantUserId: string,
@@ -909,6 +931,18 @@ export async function deleteMeetingParticipant(
   await requestJson<null>(
     `/api/v1/meetings/${encodeURIComponent(meetingId)}/participants/` +
       `${encodeURIComponent(participantUserId)}?expected_version=${expectedVersion}`,
+    { method: 'DELETE' },
+  );
+}
+
+export async function deleteExternalMeetingParticipant(
+  meetingId: string,
+  externalParticipantId: string,
+  expectedVersion: number,
+): Promise<void> {
+  await requestJson<null>(
+    `/api/v1/meetings/${encodeURIComponent(meetingId)}/participants/external/` +
+      `${encodeURIComponent(externalParticipantId)}?expected_version=${expectedVersion}`,
     { method: 'DELETE' },
   );
 }

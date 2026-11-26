@@ -28,6 +28,7 @@ from app.models.meeting import (
     DecisionBriefDecision,
     DecisionBriefVersion,
     Meeting,
+    MeetingExternalParticipant,
     MeetingNotetakerHandover,
     MeetingParticipant,
     MeetingStatus,
@@ -48,6 +49,7 @@ from app.schemas.meetings import (
     DecisionBriefApprovalState,
     DecisionBriefVersionCreate,
     MeetingCreate,
+    MeetingExternalParticipantCreate,
     MeetingMetadataUpdate,
     MeetingParticipantCreate,
     MinutesReviewCreate,
@@ -283,6 +285,7 @@ def list_meetings(
     statement = select(Meeting).options(
         selectinload(Meeting.agendas),
         selectinload(Meeting.participants).selectinload(MeetingParticipant.user),
+        selectinload(Meeting.external_participants),
     )
     normalized_query = (query or "").strip()
     if normalized_query:
@@ -307,6 +310,7 @@ def get_meeting(session: Session, meeting_id: UUID) -> Meeting | None:
         .options(
             selectinload(Meeting.agendas),
             selectinload(Meeting.participants).selectinload(MeetingParticipant.user),
+            selectinload(Meeting.external_participants),
         )
         .where(Meeting.id == meeting_id)
     )
@@ -618,6 +622,50 @@ def add_meeting_participant(
     return result
 
 
+def add_external_meeting_participant(
+    session: Session,
+    meeting_id: UUID,
+    actor: User,
+    data: MeetingExternalParticipantCreate,
+    *,
+    correlation_id: UUID | None,
+) -> MeetingExternalParticipant:
+    meeting = _lock_editable_meeting(
+        session, actor, meeting_id, expected_version=data.expected_version
+    )
+    participant = MeetingExternalParticipant(
+        meeting_id=meeting.id,
+        participant_name=data.participant_name,
+    )
+    meeting.external_participants.append(participant)
+    session.add(participant)
+    try:
+        session.flush()
+        _commit_meeting_mutation(
+            session,
+            meeting=meeting,
+            actor=actor,
+            action="meeting.participant_changed",
+            correlation_id=correlation_id,
+            before_values=None,
+            after_values={
+                "external_participant_id": str(participant.id),
+                "participant_type": "EXTERNAL",
+                "operation": "ADDED",
+                "changed_fields": "participant_name",
+            },
+        )
+    except (SQLAlchemyError, ValidationError) as error:
+        session.rollback()
+        if isinstance(error, IntegrityError):
+            raise DuplicateMeetingRecord from error
+        raise MeetingMutationPersistenceError from error
+    result = session.get(MeetingExternalParticipant, participant.id)
+    if result is None:
+        raise MeetingParticipantNotFound
+    return result
+
+
 def _agenda_audit_snapshot(
     agenda: Agenda, *, operation: str, changed_fields: set[str]
 ) -> dict[str, str]:
@@ -765,6 +813,44 @@ def delete_meeting_participant(
         operation="REMOVED",
         changed_fields={"user_id"},
     )
+    session.delete(participant)
+    _commit_meeting_mutation(
+        session,
+        meeting=meeting,
+        actor=actor,
+        action="meeting.participant_changed",
+        correlation_id=correlation_id,
+        before_values=before_values,
+        after_values=None,
+    )
+
+
+def delete_external_meeting_participant(
+    session: Session,
+    meeting_id: UUID,
+    external_participant_id: UUID,
+    actor: User,
+    *,
+    expected_version: int,
+    correlation_id: UUID | None,
+) -> None:
+    meeting = _lock_editable_meeting(session, actor, meeting_id, expected_version=expected_version)
+    participant = session.scalar(
+        select(MeetingExternalParticipant).where(
+            MeetingExternalParticipant.id == external_participant_id,
+            MeetingExternalParticipant.meeting_id == meeting.id,
+        )
+    )
+    if participant is None:
+        session.rollback()
+        raise MeetingParticipantNotFound
+
+    before_values = {
+        "external_participant_id": str(participant.id),
+        "participant_type": "EXTERNAL",
+        "operation": "REMOVED",
+        "changed_fields": "participant_name",
+    }
     session.delete(participant)
     _commit_meeting_mutation(
         session,

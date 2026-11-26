@@ -27,7 +27,7 @@ from app.models import meeting as meeting_models
 from app.models.auth import Role, User
 from app.models.organization import OrganizationUnit, ReportingLine, UserUnitMembership
 
-LATEST_MIGRATION = "0027_brief_optional_priority"
+LATEST_MIGRATION = "0028_meeting_external_attendees"
 UNIT_CODE = "REKTORAT"
 UNIT_NAME = "Rektorat ITPLN"
 DEMO_UNIT_CODE = "SITARA-DEMO"

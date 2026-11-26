@@ -436,6 +436,25 @@ def test_action_item_creation_records_responsible_and_pic_origin_units(
     assert persisted_item.assignments[0].pic_origin_unit_id == unit.id
 
 
+def test_action_item_creation_does_not_require_a_responsible_unit(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    payload = _task_payload(refs, main_pic_user_id=str(users["pic_main"].id))
+    payload.pop("responsible_unit_id")
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        response = client.post("/api/v1/action-items", json=payload)
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["responsible_unit"] is None
+    persisted_item = session.get(ActionItem, UUID(created["id"]))
+    assert persisted_item is not None
+    assert persisted_item.responsible_unit_id is None
+
+
 def test_action_item_creation_rejects_units_not_active_for_their_purpose(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
 ) -> None:
