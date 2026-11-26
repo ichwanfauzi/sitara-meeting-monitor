@@ -208,6 +208,7 @@ describe('DecisionBriefEditor', () => {
               id: '70000000-0000-4000-8000-000000000002',
               decision_text: 'Putusan pada revisi terbaru',
               pic_suggestion: 'PIC revisi terbaru',
+              supporting_pic_suggestion: 'Sekretariat teknis, Biro SDM',
               output_expected: 'Output revisi terbaru',
               target_date: '2027-01-15',
             },
@@ -268,6 +269,7 @@ describe('DecisionBriefEditor', () => {
       'Bahasan',
       'Putusan/Tindak Lanjut',
       'PIC',
+      'PIC pendukung',
       'Output',
       'Target Penyelesaian',
     ]) {
@@ -275,6 +277,7 @@ describe('DecisionBriefEditor', () => {
     }
     expect(table).toHaveTextContent('Evaluasi triwulan');
     expect(table).toHaveTextContent('PIC revisi terbaru');
+    expect(table).toHaveTextContent('Sekretariat teknis, Biro SDM');
     expect(table).toHaveTextContent('Output revisi terbaru');
     expect(table).toHaveTextContent('15 Januari 2027');
     const decisionInput = screen.getByRole('textbox', {

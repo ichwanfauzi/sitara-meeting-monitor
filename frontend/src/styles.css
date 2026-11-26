@@ -3337,11 +3337,15 @@ textarea:focus-visible {
 }
 
 .decision-brief-column-decision {
-  width: 42%;
+  width: 34%;
 }
 
 .decision-brief-column-pic {
-  width: 12%;
+  width: 10%;
+}
+
+.decision-brief-column-supporting-pic {
+  width: 10%;
 }
 
 .decision-brief-column-output {
@@ -5020,22 +5024,26 @@ textarea:focus-visible {
 }
 
 .minutes-preview-table th:nth-child(2) {
-  width: 22%;
+  width: 21%;
 }
 
 .minutes-preview-table th:nth-child(3) {
-  width: 37%;
+  width: 32%;
 }
 
 .minutes-preview-table th:nth-child(4) {
-  width: 12%;
+  width: 10%;
 }
 
 .minutes-preview-table th:nth-child(5) {
-  width: 17%;
+  width: 10%;
 }
 
 .minutes-preview-table th:nth-child(6) {
+  width: 15%;
+}
+
+.minutes-preview-table th:nth-child(7) {
   width: 8%;
 }
 
@@ -5156,22 +5164,26 @@ textarea:focus-visible {
   }
 
   .minutes-preview-table th:nth-child(2) {
-    width: 22%;
+    width: 21%;
   }
 
   .minutes-preview-table th:nth-child(3) {
-    width: 37%;
+    width: 32%;
   }
 
   .minutes-preview-table th:nth-child(4) {
-    width: 12%;
+    width: 10%;
   }
 
   .minutes-preview-table th:nth-child(5) {
-    width: 17%;
+    width: 10%;
   }
 
   .minutes-preview-table th:nth-child(6) {
+    width: 15%;
+  }
+
+  .minutes-preview-table th:nth-child(7) {
     width: 8%;
   }
 
@@ -6586,11 +6598,15 @@ textarea:focus-visible {
 }
 
 .repository-brief-column-decision {
-  width: 38%;
+  width: 31%;
 }
 
 .repository-brief-column-pic {
-  width: 12%;
+  width: 10%;
+}
+
+.repository-brief-column-supporting-pic {
+  width: 10%;
 }
 
 .repository-brief-column-output {
@@ -6598,7 +6614,7 @@ textarea:focus-visible {
 }
 
 .repository-brief-column-target {
-  width: 11%;
+  width: 10%;
 }
 
 .repository-brief-table tr:last-child td {

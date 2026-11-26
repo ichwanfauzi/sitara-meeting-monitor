@@ -191,7 +191,8 @@ tabel tersendiri dan dicetak dalam format landscape.
 
 Selama sesi LIVE, pengguna aktif Sekretariat, Manager Legal, Rektor, dan Warek dapat mengedit notulensi. Notulis opsional dipilih saat rapat dibuat untuk atribusi, bukan sebagai gerbang edit. Setiap editor mengirim revisi lengkap dengan `base_revision_id`; revisi usang ditolak agar tidak menimpa perubahan yang lebih baru. Kolaborasi real-time belum tersedia.
 
-Form editor mengelompokkan pokok bahasan, putusan/arahan, PIC usulan, output, dan target
+Form editor mengelompokkan pokok bahasan, putusan/arahan, PIC usulan, PIC pendukung opsional,
+output, dan target
 secara berurutan di dalam kartu agenda. Seluruh isi tetap dikirim sebagai satu snapshot
 revisi terstruktur. Revisi teks lama tetap tersimpan; isinya tidak disalin atau dipetakan
 ke agenda secara otomatis. Detail PIC, output, dan target hanya ditampilkan setelah putusan
@@ -201,9 +202,10 @@ daftar bernomor di dalam baris yang sama. Nomor hanya ditampilkan pada putusan; 
 dan Target di kolom masing-masing tidak diberi nomor berulang. Target penyelesaian dapat diisi
 sebagai tanggal atau teks manual. Pratinjau cetak mengikuti notula formal landscape dan
 menambahkan kolom nomor.
-Pengguna inti yang menyunting mencatat teks putusan, PIC usulan, output, target tanggal atau
-teks, dan penanda kebutuhan tindak lanjut. PIC usulan pada notulen adalah teks bebas, bukan
-identitas atau assignment resmi. Riwayat teknis revisi tidak ditampilkan di editor.
+Pengguna inti yang menyunting mencatat teks putusan, PIC usulan, PIC pendukung opsional, output,
+target tanggal atau teks, dan penanda kebutuhan tindak lanjut. Kedua kolom PIC pada notulen
+adalah teks bebas, bukan identitas atau assignment resmi. Riwayat teknis revisi tidak ditampilkan
+di editor.
 
 ### 7.5 Putusan dan detail action item
 

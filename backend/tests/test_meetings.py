@@ -46,6 +46,7 @@ class DecisionPayload(TypedDict):
     target_date: str
     is_action_item: bool
     pic_suggestion: NotRequired[str]
+    supporting_pic_suggestion: NotRequired[str]
     proposed_pic_user_id: NotRequired[str]
 
 
@@ -1574,6 +1575,9 @@ def test_structured_minutes_revision_round_trips_agenda_discussion_and_decision(
         structured_payload["discussions"][0]["decisions"][0]["pic_suggestion"] = (
             "Warek bidang akademik"
         )
+        structured_payload["discussions"][0]["decisions"][0]["supporting_pic_suggestion"] = (
+            "Sekretariat teknis, Biro SDM"
+        )
         saved = client.post(f"{meeting_url}/minutes-revisions", json=structured_payload)
         history = client.get(f"{meeting_url}/minutes-revisions")
 
@@ -1587,6 +1591,7 @@ def test_structured_minutes_revision_round_trips_agenda_discussion_and_decision(
     assert decision["discussion_id"] == revision["discussions"][0]["id"]
     assert decision["decision_text"] == "Perbaiki pelaporan triwulan"
     assert decision["pic_suggestion"] == "Warek bidang akademik"
+    assert decision["supporting_pic_suggestion"] == "Sekretariat teknis, Biro SDM"
     assert decision["target_date"] == "2026-11-30"
     assert decision["is_action_item"] is True
     assert history.status_code == 200

@@ -275,9 +275,52 @@ describe('MinutesEditor', () => {
     await userActions.type(picSuggestion, 'Warek bidang akademik');
     expect(picSuggestion).toHaveValue('Warek bidang akademik');
 
+    const supportingPicSuggestion = within(entryForm).getByLabelText('PIC pendukung (opsional)');
+    expect(supportingPicSuggestion).not.toBeRequired();
+    await userActions.type(supportingPicSuggestion, 'Sekretariat teknis, Biro SDM');
+    expect(supportingPicSuggestion).toHaveValue('Sekretariat teknis, Biro SDM');
+
     const printPreview = screen.getByRole('table', { name: 'Pratinjau hasil rapat' });
     expect(within(printPreview).getByText('Lengkapi laporan')).toBeInTheDocument();
+    expect(within(printPreview).getByText('Sekretariat teknis, Biro SDM')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Cetak hasil notulensi' })).toBeDisabled();
+  });
+
+  it('saves the optional supporting PIC suggestion with the structured minutes', async () => {
+    const userActions = userEvent.setup();
+    const fetchMock = setupEditor({ revisions: [structuredRevision] });
+    const savedRevision = {
+      ...structuredRevision,
+      id: latestRevisionId,
+      revision_number: 2,
+      discussions: structuredRevision.discussions.map((discussion) => ({
+        ...discussion,
+        id: '60000000-0000-4000-8000-000000000003',
+        decisions: discussion.decisions.map((decision) => ({
+          ...decision,
+          id: '70000000-0000-4000-8000-000000000003',
+          discussion_id: '60000000-0000-4000-8000-000000000003',
+          supporting_pic_suggestion: 'Sekretariat teknis, Biro SDM',
+        })),
+      })),
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(savedRevision, 201));
+
+    const supportingPicSuggestion = await screen.findByLabelText('PIC pendukung (opsional)');
+    await userActions.type(supportingPicSuggestion, 'Sekretariat teknis, Biro SDM');
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
+
+    expect(await screen.findByText('Notulensi tersimpan.')).toBeInTheDocument();
+    const writeCall = fetchMock.mock.calls.find(([, options]) => options?.method === 'POST');
+    expect(
+      JSON.parse(writeCall?.[1]?.body as string).discussions[0].decisions[0]
+        .supporting_pic_suggestion,
+    ).toBe('Sekretariat teknis, Biro SDM');
+    expect(
+      within(screen.getByRole('table', { name: 'Pratinjau hasil rapat' })).getByText(
+        'Sekretariat teknis, Biro SDM',
+      ),
+    ).toBeInTheDocument();
   });
 
   it('groups agenda entry fields into a guided form while keeping the print preview table', async () => {
@@ -288,6 +331,7 @@ describe('MinutesEditor', () => {
     expect(within(form).getByLabelText('Isi pembahasan 1 agenda 1')).toBeVisible();
     expect(within(form).getByLabelText('Isi putusan 1 pembahasan 1')).toBeVisible();
     expect(within(form).getByLabelText('PIC usulan')).toBeVisible();
+    expect(within(form).getByLabelText('PIC pendukung (opsional)')).toBeVisible();
     expect(within(form).getByLabelText('Output yang diharapkan')).toBeVisible();
     expect(within(form).getByLabelText('Target penyelesaian berupa tanggal')).toBeVisible();
     expect(screen.getByRole('table', { name: 'Pratinjau hasil rapat' })).toBeInTheDocument();
@@ -436,6 +480,7 @@ describe('MinutesEditor', () => {
             {
               decision_text: 'Lengkapi laporan',
               pic_suggestion: null,
+              supporting_pic_suggestion: null,
               output_expected: null,
               target_date: null,
               target_text: null,
@@ -480,6 +525,7 @@ describe('MinutesEditor', () => {
             {
               decision_text: 'Lengkapi laporan',
               pic_suggestion: null,
+              supporting_pic_suggestion: null,
               output_expected: 'Laporan revisi',
               target_date: '2026-11-30',
               target_text: null,
@@ -561,6 +607,7 @@ describe('MinutesEditor', () => {
             {
               decision_text: 'Lengkapi laporan',
               pic_suggestion: null,
+              supporting_pic_suggestion: null,
               output_expected: 'Laporan revisi',
               target_date: '2026-11-30',
               target_text: null,

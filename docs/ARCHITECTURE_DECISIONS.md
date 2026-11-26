@@ -628,3 +628,19 @@ separate prevents them from being mistaken for authenticated users.
 **Impact:** Migration `0028_meeting_external_attendees` adds
 `meeting_external_participants` with a guarded downgrade when entries exist.
 The API returns these names separately from account-backed participants.
+
+## ADR-029: Optional supporting PIC on minutes decisions
+
+**Decision (2026-11-26):** A structured minutes decision may include an
+optional supporting PIC suggestion alongside its existing free-text PIC
+suggestion. Both values are informational text, not user identities or official
+assignments; official assignments continue to be recorded on Action Items.
+Surface the supporting suggestion in the minutes editor, saved revision,
+Decision Brief source table, and repository print view.
+
+**Reason:** Allow note-takers to capture supporting roles in the meeting record
+without conflating proposed PICs with authorized operational assignments.
+
+**Impact:** Migration `0029_minutes_supporting_pic` adds a nullable,
+length-limited field to `minutes_decisions`; its downgrade refuses to discard
+stored suggestions.

@@ -59,6 +59,7 @@ const currentRevision = {
           decision_number: 1,
           decision_text: 'PUTUSAN LENGKAP TERBARU',
           pic_suggestion: 'Wakil Rektor I',
+          supporting_pic_suggestion: 'Sekretariat teknis, Biro SDM',
           output_expected: 'Laporan evaluasi',
           target_date: '2026-12-01',
           target_text: null,
@@ -167,6 +168,7 @@ describe('RepositoryMeetingDetail', () => {
     await userEvent.click(within(minutesSection).getByText('Buka notulensi'));
     expect(within(minutesSection).getByRole('button', { name: 'Cetak notulensi' })).toBeVisible();
     expect(within(minutesSection).getByText('Catatan terbaru')).toBeVisible();
+    expect(within(minutesSection).getByText('Sekretariat teknis, Biro SDM')).toBeVisible();
     expect(minutesSection).not.toHaveTextContent('NOTULENSI LAMA YANG SUDAH DIGANTI');
 
     const briefSection = screen.getByRole('region', { name: 'Decision Brief' });
@@ -191,10 +193,12 @@ describe('RepositoryMeetingDetail', () => {
       'repository-brief-column-topic',
       'repository-brief-column-decision',
       'repository-brief-column-pic',
+      'repository-brief-column-supporting-pic',
       'repository-brief-column-output',
       'repository-brief-column-target',
     ]);
     expect(printTable.closest('[data-print-target="true"]')).not.toBeNull();
+    expect(printTable).toHaveTextContent('Sekretariat teknis, Biro SDM');
     expect(print).toHaveBeenCalledOnce();
   });
 

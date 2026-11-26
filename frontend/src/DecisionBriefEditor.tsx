@@ -47,6 +47,7 @@ interface DecisionBriefTableRow {
   discussionSubject: string | null;
   briefText: string;
   picSuggestion: string | null;
+  supportingPicSuggestion: string | null;
   outputExpected: string | null;
   targetDate: string | null;
   targetText: string | null;
@@ -143,6 +144,7 @@ function rowsForBrief(
         discussionSubject: briefDecision.source_discussion_subject,
         briefText: briefDecision.brief_text ?? '',
         picSuggestion: sourceDecision?.pic_suggestion ?? null,
+        supportingPicSuggestion: sourceDecision?.supporting_pic_suggestion ?? null,
         outputExpected: sourceDecision?.output_expected ?? null,
         targetDate: sourceDecision?.target_date ?? null,
         targetText: sourceDecision?.target_text ?? null,
@@ -174,6 +176,7 @@ function DecisionBriefTable({
           <col className="decision-brief-column-topic" />
           <col className="decision-brief-column-decision" />
           <col className="decision-brief-column-pic" />
+          <col className="decision-brief-column-supporting-pic" />
           <col className="decision-brief-column-output" />
           <col className="decision-brief-column-target" />
         </colgroup>
@@ -183,6 +186,7 @@ function DecisionBriefTable({
             <th scope="col">Bahasan</th>
             <th scope="col">Putusan/Tindak Lanjut</th>
             <th scope="col">PIC</th>
+            <th scope="col">PIC pendukung</th>
             <th scope="col">Output</th>
             <th scope="col">Target Penyelesaian</th>
           </tr>
@@ -216,6 +220,7 @@ function DecisionBriefTable({
                   )}
                 </td>
                 <td>{row.picSuggestion || '—'}</td>
+                <td>{row.supportingPicSuggestion || '—'}</td>
                 <td>{row.outputExpected || '—'}</td>
                 <td>{row.targetDate ? readableDate(row.targetDate) : row.targetText || '—'}</td>
               </tr>
@@ -280,6 +285,7 @@ function DecisionBriefEditor({ authenticatedUser, targetMeetingId }: DecisionBri
         discussionSubject,
         briefText: briefTexts[decision.id] ?? '',
         picSuggestion: decision.pic_suggestion ?? null,
+        supportingPicSuggestion: decision.supporting_pic_suggestion ?? null,
         outputExpected: decision.output_expected,
         targetDate: decision.target_date,
         targetText: decision.target_text,

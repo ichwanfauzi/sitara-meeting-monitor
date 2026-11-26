@@ -9,11 +9,14 @@ from alembic.script import ScriptDirectory
 from app.core.config import get_settings
 from app.models.auth import User
 from app.models.meeting import (
+    Agenda,
     DecisionBriefApprovalEvent,
     DecisionBriefVersion,
     Meeting,
     MeetingExternalParticipant,
     MeetingStatus,
+    MinutesDecision,
+    MinutesDiscussion,
     MinutesRevision,
 )
 from sqlalchemy import create_engine, inspect, text
@@ -83,6 +86,123 @@ def test_external_meeting_participants_migration_creates_reversible_table(
 
         command.downgrade(config, "0027_brief_optional_priority")
         assert "meeting_external_participants" not in inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_minutes_supporting_pic_migration_limits_values_and_guards_downgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "minutes-supporting-pic.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+
+    try:
+        command.upgrade(config, "0028_meeting_external_attendees")
+        command.upgrade(config, "head")
+
+        actor_id = uuid4()
+        meeting_id = uuid4()
+        agenda_id = uuid4()
+        revision_id = uuid4()
+        discussion_id = uuid4()
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    User(
+                        id=actor_id,
+                        email="supporting-pic-migration@example.test",
+                        full_name="Synthetic Supporting PIC User",
+                        password_hash="synthetic-only-not-used",
+                        is_active=True,
+                    ),
+                    Meeting(
+                        id=meeting_id,
+                        meeting_number="SUPPORTING-PIC-MIGRATION-001",
+                        title="Synthetic supporting PIC migration",
+                        meeting_date=date(2026, 11, 26),
+                        created_by_id=actor_id,
+                    ),
+                    Agenda(
+                        id=agenda_id,
+                        meeting_id=meeting_id,
+                        agenda_number=1,
+                        title="Synthetic migration agenda",
+                    ),
+                    MinutesRevision(
+                        id=revision_id,
+                        meeting_id=meeting_id,
+                        revision_number=1,
+                        format_version=2,
+                        content=None,
+                        created_by_id=actor_id,
+                    ),
+                    MinutesDiscussion(
+                        id=discussion_id,
+                        meeting_id=meeting_id,
+                        minutes_revision_id=revision_id,
+                        agenda_id=agenda_id,
+                        discussion_number=1,
+                        content="Synthetic migration discussion",
+                    ),
+                    MinutesDecision(
+                        meeting_id=meeting_id,
+                        minutes_revision_id=revision_id,
+                        discussion_id=discussion_id,
+                        decision_number=1,
+                        decision_text="Synthetic migration decision",
+                        supporting_pic_suggestion="Synthetic supporting PIC",
+                    ),
+                ]
+            )
+            session.commit()
+
+        with engine.connect() as connection:
+            meeting_key, revision_key, discussion_key = connection.execute(
+                text(
+                    "SELECT meeting_id, minutes_revision_id, discussion_id "
+                    "FROM minutes_decisions LIMIT 1"
+                )
+            ).one()
+        with pytest.raises(IntegrityError), engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO minutes_decisions "
+                    "(id, meeting_id, minutes_revision_id, discussion_id, decision_number, "
+                    "decision_text, supporting_pic_suggestion, is_action_item) "
+                    "VALUES (:id, :meeting_id, :revision_id, :discussion_id, 2, "
+                    "'Synthetic excessive supporting PIC', :supporting_pic, 0)"
+                ),
+                {
+                    "id": uuid4().hex,
+                    "meeting_id": meeting_key,
+                    "revision_id": revision_key,
+                    "discussion_id": discussion_key,
+                    "supporting_pic": "x" * 2_001,
+                },
+            )
+
+        with pytest.raises(
+            RuntimeError,
+            match="Cannot downgrade while supporting PIC suggestions are stored",
+        ):
+            command.downgrade(config, "0028_meeting_external_attendees")
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0029_minutes_supporting_pic"
+            )
+            columns = {
+                column["name"] for column in inspect(connection).get_columns("minutes_decisions")
+            }
+            assert "supporting_pic_suggestion" in columns
     finally:
         engine.dispose()
         get_settings.cache_clear()
@@ -1192,7 +1312,7 @@ def test_user_job_title_migration_preserves_rows_and_blocks_data_loss(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
         assert user == ("Synthetic Existing User", None)
-        assert migration_head == "0028_meeting_external_attendees"
+        assert migration_head == "0029_minutes_supporting_pic"
 
         with engine.begin() as connection:
             connection.execute(
@@ -1268,7 +1388,7 @@ def test_audit_event_migration_is_append_only_and_refuses_data_loss(
         with engine.connect() as connection:
             assert (
                 connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-                == "0028_meeting_external_attendees"
+                == "0029_minutes_supporting_pic"
             )
             connection.execute(
                 text(
@@ -1611,7 +1731,7 @@ def test_evidence_quarantine_migration_backfills_existing_files(
             ).scalar_one()
 
         assert scan_event == (1, "PENDING")
-        assert migration_head == "0028_meeting_external_attendees"
+        assert migration_head == "0029_minutes_supporting_pic"
     finally:
         engine.dispose()
         get_settings.cache_clear()
@@ -2250,7 +2370,7 @@ def test_structured_minutes_migration_preserves_legacy_text_and_bound_review(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
 
-        assert migration_head == "0028_meeting_external_attendees"
+        assert migration_head == "0029_minutes_supporting_pic"
         assert (revision.format_version, revision.content) == (1, original_text)
         assert (review.minutes_revision_id, review.result) == (revision_id, "VALID")
         assert {
@@ -2261,6 +2381,7 @@ def test_structured_minutes_migration_preserves_legacy_text_and_bound_review(
             column["name"] for column in inspect(engine).get_columns("minutes_decisions")
         }
         assert "pic_suggestion" in decision_columns
+        assert "supporting_pic_suggestion" in decision_columns
         with engine.begin() as connection, pytest.raises(IntegrityError):
             connection.execute(
                 text(

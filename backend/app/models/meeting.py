@@ -355,6 +355,10 @@ class MinutesDecision(Base):
             "target_text IS NULL OR length(target_text) <= 500",
             name="ck_minutes_decisions_target_text_length",
         ),
+        CheckConstraint(
+            "supporting_pic_suggestion IS NULL OR length(supporting_pic_suggestion) <= 2000",
+            name="ck_minutes_decisions_supporting_pic_suggestion_length",
+        ),
         ForeignKeyConstraint(
             ["meeting_id", "minutes_revision_id", "discussion_id"],
             [
@@ -386,6 +390,7 @@ class MinutesDecision(Base):
     decision_number: Mapped[int] = mapped_column(Integer, nullable=False)
     decision_text: Mapped[str] = mapped_column(Text, nullable=False)
     pic_suggestion: Mapped[str | None] = mapped_column(String(300))
+    supporting_pic_suggestion: Mapped[str | None] = mapped_column(String(2_000))
     output_expected: Mapped[str | None] = mapped_column(Text)
     target_date: Mapped[date | None] = mapped_column(Date)
     target_text: Mapped[str | None] = mapped_column(Text)

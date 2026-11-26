@@ -27,6 +27,7 @@ interface DiscussionDraft {
 interface DecisionDraft {
   decision_text: string;
   pic_suggestion: string;
+  supporting_pic_suggestion: string;
   output_expected: string;
   target_kind: 'DATE' | 'TEXT';
   target_date: string;
@@ -74,6 +75,7 @@ function structuredDraftFrom(revision: MinutesRevision | null): DiscussionDraft[
     decisions: discussion.decisions.map((decision) => ({
       decision_text: decision.decision_text,
       pic_suggestion: decision.pic_suggestion ?? '',
+      supporting_pic_suggestion: decision.supporting_pic_suggestion ?? '',
       output_expected: decision.output_expected ?? '',
       target_kind: decision.target_text ? 'TEXT' : 'DATE',
       target_date: decision.target_date ?? '',
@@ -94,6 +96,7 @@ function structuredSnapshot(discussions: DiscussionDraft[]): StructuredMinutesRe
       decisions: discussion.decisions.map((decision) => ({
         decision_text: decision.decision_text,
         pic_suggestion: decision.pic_suggestion.trim() || null,
+        supporting_pic_suggestion: decision.supporting_pic_suggestion.trim() || null,
         output_expected: decision.output_expected.trim() || null,
         target_date: decision.target_kind === 'DATE' ? decision.target_date || null : null,
         target_text: decision.target_kind === 'TEXT' ? decision.target_text.trim() || null : null,
@@ -393,6 +396,28 @@ function MinutesGuidedEditor({
                                               }
                                             />
                                           </label>
+                                          <label className="minutes-table-field">
+                                            PIC pendukung (opsional)
+                                            <input
+                                              aria-label="PIC pendukung (opsional)"
+                                              className="minutes-input"
+                                              disabled={fieldsDisabled}
+                                              maxLength={2_000}
+                                              value={decision.supporting_pic_suggestion}
+                                              onChange={(event) =>
+                                                onUpdateDiscussion(discussionIndex, (current) =>
+                                                  updateDecision(
+                                                    current,
+                                                    decisionIndex,
+                                                    (item) => ({
+                                                      ...item,
+                                                      supporting_pic_suggestion: event.target.value,
+                                                    }),
+                                                  ),
+                                                )
+                                              }
+                                            />
+                                          </label>
                                           <label className="minutes-table-field minutes-guided-output">
                                             Output yang diharapkan
                                             <textarea
@@ -507,6 +532,7 @@ function MinutesGuidedEditor({
                                     {
                                       decision_text: '',
                                       pic_suggestion: '',
+                                      supporting_pic_suggestion: '',
                                       output_expected: '',
                                       target_kind: 'DATE',
                                       target_date: '',
@@ -1072,6 +1098,7 @@ function MinutesEditor({
                         <th scope="col">Agenda/Pokok Bahasan</th>
                         <th scope="col">Putusan/Arahan &amp; Tindak Lanjut</th>
                         <th scope="col">PIC</th>
+                        <th scope="col">PIC pendukung</th>
                         <th scope="col">Output</th>
                         <th scope="col">Target</th>
                       </tr>
@@ -1116,6 +1143,17 @@ function MinutesEditor({
                                 decisions.map((decision, decisionIndex) => (
                                   <p key={decisionIndex}>
                                     {decision.pic_suggestion || 'Belum ditentukan'}
+                                  </p>
+                                ))
+                              ) : (
+                                <p>Belum ditentukan</p>
+                              )}
+                            </td>
+                            <td className="minutes-preview-cell-list">
+                              {decisions.length ? (
+                                decisions.map((decision, decisionIndex) => (
+                                  <p key={decisionIndex}>
+                                    {decision.supporting_pic_suggestion || 'Belum ditentukan'}
                                   </p>
                                 ))
                               ) : (

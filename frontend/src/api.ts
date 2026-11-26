@@ -357,6 +357,7 @@ export interface MinutesDecision {
   decision_number: number;
   decision_text: string;
   pic_suggestion?: string | null;
+  supporting_pic_suggestion?: string | null;
   output_expected: string | null;
   target_date: string | null;
   target_text: string | null;
@@ -463,6 +464,7 @@ export interface StructuredMinutesDiscussionInput {
   decisions: {
     decision_text: string;
     pic_suggestion?: string | null;
+    supporting_pic_suggestion?: string | null;
     output_expected: string | null;
     target_date: string | null;
     target_text: string | null;

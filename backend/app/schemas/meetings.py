@@ -190,6 +190,7 @@ class MinutesDecisionCreate(BaseModel):
 
     decision_text: str = Field(min_length=1, max_length=20_000)
     pic_suggestion: str | None = Field(default=None, max_length=300)
+    supporting_pic_suggestion: str | None = Field(default=None, max_length=2_000)
     output_expected: str | None = Field(default=None, max_length=20_000)
     target_date: date | None = None
     target_text: str | None = Field(default=None, max_length=500)
@@ -205,6 +206,14 @@ class MinutesDecisionCreate(BaseModel):
     @field_validator("pic_suggestion")
     @classmethod
     def strip_pic_suggestion(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @field_validator("supporting_pic_suggestion")
+    @classmethod
+    def strip_supporting_pic_suggestion(cls, value: str | None) -> str | None:
         if value is None:
             return None
         value = value.strip()
@@ -448,6 +457,7 @@ class MinutesDecisionResponse(BaseModel):
     decision_number: int
     decision_text: str
     pic_suggestion: str | None
+    supporting_pic_suggestion: str | None
     output_expected: str | None
     target_date: date | None
     target_text: str | None

@@ -226,6 +226,7 @@ def _serialize_minutes_revisions(
                 decision_number=decision.decision_number,
                 decision_text=decision.decision_text,
                 pic_suggestion=decision.pic_suggestion,
+                supporting_pic_suggestion=decision.supporting_pic_suggestion,
                 output_expected=decision.output_expected,
                 target_date=decision.target_date,
                 target_text=decision.target_text,

@@ -230,6 +230,7 @@ function RepositoryMeetingDetail({ meeting }: { meeting: MeetingSummary }) {
                         <th scope="col">Agenda/Pokok Bahasan</th>
                         <th scope="col">Putusan/Arahan &amp; Tindak Lanjut</th>
                         <th scope="col">PIC</th>
+                        <th scope="col">PIC pendukung</th>
                         <th scope="col">Output</th>
                         <th scope="col">Target</th>
                       </tr>
@@ -269,6 +270,17 @@ function RepositoryMeetingDetail({ meeting }: { meeting: MeetingSummary }) {
                                 discussion.decisions.map((decision) => (
                                   <p key={decision.id}>
                                     {decision.pic_suggestion || 'Belum ditentukan'}
+                                  </p>
+                                ))
+                              ) : (
+                                <p>Belum ditentukan</p>
+                              )}
+                            </td>
+                            <td className="minutes-preview-cell-list">
+                              {discussion.decisions.length ? (
+                                discussion.decisions.map((decision) => (
+                                  <p key={decision.id}>
+                                    {decision.supporting_pic_suggestion || 'Belum ditentukan'}
                                   </p>
                                 ))
                               ) : (
@@ -351,6 +363,7 @@ function RepositoryMeetingDetail({ meeting }: { meeting: MeetingSummary }) {
                       <col className="repository-brief-column-topic" />
                       <col className="repository-brief-column-decision" />
                       <col className="repository-brief-column-pic" />
+                      <col className="repository-brief-column-supporting-pic" />
                       <col className="repository-brief-column-output" />
                       <col className="repository-brief-column-target" />
                     </colgroup>
@@ -360,6 +373,7 @@ function RepositoryMeetingDetail({ meeting }: { meeting: MeetingSummary }) {
                         <th scope="col">Bahasan</th>
                         <th scope="col">Putusan/Tindak Lanjut</th>
                         <th scope="col">PIC</th>
+                        <th scope="col">PIC pendukung</th>
                         <th scope="col">Output</th>
                         <th scope="col">Target Penyelesaian</th>
                       </tr>
@@ -385,6 +399,9 @@ function RepositoryMeetingDetail({ meeting }: { meeting: MeetingSummary }) {
                               <small>Prioritas: {decision.priority || 'Belum ditentukan'}</small>
                             </td>
                             <td>{sourceDecision?.pic_suggestion || 'Belum ditentukan'}</td>
+                            <td>
+                              {sourceDecision?.supporting_pic_suggestion || 'Belum ditentukan'}
+                            </td>
                             <td>{sourceDecision?.output_expected || 'Belum ditentukan'}</td>
                             <td>
                               {sourceDecision?.target_date
