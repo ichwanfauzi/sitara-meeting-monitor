@@ -434,9 +434,10 @@ COMMIT;
 -- 1. Enforce "only Secretariat changes official task status" in backend
 --    authorization and in a database trigger/RLS policy before production.
 -- 2. Enforce that a FINAL meeting has an authorized finalizer and that
---    only its designated notetaker can edit during LIVE status in backend.
--- 3. Enforce that only authorized leadership/Secretariat can read complete
---    minutes and decision briefs; PIC sees only assigned task data.
+--    active Secretariat/Rektor/Warek users can edit during LIVE; notetaker
+--    identity is attribution, not an exclusive edit gate.
+-- 3. Enforce that Secretariat/Rektor/Warek can read complete minutes and
+--    Decision Briefs across Rapim; PIC sees only assigned task data.
 -- 4. Validate that an ACTION_ITEM decision has a corresponding action_items
 --    row, and a non-action-item decision does not have one, using a
 --    transactional service or deferred constraint trigger.
@@ -446,5 +447,5 @@ COMMIT;
 --    production. Do not use a database superuser for the web application.
 -- 7. Add a trigger to append status_histories and audit_logs atomically when
 --    official_status changes. Restrict direct updates to action_items.
--- 8. For live minutes, use a single designated notetaker as writer. Other
---    authorized viewers receive read-only access during LIVE status.
+-- 8. For live minutes, allow all three core roles to append revisions using
+--    base_revision_id concurrency checks. Keep notetaker identity for attribution.

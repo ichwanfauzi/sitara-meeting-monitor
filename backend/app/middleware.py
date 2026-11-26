@@ -1,12 +1,41 @@
 """Request middleware for early evidence upload size enforcement."""
 
 import json
+from uuid import uuid4
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
 class _EvidenceRequestTooLarge(Exception):
     pass
+
+
+class RequestCorrelationIdMiddleware:
+    """Assign a server-generated correlation ID to each HTTP request."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        correlation_id = uuid4()
+        scope.setdefault("state", {})["correlation_id"] = correlation_id
+
+        async def send_with_correlation_id(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"x-correlation-id"
+                ]
+                headers.append((b"x-correlation-id", str(correlation_id).encode("ascii")))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_correlation_id)
 
 
 class EvidenceUploadSizeLimitMiddleware:

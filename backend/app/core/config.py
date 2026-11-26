@@ -5,10 +5,11 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DNS_LABEL_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+_EMAIL_PATTERN = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
 
 
 class Settings(BaseSettings):
@@ -23,6 +24,17 @@ class Settings(BaseSettings):
     clamav_port: int = Field(default=3310, ge=1, le=65_535)
     clamav_timeout_seconds: int = Field(default=30, ge=1, le=300)
     evidence_scan_poll_seconds: int = Field(default=5, ge=1, le=300)
+    notification_email_enabled: bool = False
+    notification_email_test_recipient: str | None = None
+    notification_email_poll_seconds: int = Field(default=15, ge=1, le=300)
+    notification_email_max_attempts: int = Field(default=5, ge=1, le=20)
+    notification_email_retry_base_seconds: int = Field(default=60, ge=1, le=3600)
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = Field(default=587, ge=1, le=65_535)
+    smtp_timeout_seconds: int = Field(default=15, ge=1, le=120)
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_from_email: str | None = None
     session_ttl_seconds: int = 43_200
     login_rate_limit_hmac_key: SecretStr | None = None
     login_rate_limit_max_attempts: int = Field(default=10, ge=1, le=1000)
@@ -49,6 +61,27 @@ class Settings(BaseSettings):
             ):
                 raise ValueError("CLAMAV_HOST must be a valid hostname or IP address") from None
         return host
+
+    @field_validator("notification_email_test_recipient", "smtp_from_email")
+    @classmethod
+    def validate_email_address(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        email = value.strip()
+        if len(email) > 320 or not _EMAIL_PATTERN.fullmatch(email):
+            raise ValueError("A valid email address is required")
+        return email
+
+    @model_validator(mode="after")
+    def restrict_test_recipient_to_nonproduction(self) -> "Settings":
+        if self.notification_email_test_recipient and self.app_env.casefold() not in {
+            "development",
+            "testing",
+        }:
+            raise ValueError(
+                "NOTIFICATION_EMAIL_TEST_RECIPIENT is only allowed in development or testing"
+            )
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

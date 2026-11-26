@@ -9,7 +9,7 @@ Act as an independent application security reviewer. Do not rewrite the implemen
 Review for:
 
 1. Authentication gaps, privilege escalation, missing server-side authorization, IDOR/BOLA, and access through alternate routes/search/export/document download.
-2. SITARA-specific policies: PIC cannot read full minutes or restricted Decision Briefs; only the designated notetaker edits live minutes; only authorized Secretariat can change official task status; completion requires verification; Super Admin is separate from operational Secretariat.
+2. SITARA-specific policies: active Secretariat, Rektor, and Warek can read all Rapim, full minutes, and Decision Briefs; those three core roles can append minutes revisions during LIVE using revision concurrency controls; PIC and Super Admin remain denied full minutes/Brief access, including mixed-role accounts; read access does not expand meeting metadata or Decision Brief write scope; only authorized Secretariat can change official task status; completion requires verification; Super Admin is separate from operational Secretariat.
 3. Validation flaws in decisions/action items, assignment hierarchy, status transitions, deadlines, document IDs, and cross-record relationships.
 4. SQL injection, unsafe file handling, path traversal, unrestricted file download, XSS, CSRF/session errors, missing rate limits, and information leakage in error responses/logs.
 5. Race conditions, duplicate notification/approval processing, weak transaction boundaries, and audit-log tampering.

@@ -31,6 +31,7 @@ services:
       APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOGIN_RATE_LIMIT_HMAC_KEY: "${LOGIN_RATE_LIMIT_HMAC_KEY:-}"
+      NOTIFICATION_EMAIL_ENABLED: "${NOTIFICATION_EMAIL_ENABLED:-false}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -117,6 +118,41 @@ services:
       - scanner-db
       - scanner
 
+  notification-email-worker:
+    image: sitara-backend:local
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.notification_email_worker"]
+    profiles:
+      - notification-email
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "${DATABASE_URL_CONTAINER:-postgresql+psycopg://sitara_app:change_me_local_only@postgres:5432/sitara_dev}"
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NOTIFICATION_EMAIL_ENABLED: "${NOTIFICATION_EMAIL_ENABLED:-false}"
+      NOTIFICATION_EMAIL_TEST_RECIPIENT: "${NOTIFICATION_EMAIL_TEST_RECIPIENT:-}"
+      NOTIFICATION_EMAIL_POLL_SECONDS: ${NOTIFICATION_EMAIL_POLL_SECONDS:-15}
+      NOTIFICATION_EMAIL_MAX_ATTEMPTS: ${NOTIFICATION_EMAIL_MAX_ATTEMPTS:-5}
+      NOTIFICATION_EMAIL_RETRY_BASE_SECONDS: ${NOTIFICATION_EMAIL_RETRY_BASE_SECONDS:-60}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_TIMEOUT_SECONDS: ${SMTP_TIMEOUT_SECONDS:-15}
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - scanner-db
+      - notification-egress
+
 volumes:
   sitara_postgres_data:
   sitara_action_item_evidence:
@@ -130,4 +166,6 @@ networks:
   scanner:
     internal: true
   clamav-egress:
+    driver: bridge
+  notification-egress:
     driver: bridge

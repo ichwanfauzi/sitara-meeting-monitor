@@ -2,6 +2,7 @@ import hashlib
 import struct
 import zlib
 from io import BytesIO
+from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
@@ -16,7 +17,11 @@ from app.services.action_item_evidence_storage import (
 )
 
 
-def _ooxml_file(part_name: str, content_type: str) -> bytes:
+def _ooxml_file(
+    part_name: str,
+    content_type: str,
+    main_part_content: str | None = None,
+) -> bytes:
     roots = {
         "word/document.xml": (
             "document",
@@ -40,7 +45,12 @@ def _ooxml_file(part_name: str, content_type: str) -> bytes:
             f'<Override PartName="/{part_name}" ContentType="{content_type}"/>'
             "</Types>",
         )
-        archive.writestr(part_name, f'<{root_name} xmlns="{namespace}"/>')
+        archive.writestr(
+            part_name,
+            main_part_content
+            if main_part_content is not None
+            else f'<{root_name} xmlns="{namespace}"/>',
+        )
     return buffer.getvalue()
 
 
@@ -108,6 +118,19 @@ def test_detects_allowlisted_evidence_from_content(
     assert detect_evidence_file_type(filename, content) == expected_type
 
 
+def test_rejects_ooxml_with_entity_declarations() -> None:
+    content = _ooxml_file(
+        "word/document.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        '<!DOCTYPE document [<!ENTITY note "synthetic">]>'
+        '<document xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "&note;</document>",
+    )
+
+    with pytest.raises(ValueError):
+        detect_evidence_file_type("entity.docx", content)
+
+
 @pytest.mark.parametrize(
     ("filename", "content"),
     [
@@ -150,7 +173,7 @@ def test_display_filename_never_contains_client_path_or_control_characters() -> 
     assert safe_display_filename("proof\r\n.pdf") == "proof.pdf"
 
 
-def test_private_storage_uses_opaque_key_and_supports_cleanup(tmp_path) -> None:
+def test_private_storage_uses_opaque_key_and_supports_cleanup(tmp_path: Path) -> None:
     content = b"%PDF-1.7 synthetic"
     storage_key, digest = store_evidence_file(tmp_path / "private", content)
 
@@ -164,7 +187,7 @@ def test_private_storage_uses_opaque_key_and_supports_cleanup(tmp_path) -> None:
     assert not stored_path.exists()
 
 
-def test_cleanup_refuses_symlinked_storage_root(tmp_path) -> None:
+def test_cleanup_refuses_symlinked_storage_root(tmp_path: Path) -> None:
     storage_root = tmp_path / "private"
     storage_root.mkdir()
     storage_key = "a" * 32
@@ -183,11 +206,11 @@ def test_cleanup_refuses_symlinked_storage_root(tmp_path) -> None:
 
 
 def test_failed_private_file_creation_leaves_no_partial_file(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from app.services import action_item_evidence_storage as storage
 
-    def fail_open(*args, **kwargs):
+    def fail_open(*args: object, **kwargs: object) -> None:
         raise OSError("synthetic filesystem failure")
 
     monkeypatch.setattr(storage.os, "open", fail_open)

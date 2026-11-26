@@ -35,7 +35,7 @@ frontend/src/
 | Legacy prototype | Target design direction | Notes |
 |---|---|---|
 | `User.role` | `users` + `roles` + `user_roles` | Enforce permission checks server-side; do not trust role sent by frontend. |
-| `Meeting` | `meetings`, `meeting_participants`, `agendas` | Preserve lifecycle and designated notetaker rules. |
+| `Meeting` | `meetings`, `meeting_participants`, `agendas` | Preserve lifecycle and per-meeting notetaker attribution; all core roles can edit minutes during LIVE. |
 | `MeetingNote` | `discussion_notes` or approved minutes tables | Keep one source of truth; clarify edit/version rules. |
 | `Decision` | `decisions` | Decisions may or may not create action items. |
 | `DecisionBrief` | `decision_briefs` linked to meeting and decisions | Treat as generated/reviewable document, not duplicate free text. |
@@ -56,15 +56,15 @@ frontend/src/
 - No production SQLAlchemy models are registered from `legacy_prototype.py`.
 - Authentication/session foundations and the initial identity migration exist; account provisioning and complete RBAC are still missing.
 - Rapim metadata models/API cover meetings, agendas, and participants with role- and object-scoped access. Minutes revisions are append-only; version 2 stores complete discussion/decision snapshots under agendas. Review attestations remain bound to an exact revision, and the editor uses the existing revision API without real-time collaboration.
-- Alembic migrations `0002_meetings_agendas`, `0003_workflow_rate_limit`, `0004_minutes_review`, `0005_versioned_minutes`, `0006_structured_minutes`, `0007_decision_brief`, and `0008_organization_scope` add meeting data, transition/rate-limit records, review attestations, versioned minutes, agenda-structured snapshots, immutable Decision Brief drafts, and empty organization-scope tables. Production migration rollout has not been verified.
+- Alembic migration code through `0024_content_audit_events` adds meeting data, transition/rate-limit records, review attestations, versioned minutes, agenda-structured snapshots, optional PIC suggestions and manual completion targets on source decisions, immutable Decision Brief versions and approval events, organization scope, centralized audit foundation, dispositions, Action Item provenance and assignment audit, meeting LIVE-editing history, Manager Legal/named PIC support, recoverable Action Item removal, separate Decision Brief editorial text, and content-free audit events for minutes and Decision Brief saves. Production migration rollout and PostgreSQL verification have not been performed.
 - `0008_organization_scope` adds units, effective-dated user memberships, and effective-dated reporting lines. It deliberately inserts no organization data. Provisioning requires an approved unit chart and employee roster; a later controlled workflow must detect overlapping effective periods, validate hierarchy cycles, and audit changes. Downgrade refuses while any organization rows exist.
 - The ORM identity metadata now matches the existing `0001_identity_sessions` email uniqueness constraint and session-user index; this alignment does not change the database schema.
 - Dashboard metrics remain labeled synthetic data and are not connected to the API.
 
 ### Meeting lifecycle and login protection baseline
 
-- `POST /api/v1/meetings/{meeting_id}/minutes-revisions` retains the legacy request `{ "content": string, "base_revision_id": UUID | null }` as version 1 and also accepts `{ "format_version": 2, "content": null, "base_revision_id": UUID | null, "discussions": [...] }`. Each discussion has an `agenda_id`, optional `subject`, nonblank `content`, and nested decisions with text and optional output, date, and action-item marker. PIC assignment, task creation, and task workflow are not implemented in this phase; unexpected assignment fields return `422`. The endpoint requires an authenticated session, CSRF header, an accessible meeting in `LIVE`, and the designated notetaker. It appends one complete snapshot and returns `201`. Version 1 text and version 2 aggregate text are capped at 1,000,000 characters; structured field lengths and list counts are bounded. A stale base returns `409`; invalid input or out-of-meeting references return `422`.
-- `GET /api/v1/meetings/{meeting_id}/minutes-revisions` returns ordered history to authorized Secretariat or leadership users in meeting scope. Responses add `format_version` and `discussions`; legacy revisions retain their original `content` and have an empty discussion list, while version 2 has `content: null` and full nested data. PIC and Super Admin are denied even when they also hold another role. Unknown or inaccessible meetings return `404`.
+- `POST /api/v1/meetings/{meeting_id}/minutes-revisions` retains the legacy request `{ "content": string, "base_revision_id": UUID | null }` as version 1 and also accepts `{ "format_version": 2, "content": null, "base_revision_id": UUID | null, "discussions": [...] }`. Each discussion has an `agenda_id`, optional `subject`, nonblank `content`, and nested decisions with text, optional PIC suggestion text, output, date, and action-item marker. PIC suggestion is not an identity or assignment; task creation, assignment, and task workflow remain separate. Unexpected assignment identity fields return `422`. The endpoint requires an authenticated session, CSRF header, an accessible meeting in `LIVE`, and a Secretariat/Rektor/Warek user. It appends one complete snapshot and returns `201`; `notetaker_id` remains attribution only. Version 1 text and version 2 aggregate text are capped at 1,000,000 characters; structured field lengths and list counts are bounded. A stale base returns `409`; invalid input or out-of-meeting references return `422`.
+- `GET /api/v1/meetings/{meeting_id}/minutes-revisions` returns ordered history for Secretariat, Rektor, and Warek across all Rapim. Responses add `format_version` and `discussions`; legacy revisions retain their original `content` and have an empty discussion list, while version 2 has `content: null` and full nested data. PIC and Super Admin are denied even when they also hold another role. Unknown or inaccessible meetings return `404`.
 - `POST /api/v1/meetings/{meeting_id}/minutes-reviews` accepts `{ "minutes_revision_id": UUID, "result": "VALID" | "INVALID", "review_note"?: string }`, requires an authenticated session, CSRF header, an accessible meeting in `LIVE`, the currently active revision, and the `SEKRETARIAT` role without `SUPER_ADMIN`. It returns `201` with the meeting, revision, reviewer, per-meeting review number, result, timestamp, and optional note. A stale or wrong-meeting revision returns `409`; invalid input returns `422`.
 - `GET /api/v1/meetings/{meeting_id}/minutes-reviews` returns the ordered review history to an authenticated, authorized Secretariat user. Inaccessible meetings return `404`, and visible meetings return `403` to roles without review authority.
 - `POST /api/v1/meetings/{meeting_id}/transition` accepts `{ "to_status": "LIVE" | "FINAL" | "ARCHIVED" }`, requires the session cookie, CSRF header, and Secretariat role, and returns the updated meeting. PIC, leaders, and Super Admin cannot transition meetings; Super Admin remains excluded even if another role is also attached.
@@ -87,18 +87,23 @@ The current backend contract covers meeting metadata and the initial lifecycle t
 
 | Method and path | Access and behavior |
 |---|---|
-| `GET /api/v1/meetings` | Authenticated Sekretariat sees all meetings; Rektor/Warek see meetings where they are creator, chairperson, notetaker, or participant. Supports bounded `limit` and non-negative `offset`. |
+| `GET /api/v1/meetings` | Active Secretariat, Rektor, and Warek can read all meetings. PIC and Super Admin are denied, including mixed-role accounts. Supports bounded `limit` and non-negative `offset`. |
 | `POST /api/v1/meetings` | Sekretariat, Rektor, and Warek may create a meeting. The server sets status to `DRAFT`; request bodies cannot override status. |
 | `GET /api/v1/meetings/{meeting_id}` | Same object scope as the list; inaccessible or unknown meetings return `404`. |
-| `POST /api/v1/meetings/{meeting_id}/agendas` | Sekretariat may manage any draft; Rektor/Warek may manage a draft they created. Agenda number is unique within its meeting. |
-| `POST /api/v1/meetings/{meeting_id}/participants` | Same draft-management scope; each user can be added once per meeting. |
-| `GET /api/v1/meetings/{meeting_id}/minutes-revisions` | Secretariat and authorized leadership within meeting scope; returns ordered text or structured revisions. PIC and Super Admin are denied. |
-| `POST /api/v1/meetings/{meeting_id}/minutes-revisions` | Designated notetaker only, with session and CSRF, while `LIVE`; appends a revision only when `base_revision_id` matches the active revision. |
+| `PATCH /api/v1/meetings/{meeting_id}` | Sekretariat and in-scope Rektor/Warek can update allowlisted metadata in `DRAFT` or `LIVE` with `expected_version`; the meeting number is immutable and a LIVE notetaker change requires handover. `FINAL`/`ARCHIVED` mutations return `409`. |
+| `POST /api/v1/meetings/{meeting_id}/agendas` | Sekretariat and in-scope Rektor/Warek can add agendas in `DRAFT` or `LIVE`; agenda number is unique within its meeting. |
+| `PUT/DELETE /api/v1/meetings/{meeting_id}/agendas/{agenda_id}` | Full agenda edits and removals require the current `expected_version`; removal is rejected when an immutable minutes discussion references the agenda. |
+| `POST /api/v1/meetings/{meeting_id}/participants` | Sekretariat and in-scope Rektor/Warek can add a participant in `DRAFT` or `LIVE`; each user can be added once per meeting. |
+| `PUT/DELETE /api/v1/meetings/{meeting_id}/participants/{user_id}` | Participant attendance/title updates and removal are available in `DRAFT` or `LIVE`; edits require `expected_version`. |
+| `GET/POST /api/v1/meetings/{meeting_id}/notetaker-handovers` | Authorized meeting readers can view handover history; the current notetaker or operational Sekretariat may request a handover during `LIVE`. |
+| `POST /api/v1/meetings/{meeting_id}/notetaker-handovers/{handover_id}/approve` | Operational Sekretariat or an in-scope Rektor/Warek can approve a pending handover. Approval changes the designated notetaker atomically with a central audit event. |
+| `GET /api/v1/meetings/{meeting_id}/minutes-revisions` | Secretariat, Rektor, and Warek across all Rapim; returns ordered text or structured revisions. PIC and Super Admin are denied. |
+| `POST /api/v1/meetings/{meeting_id}/minutes-revisions` | Any active Secretariat, Rektor, or Warek user with session and CSRF while `LIVE`; appends a revision only when `base_revision_id` matches the active revision. |
 | `GET /api/v1/meetings/{meeting_id}/minutes-reviews` | Secretariat only, excluding Super Admin; returns the review history for an accessible meeting. |
 | `POST /api/v1/meetings/{meeting_id}/minutes-reviews` | Secretariat only, excluding Super Admin; accessible meetings must be `LIVE`, and `minutes_revision_id` must identify the active revision. Appends an attributable review attestation. |
 | `POST /api/v1/meetings/{meeting_id}/transition` | Secretariat only. `DRAFT → LIVE`, `LIVE → FINAL` with latest valid review, and `FINAL → ARCHIVED` are allowed; other transitions or missing/invalid review return `409`. |
 
-All write routes require the authenticated session cookie and `X-CSRF-Token` matching the `sitara_csrf` cookie. PIC has no meeting metadata access and cannot read minutes content. Super Admin is denied even if another role is also attached, preserving its separation from operational Sekretariat access. Meeting responses include lifecycle status (`DRAFT`, `LIVE`, `FINAL`, `ARCHIVED`). Revision history is append-only and ordered by revision number. Review history is also ordered by review number; finalization requires its latest result to be `VALID` and its revision ID to equal the current highest revision. A newer revision invalidates prior reviews. The same Secretariat user may review and finalize. Only Secretariat may start (`DRAFT → LIVE`) or archive (`FINAL → ARCHIVED`) a meeting.
+All write routes require the authenticated session cookie and `X-CSRF-Token` matching the `sitara_csrf` cookie. PIC has no meeting metadata access and cannot read minutes content. Super Admin is denied even if another role is also attached, preserving its separation from operational Sekretariat access. Meeting responses include lifecycle status and a concurrency `version`. Metadata, agenda, participant, lifecycle transition, and handover writes increment that version and append their relevant history atomically; meeting change audit payloads are allowlisted and do not contain minutes or Decision Brief content. Revision history is append-only and ordered by revision number. Review history is also ordered by review number; finalization requires its latest result to be `VALID` and its revision ID to equal the current highest revision. A newer revision invalidates prior reviews. The same Secretariat user may review and finalize. Only Secretariat may start (`DRAFT → LIVE`) or archive (`FINAL → ARCHIVED`) a meeting.
 
 The data path is `Meeting 1:N Agenda`, `Meeting 1:N MinutesRevision`, `MinutesRevision 1:N MinutesDiscussion`, `Agenda 1:N MinutesDiscussion`, `MinutesDiscussion 1:N MinutesDecision`, `MinutesRevision 1:N MinutesReview`, `Meeting 1:N DecisionBriefVersion`, and `DecisionBriefVersion 1:N DecisionBriefDecision`. Brief entries reference the exact source decision in the brief's source revision; their editorial priority and notes do not duplicate decision text. Action items remain a future module and must reference decisions through a non-unique foreign key because one decision may yield zero or multiple tasks.
 
@@ -140,7 +145,13 @@ The linear chain is:
 `0005_versioned_minutes` → `0006_structured_minutes` →
 `0007_decision_brief` → `0008_organization_scope` →
 `0009_action_items` → `0010_action_item_evidence` →
-`0011_evidence_scan_quarantine`.
+`0011_evidence_scan_quarantine` → `0012_user_job_title` →
+`0013_audit_foundation` → `0014_dispositions` →
+`0015_action_item_dispositions` → `0016_meeting_live_editing` →
+`0017_decision_brief_approval` -> `0018_action_item_unit_provenance` ->
+`0019_assignment_audit` -> `0020_minutes_pic_suggestion` ->
+`0021_meeting_roster_pic` -> `0022_repository_action_item_edits` ->
+`0023_minutes_manual_target` -> `0024_content_audit_events`.
 
 | Revision | Upgrade effects | Data, rollback, and operational risk |
 |---|---|---|
@@ -155,6 +166,20 @@ The linear chain is:
 | `0009_action_items` ← `0008` | Creates `action_items`, `assignments`, `progress_updates`, `completion_verifications`, and `status_histories`; adds status/provenance checks, composite FKs, partial unique assignment indexes, and integrity/append-only triggers. | No backfill. Downgrade refuses while task or history rows exist; it would otherwise remove all five tables. |
 | `0010_action_item_evidence` ← `0009` | Makes progress assignment nullable, adds `submitted_as` default `PIC`, replaces assignment constraints/guards, and creates `action_item_evidence` with file/link metadata, size/type/checksum checks, indexes, and evidence-limit/append-only guards. | Existing progress rows receive the `PIC` default. Downgrade refuses if evidence or leadership progress exists; it also removes the evidence table and the leadership-progress capability. |
 | `0011_evidence_scan_quarantine` ← `0010` | Creates append-only `action_item_evidence_scans`, event/status/checksum constraints and guards; inserts a first `PENDING` event for every existing `FILE` evidence row. | This is the chain’s data backfill; work and transaction/WAL volume scale with the number of existing files. Downgrade refuses while scan history exists. |
+| `0012_user_job_title` ← `0011` | Adds nullable `users.job_title` for separately recording a user's title without overloading organization-unit membership. | No backfill. Downgrade refuses while any job title is populated; existing user rows are preserved. |
+| `0013_audit_foundation` ← `0012` | Creates append-only `audit_events` with actor, role snapshot, action/object, correlation ID, and allowlisted before/after JSON values; adds indexes and mutation guards. | No backfill. Downgrade refuses while audit events exist. PostgreSQL blocks UPDATE/DELETE/TRUNCATE; SQLite blocks UPDATE/DELETE. |
+| `0014_dispositions` ← `0013` | Creates `dispositions` and multi-target `disposition_targets` with exact meeting/revision/decision source binding; expands audit action/object constraints to allow successful disposition creation. | No backfill. Downgrade refuses while disposition records or disposition audit events exist. SQLite rebuilds the audit table to alter checks and recreates its UPDATE/DELETE triggers. |
+| `0015_action_item_dispositions` ← `0014` | Adds nullable `action_items.disposition_id` with a composite FK binding the disposition to the same meeting, minutes revision, and decision; expands audit constraints for `action_item.created` and extends source immutability guards. | No backfill; existing Action Items remain unlinked. Downgrade refuses while linked Action Items or Action Item audit events exist. SQLite rebuilds `action_items` and `audit_events`, temporarily removing and restoring affected triggers. |
+| `0016_meeting_live_editing` ← `0015` | Adds the positive `meetings.version` concurrency token, append-only notetaker handover history with approve-once guards, and allowlisted audit actions for meeting metadata, agenda, participant, and handover mutations. | No backfill beyond version `1`. Downgrade refuses after handover or Stage 17 audit history exists. SQLite blocks UPDATE/DELETE; PostgreSQL also blocks TRUNCATE. These controls do not prevent a database owner/superuser from altering the schema or triggers. |
+| `0017_decision_brief_approval` ← `0016` | Creates append-only, exact-version-bound Decision Brief approval events; adds terminal-event uniqueness and the audit action/object allowlist for submit, withdraw, approve, and reject. | Existing versions remain drafts; no approval is fabricated. Downgrade refuses when approval history exists. SQLite blocks UPDATE/DELETE; PostgreSQL also blocks TRUNCATE. Database owners/superusers can still alter schema or triggers. |
+
+| `0018_action_item_unit_provenance` <- `0017` | Adds nullable `action_items.responsible_unit_id` and `assignments.pic_origin_unit_id` with restrictive organization-unit FKs and lookup indexes. Assignment origin records the selected active membership for each assignment history row; the task unit is immutable after creation. | No backfill: legacy tasks and assignments remain `NULL` because their historical units cannot be inferred safely. Current API writes may omit the responsible unit; if supplied, it must be active. A selected PIC origin must match an active membership. Downgrade refuses while either field is populated. SQLite and PostgreSQL protect both provenance fields from later edits. |
+| `0019_assignment_audit` <- `0018` | Extends the audit action allowlist with `action_item.assignment_changed` for assignment creation, main PIC replacement, and supporting PIC ending. | Event payload is allowlisted and omits free-form reasons. Existing append-only guards remain active. Downgrade refuses while assignment audit events exist. SQLite migration tests cover accepted and mismatched action/object pairs; PostgreSQL verification has not been run. |
+| `0020_minutes_pic_suggestion` <- `0019` | Adds nullable `minutes_decisions.pic_suggestion` (maximum 300 characters) for the PIC suggestion shown in the structured minutes table. | No backfill. Official PIC assignments remain Action Items with separate assignment history. Downgrade refuses while any suggestion is populated; SQLite API/migration tests cover round-trip storage and the schema. PostgreSQL migration verification has not been run. |
+| `0021_meeting_roster_pic` <- `0020` | Adds the Manager Legal role, active meeting participants/titles, and named PIC assignments while preserving the legacy identity/unit columns. | No production account is created by migration. Production rollout and PostgreSQL verification have not been run. |
+| `0022_repository_action_item_edits` <- `0021` | Adds Action Item soft-delete metadata, the paired deletion actor/time invariant, Decision Brief `brief_text`, and audit allowlist entries for task edits/removal. | No backfill. Downgrade refuses while soft-deleted tasks, non-null brief text, or edit audit events exist. Production rollout and PostgreSQL verification have not been run. |
+| `0023_minutes_manual_target` <- `0022` | Adds nullable `minutes_decisions.target_text` for manual completion targets, limited to 500 characters; date and text target values are mutually exclusive. | No backfill. Downgrade refuses while a manual target exists. Production rollout and PostgreSQL verification have not been run; do not apply this migration to a shared or production database without the normal migration review. |
+| `0024_content_audit_events` <- `0023` | Extends the central audit action/object allowlist with content-free `minutes.revised` and `decision_brief.saved` events. Successful snapshot writes append actor, source identifiers, revision/version, format, and decision count in the same transaction; document text is excluded. | No backfill. SQLite recreates the audit table and restores append-only triggers; PostgreSQL alters checks in place. Downgrade refuses while either event type exists. Disposable SQLite migration and API tests pass; production rollout and PostgreSQL verification have not been run. |
 
 Most revisions create new tables, but `0005`, `0006`, `0007`, and `0010`
 also alter existing tables or add constraints/indexes. The migrations use
@@ -400,7 +425,7 @@ Keep ClamAV unmounted from the evidence volume.
 The API and worker may start only after all of the following are true:
 
 - The main database is at the reviewed repository migration head
-  `0011_evidence_scan_quarantine`; migration is a separately approved,
+  `0012_user_job_title`; migration is a separately approved,
   monitored one-time operation, never an API/worker startup action.
 - A fresh custom-format PostgreSQL archive is retained in approved encrypted
   storage outside the database volume and host failure domain; that exact
@@ -538,6 +563,77 @@ quiesced across both captures. A manifest and matching archive hashes prove
 artifact identity/integrity; they do not alone prove application-level
 consistency. Restore validation must check the cross-reference and digest
 invariants above.
+
+### Restore helper guardrails (Stage 7.38)
+
+[`scripts/restore-db-to-sandbox.sh`](../scripts/restore-db-to-sandbox.sh) is
+for an isolated disposable database-only drill; it is not a production
+recovery tool and does not restore evidence. It no longer invokes Compose,
+`dropdb`, or any database deletion command. Do not run it until an authorized
+operator has separately provisioned and verified a disposable PostgreSQL 16
+container. The helper does not create, stop, or remove containers, networks,
+or volumes.
+
+The helper requires three positional arguments: a readable non-empty
+PostgreSQL custom-format archive, a new target name exactly matching
+`sitara_restore_<run-id>` (with hyphens in the run ID replaced by underscores),
+and a report path that does not already exist in an existing writable
+directory. It stages a private read-only copy of the archive and verifies and
+restores that same copy, avoiding a change between format validation and
+restore. It requires these non-secret environment identifiers:
+
+- `SITARA_RESTORE_ENVIRONMENT=disposable`
+- `SITARA_RESTORE_CONTAINER_ID` set to the full 64-character container ID
+- `SITARA_RESTORE_TARGET_HOST=container:<same-full-container-id>`
+- `SITARA_RESTORE_TARGET_PORT=5432`
+- `SITARA_RESTORE_RUN_ID` as 8-48 lowercase letters, digits, underscores, or
+  hyphens, matching the container's run label and target database suffix
+- `SITARA_RESTORE_EXPECTED_SYSTEM_IDENTIFIER` matching the PostgreSQL
+  `pg_control_system()` identity verified for that container
+- `SITARA_RESTORE_DB_USER` for the disposable cluster (the application role
+  `sitara_app` is rejected)
+- Optional comma-separated `SITARA_RESTORE_PROTECTED_DATABASES` for additional
+  protected database names, including a production name once established
+
+The container must be running the PostgreSQL 16 image, carry labels
+`sitara.restore.disposable=true` and `sitara.restore.run_id=<run-id>`, have no
+Compose project label, use exactly one dedicated Docker network containing
+only that container, store PostgreSQL data only on a dedicated tmpfs mount,
+have no persistent mounts, and publish no host ports. The supplied host is an
+identity assertion, not a network route; all database operations use
+`docker exec` against the verified container and PostgreSQL's local socket.
+The cluster must contain only PostgreSQL's built-in `postgres` database
+before the restore begins; any pre-existing user database causes rejection.
+The helper confirms the PostgreSQL system identifier, server/client major
+versions, and internal port before creating a database. Any missing or
+mismatched identity fails closed. Names and prefixes are not treated as proof
+of isolation.
+
+If `<archive>.sha256` exists, its first field must be a SHA-256 digest and is
+verified against the staged archive before format inspection. Without a
+sidecar, the helper warns and the report records `NOT_PROVIDED`; PostgreSQL
+`pg_restore --list` still must accept the archive and identify PostgreSQL 16
+as its source major. Encrypted archives must first be decrypted through the
+separately approved key process
+to a protected temporary regular file; this helper does not handle keys or
+perform decryption. Do not put credentials in command arguments, environment
+dumps, or logs.
+
+The target database is checked for existence, then created with a single
+non-overwriting `CREATE DATABASE` operation. A concurrent name collision
+fails without replacing data. Restore and post-restore checks record status,
+server version, Alembic revision when present, and non-system table count in
+the new report. On restore failure, the newly created target may be partial;
+the helper leaves it in place for controlled investigation, never removes it,
+and does not report success. The source archive is not modified. A PASS report
+proves only the database checks described above, not evidence recovery or
+application readiness.
+After a failed or partial restore, do not retry into or remove that database;
+provision a fresh disposable container with a new run ID and target name.
+
+No disposable container is provisioned by this stage, and these instructions
+are not authorization to run a restore. The source SITARA databases remain
+protected targets.
 
 ### Stage 7.4.1 decision
 

@@ -646,3 +646,21 @@ passing. It did not rerun the full backend suite or either E2E. Docker Engine
 was unavailable to that audit, so it did not freshly verify live runtime
 attachments or main-container health. The successful Stage 7.5.5 runtime
 results above remain historical evidence, not a Stage 7.5.6 runtime result.
+
+## Stage 6A — Real ClamAV and evidence verification
+
+The Stage 6A disposable daemon and HTTP/Uvicorn runs used PostgreSQL 16, a
+private tmpfs evidence store, and ClamAV 1.5.4 with signature version 28174.
+They exercised clean and EICAR uploads, scanner disconnection and timeout,
+recovery, checksum matching, authorized downloads, and Secretariat completion
+verification. The HTTP run also confirmed that infected evidence could not be
+downloaded or verified, that a PIC could not review their own request, and
+that SUPER_ADMIN alone did not authorize evidence download.
+
+The daemon run changed a stored file after a real CLEAN scan; completion
+verification correctly returned 409. This exposed and fixed a gap: verification
+now re-reads the bounded private file and checks its metadata and SHA-256 before
+marking the Action Item complete. Both harnesses reported cleanup, and the
+pre-existing Docker inventory was unchanged. Full test results and limitations
+were recorded in the Stage 6A audit trail, which is maintained outside this
+repository.

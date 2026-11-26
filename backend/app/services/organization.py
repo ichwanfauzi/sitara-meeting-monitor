@@ -8,7 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, aliased
 
 from app.core.roles import (
+    ACTION_ITEM_MANAGER_ROLES,
     MEETING_LEADER_ROLES,
+    MEETING_MANAGER_ROLES,
     PIC_ROLE,
     SECRETARIAT_ROLE,
     SUPER_ADMIN_ROLE,
@@ -43,7 +45,17 @@ def is_active_secretariat(session: Session, user: User) -> bool:
     if not _active_user(session, user.id):
         return False
     roles = _role_codes(session, user.id)
-    return SECRETARIAT_ROLE in roles and SUPER_ADMIN_ROLE not in roles
+    return roles.isdisjoint({SUPER_ADMIN_ROLE, PIC_ROLE}) and SECRETARIAT_ROLE in roles
+
+
+def is_active_action_manager(session: Session, user: User) -> bool:
+    """Return true for active Secretariat or Manager Legal operators only."""
+    if not _active_user(session, user.id):
+        return False
+    roles = _role_codes(session, user.id)
+    return roles.isdisjoint({SUPER_ADMIN_ROLE, PIC_ROLE}) and bool(
+        roles.intersection(ACTION_ITEM_MANAGER_ROLES)
+    )
 
 
 def has_active_unit_membership(
@@ -83,9 +95,18 @@ def is_in_reporting_scope(
     """Check for a current transitive reporting path through active organization members."""
     if manager_user_id == subordinate_user_id:
         return False
+    reachable = _active_reporting_scope_user_ids(session, manager_user_id, at=at)
+    return reachable is not None and subordinate_user_id in reachable
+
+
+def _active_reporting_scope_user_ids(
+    session: Session,
+    manager_user_id: UUID,
+    *,
+    at: datetime | None = None,
+) -> set[UUID] | None:
     instant = _effective_at(at)
     manager_alias = aliased(User)
-    subordinate_alias = aliased(User)
     active_members = set(
         session.scalars(
             select(UserUnitMembership.user_id)
@@ -101,9 +122,10 @@ def is_in_reporting_scope(
             .distinct()
         )
     )
-    if manager_user_id not in active_members or subordinate_user_id not in active_members:
-        return False
+    if manager_user_id not in active_members:
+        return None
 
+    subordinate_alias = aliased(User)
     edges = session.execute(
         select(ReportingLine.manager_user_id, ReportingLine.subordinate_user_id)
         .join(manager_alias, manager_alias.id == ReportingLine.manager_user_id)
@@ -128,8 +150,6 @@ def is_in_reporting_scope(
             if child_id not in reachable:
                 reachable.add(child_id)
                 pending.append(child_id)
-    if subordinate_user_id not in reachable:
-        return False
 
     # A malformed cycle must not turn reciprocal reporting links into mutual access.
     in_degree = dict.fromkeys(reachable, 0)
@@ -147,14 +167,14 @@ def is_in_reporting_scope(
                 in_degree[child_id] -= 1
                 if in_degree[child_id] == 0:
                     roots.append(child_id)
-    return acyclic_count == len(reachable)
+    return reachable if acyclic_count == len(reachable) else None
 
 
 def can_access_task_scope(
     session: Session,
     actor: User,
     *,
-    main_pic_user_id: UUID,
+    main_pic_user_id: UUID | None,
     supporting_pic_user_ids: set[UUID],
     at: datetime | None = None,
 ) -> bool:
@@ -168,14 +188,19 @@ def can_access_task_scope(
     roles = _role_codes(session, actor.id)
     if SUPER_ADMIN_ROLE in roles:
         return False
-    if SECRETARIAT_ROLE in roles:
+    if roles.intersection(ACTION_ITEM_MANAGER_ROLES) and PIC_ROLE not in roles:
         return True
+
+    assigned_pic_ids = {
+        user_id for user_id in {main_pic_user_id, *supporting_pic_user_ids} if user_id is not None
+    }
+    if actor.id in assigned_pic_ids:
+        return True
+    if PIC_ROLE in roles:
+        return False
     if not has_active_unit_membership(session, actor.id, at=at):
         return False
 
-    assigned_pic_ids = {main_pic_user_id, *supporting_pic_user_ids}
-    if PIC_ROLE in roles:
-        return actor.id in assigned_pic_ids
     if not roles.intersection(MEETING_LEADER_ROLES):
         return False
     return any(
@@ -191,14 +216,59 @@ def can_assign_pic(
     *,
     at: datetime | None = None,
 ) -> bool:
-    """Allow operational Secretariat to assign only an active, scoped PIC account."""
-    if not is_active_secretariat(session, assigner):
-        return False
-    assignee_roles = _role_codes(session, assignee_user_id)
-    if (
-        not _active_user(session, assignee_user_id)
-        or PIC_ROLE not in assignee_roles
-        or SUPER_ADMIN_ROLE in assignee_roles
-    ):
-        return False
-    return has_active_unit_membership(session, assignee_user_id, at=at)
+    """Allow an eligible operator to assign an active PIC; callers enforce meeting scope."""
+    return assignee_user_id in assignable_pic_user_ids(
+        session,
+        assigner,
+        candidate_ids={assignee_user_id},
+        at=at,
+    )
+
+
+def assignable_pic_user_ids(
+    session: Session,
+    assigner: User,
+    *,
+    candidate_ids: set[UUID] | None = None,
+    at: datetime | None = None,
+) -> set[UUID]:
+    """Return active core users eligible for a PIC assignment.
+
+    Meeting authorization is checked by the Action Item service. Candidate
+    availability is based on the approved seven-user operating roster, not unit
+    membership.
+    """
+    if not _active_user(session, assigner.id):
+        return set()
+    if not is_active_action_manager(session, assigner):
+        return set()
+
+    core_roster_users = (
+        select(user_roles.c.user_id)
+        .join(Role, Role.id == user_roles.c.role_id)
+        .where(Role.role_code.in_(MEETING_MANAGER_ROLES))
+    )
+    super_admin_users = (
+        select(user_roles.c.user_id)
+        .join(Role, Role.id == user_roles.c.role_id)
+        .where(Role.role_code == SUPER_ADMIN_ROLE)
+    )
+    now = _effective_at(at)
+    statement = (
+        select(User.id)
+        .join(UserUnitMembership, UserUnitMembership.user_id == User.id)
+        .join(OrganizationUnit, OrganizationUnit.id == UserUnitMembership.unit_id)
+        .where(
+            User.is_active.is_(True),
+            OrganizationUnit.is_active.is_(True),
+            UserUnitMembership.valid_from <= now,
+            (UserUnitMembership.valid_until.is_(None)) | (UserUnitMembership.valid_until > now),
+            User.id.in_(core_roster_users),
+            ~User.id.in_(super_admin_users),
+        )
+        .distinct()
+    )
+    if candidate_ids is not None:
+        statement = statement.where(User.id.in_(candidate_ids))
+    eligible_ids = set(session.scalars(statement))
+    return eligible_ids

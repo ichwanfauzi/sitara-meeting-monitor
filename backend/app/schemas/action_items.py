@@ -15,6 +15,12 @@ from app.models.action_item import (
 )
 
 
+class OrganizationUnitReference(BaseModel):
+    id: UUID
+    unit_code: str
+    name: str
+
+
 def _trim_required(value: str) -> str:
     value = value.strip()
     if not value:
@@ -35,39 +41,98 @@ class ActionItemCreate(BaseModel):
     meeting_id: UUID
     source_minutes_revision_id: UUID
     source_decision_id: UUID
+    disposition_id: UUID | None = None
+    responsible_unit_id: UUID | None = None
     title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=20_000)
     output_expected: str | None = Field(default=None, max_length=20_000)
     due_date: date | None = None
     priority: str = Field(min_length=1, max_length=100)
-    main_pic_user_id: UUID
-    main_assignment_reason: str | None = Field(default=None, max_length=4_000)
+    main_pic_user_id: UUID | None = None
+    main_pic_display_name: str | None = Field(default=None, max_length=200)
+    main_pic_origin_unit_id: UUID | None = None
 
     _strip_title = field_validator("title")(_trim_required)
     _strip_description = field_validator("description")(_trim_required)
     _strip_output = field_validator("output_expected")(_trim_optional)
     _strip_priority = field_validator("priority")(_trim_required)
-    _strip_assignment_reason = field_validator("main_assignment_reason")(_trim_optional)
+    _strip_main_pic_display_name = field_validator("main_pic_display_name")(_trim_optional)
+
+    @model_validator(mode="after")
+    def require_main_pic(self) -> "ActionItemCreate":
+        if (self.main_pic_user_id is None) == (self.main_pic_display_name is None):
+            raise ValueError("Choose an active PIC or enter a PIC name")
+        if self.main_pic_user_id is None and self.main_pic_origin_unit_id is not None:
+            raise ValueError("Named PICs cannot have a verified origin unit")
+        if self.main_pic_user_id is not None and self.main_pic_origin_unit_id is None:
+            raise ValueError("Choose the PIC's active origin unit")
+        return self
+
+
+class ActionItemUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=300)
+    description: str = Field(min_length=1, max_length=20_000)
+    output_expected: str | None = Field(default=None, max_length=20_000)
+    due_date: date | None = None
+    priority: str = Field(min_length=1, max_length=100)
+
+    _strip_title = field_validator("title")(_trim_required)
+    _strip_description = field_validator("description")(_trim_required)
+    _strip_output = field_validator("output_expected")(_trim_optional)
+    _strip_priority = field_validator("priority")(_trim_required)
 
 
 class ActionItemAssignmentCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    assignee_user_id: UUID
+    assignee_user_id: UUID | None = None
+    assignee_display_name: str | None = Field(default=None, max_length=200)
+    pic_origin_unit_id: UUID | None = None
+    reason: str | None = Field(default=None, max_length=4_000)
     assignment_role: AssignmentRole
     expected_version: int = Field(ge=1)
-    reason: str | None = Field(default=None, max_length=4_000)
-
+    _strip_assignee_display_name = field_validator("assignee_display_name")(_trim_optional)
     _strip_reason = field_validator("reason")(_trim_optional)
+
+    @model_validator(mode="after")
+    def require_assignee(self) -> "ActionItemAssignmentCreate":
+        if (self.assignee_user_id is None) == (self.assignee_display_name is None):
+            raise ValueError("Choose an active PIC or enter a PIC name")
+        if self.assignee_user_id is None and self.pic_origin_unit_id is not None:
+            raise ValueError("Named PICs cannot have a verified origin unit")
+        if self.assignee_user_id is not None and self.pic_origin_unit_id is None:
+            raise ValueError("Choose the PIC's active origin unit")
+        return self
 
 
 class ActionItemAssignmentEnd(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=1)
-    reason: str = Field(min_length=1, max_length=4_000)
+    reason: str | None = Field(default=None, max_length=4_000)
 
-    _strip_reason = field_validator("reason")(_trim_required)
+    _strip_reason = field_validator("reason")(_trim_optional)
+
+
+class AssignablePicDirectoryUser(BaseModel):
+    id: UUID
+    full_name: str
+    job_title: str | None
+    active_units: list[OrganizationUnitReference]
+
+
+class AssignablePicDirectoryResponse(BaseModel):
+    query: str
+    pics: list[AssignablePicDirectoryUser]
+    units: list[OrganizationUnitReference]
+    more_pics: bool
+
+
+class OrganizationUnitDirectoryResponse(BaseModel):
+    units: list[OrganizationUnitReference]
 
 
 class ProgressUpdateCreate(BaseModel):
@@ -124,13 +189,15 @@ class CompletionReviewCreate(BaseModel):
 class ActionItemAssignmentResponse(BaseModel):
     id: UUID
     action_item_id: UUID
-    assignee_user_id: UUID
+    assignee_user_id: UUID | None
+    assignee_display_name: str | None
+    assignee_name: str | None
+    pic_origin_unit: OrganizationUnitReference | None
     assigned_by_user_id: UUID
     assignment_role: AssignmentRole
     started_at: datetime
     ended_at: datetime | None
     ended_by_user_id: UUID | None
-    assignment_reason: str | None
     end_reason: str | None
 
 
@@ -206,6 +273,8 @@ class ActionItemResponse(BaseModel):
     meeting_id: UUID
     source_minutes_revision_id: UUID
     source_decision_id: UUID
+    disposition_id: UUID | None
+    responsible_unit: OrganizationUnitReference | None
     source_revision_is_stale: bool
     title: str
     description: str
@@ -218,6 +287,7 @@ class ActionItemResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    deleted_at: datetime | None
     active_assignments: list[ActionItemAssignmentResponse]
 
 

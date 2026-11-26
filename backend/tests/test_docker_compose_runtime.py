@@ -21,11 +21,29 @@ _COMPOSE_ENV_KEYS = {
     "EVIDENCE_SCAN_POLL_SECONDS",
     "LOG_LEVEL",
     "LOGIN_RATE_LIMIT_HMAC_KEY",
+    "NOTIFICATION_EMAIL_ENABLED",
+    "NOTIFICATION_EMAIL_MAX_ATTEMPTS",
+    "NOTIFICATION_EMAIL_POLL_SECONDS",
+    "NOTIFICATION_EMAIL_RETRY_BASE_SECONDS",
+    "NOTIFICATION_EMAIL_TEST_RECIPIENT",
     "POSTGRES_DB",
     "POSTGRES_PASSWORD",
     "POSTGRES_PORT",
     "POSTGRES_USER",
+    "SMTP_FROM_EMAIL",
+    "SMTP_HOST",
+    "SMTP_PASSWORD",
+    "SMTP_PORT",
+    "SMTP_TIMEOUT_SECONDS",
+    "SMTP_USERNAME",
 }
+
+
+def _parse_compose_config(output: str) -> dict[str, Any]:
+    payload: object = json.loads(output)
+    if not isinstance(payload, dict) or any(not isinstance(key, str) for key in payload):
+        pytest.fail("docker compose config did not return a JSON object", pytrace=False)
+    return {key: value for key, value in payload.items() if isinstance(key, str)}
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +82,7 @@ def compose_config() -> dict[str, Any]:
         pytest.fail(
             "docker compose config returned a non-zero exit code; command output suppressed"
         )
-    return json.loads(result.stdout)
+    return _parse_compose_config(result.stdout)
 
 
 def test_compose_defines_integrated_runtime_services(
@@ -73,6 +91,7 @@ def test_compose_defines_integrated_runtime_services(
     services = compose_config["services"]
 
     assert {"postgres", "api", "clamav", "evidence-scanner"} <= services.keys()
+    assert "notification-email-worker" not in services
 
 
 def test_postgres_has_no_host_port_and_preserves_data_volume(
@@ -128,26 +147,38 @@ def dev_compose_config() -> dict[str, Any]:
             "docker compose development override config returned a non-zero exit code; "
             "command output suppressed"
         )
-    return json.loads(result.stdout)
+    return _parse_compose_config(result.stdout)
 
 
-def test_dev_compose_publishes_postgres_on_loopback_only(
+def test_dev_compose_publishes_postgres_through_loopback_proxy(
     dev_compose_config: dict[str, Any],
 ) -> None:
     services = dev_compose_config["services"]
     postgres = services["postgres"]
-    published_ports = postgres.get("ports", [])
+    proxy = services["postgres-port-proxy"]
+    published_ports = proxy.get("ports", [])
 
+    assert not postgres.get("ports")
     assert len(published_ports) == 1
     assert published_ports[0]["host_ip"] == "127.0.0.1"
     assert published_ports[0]["published"] == "55432"
     assert published_ports[0]["target"] == 5432
+    assert proxy["image"] == "haproxy:3.2.26-alpine3.24"
+    assert proxy["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert set(proxy["networks"]) == {"dev-postgres-proxy", "dev-postgres-publish"}
     assert (
         services["api"]["environment"]["DATABASE_URL"]
         == (services["evidence-scanner"]["environment"]["DATABASE_URL"])
     )
     assert "@postgres:5432/" in services["api"]["environment"]["DATABASE_URL"]
-    assert set(services["postgres"]["networks"]) == {"api-db", "scanner-db"}
+    assert set(postgres["networks"]) == {"api-db", "scanner-db", "dev-postgres-proxy"}
+    assert dev_compose_config["networks"]["dev-postgres-proxy"]["internal"] is True
+    assert (
+        dev_compose_config["networks"]["dev-postgres-publish"]["driver_opts"][
+            "com.docker.network.bridge.enable_ip_masquerade"
+        ]
+        == "false"
+    )
     assert any(
         volume["source"] == "sitara_postgres_data"
         and volume["target"] == "/var/lib/postgresql/data"
@@ -176,6 +207,63 @@ def test_clamav_is_internal_and_scanner_waits_for_healthy_dependencies(
     assert scanner["environment"]["CLAMAV_PORT"] == "3310"
     assert scanner["environment"]["CLAMAV_TIMEOUT_SECONDS"] == "30"
     assert scanner["environment"]["EVIDENCE_SCAN_POLL_SECONDS"] == "5"
+
+
+@pytest.fixture(scope="module")
+def email_profile_compose_config() -> dict[str, Any]:
+    if shutil.which("docker") is None:
+        pytest.skip("Docker Compose v2 is required to validate the email worker profile")
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in _COMPOSE_ENV_KEYS and not key.upper().startswith("COMPOSE_")
+    }
+    environment["COMPOSE_PROFILES"] = "notification-email"
+    command = [
+        "docker",
+        "compose",
+        "--project-directory",
+        str(_REPOSITORY_ROOT),
+        "--file",
+        str(_REPOSITORY_ROOT / "docker-compose.yml"),
+        "--env-file",
+        str(_REPOSITORY_ROOT / ".env.example"),
+        "--project-name",
+        "sitara-email-config-test",
+        "config",
+        "--format",
+        "json",
+    ]
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+    if result.returncode:
+        pytest.fail(
+            "docker compose email profile config returned a non-zero exit code; "
+            "command output suppressed"
+        )
+    return _parse_compose_config(result.stdout)
+
+
+def test_notification_email_worker_is_opt_in_and_keeps_smtp_secrets_scoped(
+    email_profile_compose_config: dict[str, Any],
+) -> None:
+    services = email_profile_compose_config["services"]
+    api_environment = services["api"]["environment"]
+    email_worker = services["notification-email-worker"]
+
+    assert email_worker["profiles"] == ["notification-email"]
+    assert email_worker["command"] == ["python", "-m", "app.notification_email_worker"]
+    assert email_worker["deploy"]["replicas"] == 1
+    assert email_worker["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert "notification-egress" in email_worker["networks"]
+    assert api_environment["NOTIFICATION_EMAIL_ENABLED"] == "false"
+    assert "SMTP_PASSWORD" not in api_environment
 
 
 def test_default_clamav_port_is_shared_by_daemon_worker_and_healthcheck(
@@ -465,7 +553,7 @@ def e2e_compose_config() -> dict[str, Any]:
     )
     if result.returncode:
         pytest.fail("docker compose E2E config returned a non-zero exit code; output suppressed")
-    return json.loads(result.stdout)
+    return _parse_compose_config(result.stdout)
 
 
 def test_e2e_compose_uses_owned_clamav_and_unique_images(

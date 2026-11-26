@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from app import evidence_scanner_worker as evidence_worker
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.db.base import Base
@@ -19,21 +20,29 @@ from app.models.action_item import (
     ActionItemAssignment,
     ActionItemEvidence,
     ActionItemEvidenceScan,
+    ActionItemStatus,
     ActionItemStatusHistory,
+    CompletionVerification,
 )
+from app.models.audit import AuditEvent
 from app.models.auth import Role, User
+from app.models.disposition import Disposition, DispositionTarget
 from app.models.meeting import (
     Meeting,
+    MeetingParticipant,
     MeetingStatus,
     MinutesDecision,
     MinutesDiscussion,
     MinutesRevision,
 )
 from app.models.organization import OrganizationUnit, ReportingLine, UserUnitMembership
+from app.schemas.action_items import ActionItemStatusChange
+from app.schemas.audit import AuditEventCreate
+from app.services.action_items import change_action_item_status
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -65,7 +74,7 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
         if (
             current_database != "sitara_clamav_e2e"
             or current_user != "sitara_e2e"
-            or migration_head != "0011_evidence_scan_quarantine"
+            or migration_head != "0020_minutes_pic_suggestion"
         ):
             engine.dispose()
             pytest.fail(
@@ -86,7 +95,7 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
         Base.metadata.create_all(engine)
     session = Session(engine, expire_on_commit=False)
 
-    role_codes = {"SEKRETARIAT", "REKTOR", "WAREK", "PIC", "SUPER_ADMIN"}
+    role_codes = {"SEKRETARIAT", "MANAGER_LEGAL", "REKTOR", "WAREK", "PIC", "SUPER_ADMIN"}
     roles = {
         role.role_code: role
         for role in session.scalars(select(Role).where(Role.role_code.in_(role_codes)))
@@ -98,13 +107,16 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
     users: dict[str, User] = {}
     role_assignments = {
         "secretariat": ("SEKRETARIAT",),
-        "pic_main": ("PIC",),
-        "pic_support": ("PIC",),
+        "manager_legal": ("MANAGER_LEGAL",),
+        "mixed_manager_pic": ("MANAGER_LEGAL", "PIC"),
+        "pic_main": ("WAREK", "PIC"),
+        "pic_support": ("WAREK", "PIC"),
         "pic_unassigned": ("PIC",),
         "pic_no_membership": ("PIC",),
         "rector": ("REKTOR",),
         "warek": ("WAREK",),
         "other_rector": ("REKTOR",),
+        "mixed_rector_pic": ("REKTOR", "PIC"),
         "secretariat_leader": ("SEKRETARIAT", "WAREK"),
         "super_admin": ("SUPER_ADMIN",),
         "mixed_admin_secretariat": ("SUPER_ADMIN", "SEKRETARIAT"),
@@ -126,12 +138,15 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
     now = datetime.now(UTC)
     members = (
         "secretariat",
+        "manager_legal",
+        "mixed_manager_pic",
         "pic_main",
         "pic_support",
         "pic_unassigned",
         "rector",
         "warek",
         "other_rector",
+        "mixed_rector_pic",
         "secretariat_leader",
     )
     for name in members:
@@ -142,19 +157,29 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
                 valid_from=now.replace(year=now.year - 1),
             )
         )
-    session.add(
-        ReportingLine(
-            manager_user_id=users["rector"].id,
-            subordinate_user_id=users["pic_main"].id,
-            valid_from=now.replace(year=now.year - 1),
-        )
-    )
-    session.add(
-        ReportingLine(
-            manager_user_id=users["warek"].id,
-            subordinate_user_id=users["pic_support"].id,
-            valid_from=now.replace(year=now.year - 1),
-        )
+    session.add_all(
+        [
+            ReportingLine(
+                manager_user_id=users["rector"].id,
+                subordinate_user_id=users["pic_main"].id,
+                valid_from=now.replace(year=now.year - 1),
+            ),
+            ReportingLine(
+                manager_user_id=users["rector"].id,
+                subordinate_user_id=users["pic_support"].id,
+                valid_from=now.replace(year=now.year - 1),
+            ),
+            ReportingLine(
+                manager_user_id=users["warek"].id,
+                subordinate_user_id=users["pic_main"].id,
+                valid_from=now.replace(year=now.year - 1),
+            ),
+            ReportingLine(
+                manager_user_id=users["warek"].id,
+                subordinate_user_id=users["pic_support"].id,
+                valid_from=now.replace(year=now.year - 1),
+            ),
+        ]
     )
 
     meeting_id, revision_id = uuid4(), uuid4()
@@ -184,6 +209,13 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
         ]
     )
     session.flush()
+    session.add_all(
+        [
+            MeetingParticipant(meeting_id=meeting_id, user_id=users["rector"].id),
+            MeetingParticipant(meeting_id=meeting_id, user_id=users["warek"].id),
+            MeetingParticipant(meeting_id=meeting_id, user_id=users["mixed_rector_pic"].id),
+        ]
+    )
     session.add_all(
         [
             MinutesRevision(
@@ -268,6 +300,7 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
         "other_meeting_id": other_meeting_id,
         "other_revision_id": other_revision_id,
         "other_decision_id": other_decision_id,
+        "unit_id": unit.id,
     }
     try:
         yield session, users, refs
@@ -302,24 +335,50 @@ def _task_payload(refs: dict[str, UUID], **overrides: object) -> dict[str, objec
         "meeting_id": str(refs["meeting_id"]),
         "source_minutes_revision_id": str(refs["revision_id"]),
         "source_decision_id": str(refs["decision_id"]),
+        "responsible_unit_id": str(refs["unit_id"]),
         "title": "Synthetic action item",
         "description": "Complete the agreed task",
         "output_expected": "Reviewed deliverable",
         "due_date": "2026-11-30",
         "priority": "Penting",
         "main_pic_user_id": None,
+        "main_pic_origin_unit_id": str(refs["unit_id"]),
     }
     payload.update(overrides)
     return payload
 
 
-def _create_task(client: TestClient, refs: dict[str, UUID], pic: User) -> dict[str, object]:
+def _disposition_payload(
+    session: Session,
+    users: dict[str, User],
+    refs: dict[str, UUID],
+) -> dict[str, object]:
+    unit_id = session.scalar(select(OrganizationUnit.id))
+    assert unit_id is not None
+    pic_role_id = next(role.id for role in users["pic_support"].roles if role.role_code == "PIC")
+    return {
+        "source_minutes_revision_id": str(refs["revision_id"]),
+        "source_decision_id": str(refs["decision_id"]),
+        "instruction": "Koordinasikan tindak lanjut lintas unit.",
+        "targets": [
+            {"target_type": "USER", "user_id": str(users["pic_support"].id)},
+            {"target_type": "UNIT", "unit_id": str(unit_id)},
+            {"target_type": "ROLE", "role_id": str(pic_role_id)},
+        ],
+    }
+
+
+def _create_task(client: TestClient, refs: dict[str, UUID], pic: User) -> dict[str, str]:
     response = client.post(
         "/api/v1/action-items",
         json=_task_payload(refs, main_pic_user_id=str(pic.id)),
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    payload: object = response.json()
+    identifier = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(identifier, str):
+        pytest.fail("Action Item response has no string id", pytrace=False)
+    return {"id": identifier}
 
 
 def test_secretariat_can_create_multiple_tasks_from_one_actionable_decision(
@@ -340,6 +399,83 @@ def test_secretariat_can_create_multiple_tasks_from_one_actionable_decision(
     assert first.json()["official_status"] == "BELUM_DIMULAI"
     assert session.query(ActionItem).count() == 2
     assert session.query(ActionItemAssignment).count() == 2
+
+
+def test_action_item_creation_records_responsible_and_pic_origin_units(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    unit = session.get(OrganizationUnit, refs["unit_id"])
+    assert unit is not None
+    payload = _task_payload(
+        refs,
+        main_pic_user_id=str(users["pic_main"].id),
+        main_pic_origin_unit_id=str(unit.id),
+        responsible_unit_id=str(unit.id),
+    )
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        response = client.post("/api/v1/action-items", json=payload)
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["responsible_unit"] == {
+        "id": str(unit.id),
+        "unit_code": unit.unit_code,
+        "name": unit.name,
+    }
+    assert created["active_assignments"][0]["pic_origin_unit"] == {
+        "id": str(unit.id),
+        "unit_code": unit.unit_code,
+        "name": unit.name,
+    }
+    persisted_item = session.get(ActionItem, UUID(created["id"]))
+    assert persisted_item is not None
+    assert persisted_item.responsible_unit_id == unit.id
+    assert persisted_item.assignments[0].pic_origin_unit_id == unit.id
+
+
+def test_action_item_creation_does_not_require_a_responsible_unit(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    payload = _task_payload(refs, main_pic_user_id=str(users["pic_main"].id))
+    payload.pop("responsible_unit_id")
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        response = client.post("/api/v1/action-items", json=payload)
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["responsible_unit"] is None
+    persisted_item = session.get(ActionItem, UUID(created["id"]))
+    assert persisted_item is not None
+    assert persisted_item.responsible_unit_id is None
+
+
+def test_action_item_creation_rejects_units_not_active_for_their_purpose(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    task_count = session.query(ActionItem).count()
+    base_payload = _task_payload(refs, main_pic_user_id=str(users["pic_main"].id))
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        invalid_origin = client.post(
+            "/api/v1/action-items",
+            json={**base_payload, "main_pic_origin_unit_id": str(uuid4())},
+        )
+        invalid_responsible = client.post(
+            "/api/v1/action-items",
+            json={**base_payload, "responsible_unit_id": str(uuid4())},
+        )
+
+    assert invalid_origin.status_code == 422
+    assert invalid_responsible.status_code == 422
+    assert session.query(ActionItem).count() == task_count
 
 
 def test_action_item_creation_rejects_non_actionable_and_cross_meeting_sources(
@@ -416,12 +552,14 @@ def test_action_item_creation_rejects_decision_from_another_revision_of_same_mee
     assert response.status_code == 422
 
 
-def test_secretariat_may_select_any_official_status_and_each_change_is_audited(
+@pytest.mark.parametrize("operator_name", ["secretariat", "manager_legal"])
+def test_operational_managers_may_select_any_official_status_and_each_change_is_audited(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    operator_name: str,
 ) -> None:
     session, users, refs = action_item_context
     with TestClient(app) as client:
-        _login(client, users["secretariat"])
+        _login(client, users[operator_name])
         created = _create_task(client, refs, users["pic_main"])
         blocked = client.patch(
             f"/api/v1/action-items/{created['id']}/status",
@@ -443,23 +581,86 @@ def test_secretariat_may_select_any_official_status_and_each_change_is_audited(
     assert [row.new_status for row in history] == ["BELUM_DIMULAI", "TERKENDALA", "BELUM_DIMULAI"]
 
 
-def test_completion_request_must_be_reviewed_and_rejection_preserves_status(
+def test_status_change_notifies_only_active_assignees_with_private_task_target(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    item = ActionItem(
+        meeting_id=refs["meeting_id"],
+        source_minutes_revision_id=refs["revision_id"],
+        source_decision_id=refs["decision_id"],
+        title="Synthetic notification task",
+        description="Synthetic task description",
+        priority="Penting",
+        created_by_id=users["secretariat"].id,
+    )
+    session.add(item)
+    session.flush()
+    session.add(
+        ActionItemAssignment(
+            action_item_id=item.id,
+            assignee_user_id=users["pic_main"].id,
+            assigned_by_user_id=users["secretariat"].id,
+            assignment_role="MAIN",
+        )
+    )
+    session.commit()
+    change_action_item_status(
+        session,
+        users["secretariat"],
+        item.id,
+        ActionItemStatusChange(expected_version=1, to_status=ActionItemStatus.TERKENDALA),
+    )
+    created_id = str(item.id)
+
+    with TestClient(app) as assigned_client:
+        _login(assigned_client, users["pic_main"])
+        notifications = assigned_client.get("/api/v1/notifications")
+    assert notifications.status_code == 200, notifications.text
+    payload = notifications.json()
+    assert payload["unread_count"] == 1
+    assert len(payload["items"]) == 1
+    notification = payload["items"][0]
+    assert notification["notification_type"] == "ACTION_ITEM_STATUS_CHANGED"
+    assert notification["target_type"] == "ACTION_ITEM"
+    assert notification["target_id"] == created_id
+    assert item.title not in notification["message"]
+    assert str(refs["meeting_id"]) not in notification["message"]
+
+    with TestClient(app) as unrelated_client:
+        _login(unrelated_client, users["pic_support"])
+        unrelated_notifications = unrelated_client.get("/api/v1/notifications")
+    assert unrelated_notifications.status_code == 200
+    assert unrelated_notifications.json() == {"items": [], "unread_count": 0}
+    denied_read = unrelated_client.post(f"/api/v1/notifications/{notification['id']}/read")
+    assert denied_read.status_code == 404
+
+    with TestClient(app) as assigned_client:
+        _login(assigned_client, users["pic_main"])
+        marked_read = assigned_client.post(f"/api/v1/notifications/{notification['id']}/read")
+    assert marked_read.status_code == 200, marked_read.text
+    assert marked_read.json()["read_at"] is not None
+
+
+@pytest.mark.parametrize("operator_name", ["secretariat", "manager_legal"])
+def test_completion_request_must_be_reviewed_by_operational_manager_and_preserves_status(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    operator_name: str,
 ) -> None:
     _, users, refs = action_item_context
     with TestClient(app) as client:
-        _login(client, users["secretariat"])
+        _login(client, users[operator_name])
         created = _create_task(client, refs, users["pic_main"])
         client.cookies.clear()
         client.headers.clear()
-        _login(client, users["pic_main"])
+        _login(client, users["warek"])
         report = client.post(
             f"/api/v1/action-items/{created['id']}/progress-updates",
             json={"report_text": "Mohon diperiksa", "completion_requested": True},
         )
         client.cookies.clear()
         client.headers.clear()
-        _login(client, users["secretariat"])
+        _login(client, users[operator_name])
         review = client.post(
             f"/api/v1/action-items/{created['id']}/completion-verifications",
             json={
@@ -482,7 +683,7 @@ def test_create_rolls_back_task_assignment_and_initial_status_on_database_failur
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.schemas.action_items import ActionItemCreate
-    from app.services.action_items import create_action_item
+    from app.services.action_items import ActionItemPersistenceError, create_action_item
 
     session, users, refs = action_item_context
     payload = ActionItemCreate.model_validate(
@@ -493,7 +694,7 @@ def test_create_rolls_back_task_assignment_and_initial_status_on_database_failur
         raise SQLAlchemyError("synthetic commit failure")
 
     monkeypatch.setattr(session, "commit", fail_commit)
-    with pytest.raises(SQLAlchemyError, match="synthetic commit failure"):
+    with pytest.raises(ActionItemPersistenceError):
         create_action_item(session, users["secretariat"], payload)
 
     assert session.query(ActionItem).count() == 0
@@ -502,9 +703,17 @@ def test_create_rolls_back_task_assignment_and_initial_status_on_database_failur
 
 
 @pytest.mark.parametrize(
-    "user_name", ["pic_main", "rector", "super_admin", "mixed_admin_secretariat"]
+    "user_name",
+    [
+        "pic_main",
+        "super_admin",
+        "mixed_admin_secretariat",
+        "other_rector",
+        "mixed_rector_pic",
+        "mixed_manager_pic",
+    ],
 )
-def test_only_operational_secretariat_can_create_action_items(
+def test_only_meeting_leaders_and_secretariat_can_create_action_items(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]], user_name: str
 ) -> None:
     _, users, refs = action_item_context
@@ -516,6 +725,573 @@ def test_only_operational_secretariat_can_create_action_items(
         )
 
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize("user_name", ["secretariat", "manager_legal", "rector", "warek"])
+def test_only_operational_managers_can_create_action_items(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]], user_name: str
+) -> None:
+    session, users, refs = action_item_context
+    cross_unit = OrganizationUnit(unit_code="CROSS-UNIT", name="Synthetic Cross Unit")
+    session.add(cross_unit)
+    session.flush()
+    session.add(
+        UserUnitMembership(
+            user_id=users["mixed_rector_pic"].id,
+            unit_id=cross_unit.id,
+            valid_from=datetime.now(UTC).replace(year=datetime.now(UTC).year - 1),
+        )
+    )
+    session.commit()
+    with TestClient(app) as client:
+        _login(client, users[user_name])
+        response = client.post(
+            "/api/v1/action-items",
+            json=_task_payload(refs, main_pic_user_id=str(users["mixed_rector_pic"].id)),
+        )
+
+    if user_name in {"secretariat", "manager_legal"}:
+        assert response.status_code == 201
+        assert response.json()["created_by_id"] == str(users[user_name].id)
+        assert response.json()["active_assignments"][0]["assignee_user_id"] == str(
+            users["mixed_rector_pic"].id
+        )
+    else:
+        assert response.status_code == 403
+
+
+def test_secretariat_can_issue_disposition_to_multiple_target_types(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    payload = _disposition_payload(session, users, refs)
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=payload,
+        )
+
+    assert response.status_code == 201, response.text
+    result = response.json()
+    assert result["meeting_id"] == str(refs["meeting_id"])
+    assert result["source_minutes_revision_id"] == str(refs["revision_id"])
+    assert result["source_decision_id"] == str(refs["decision_id"])
+    assert result["issued_by_user_id"] == str(users["secretariat"].id)
+    assert result["instruction"] == payload["instruction"]
+    assert {target["target_type"] for target in result["targets"]} == {"USER", "UNIT", "ROLE"}
+    audit_event = session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.object_id == UUID(result["id"]),
+            AuditEvent.action == "disposition.created",
+        )
+    )
+    assert audit_event is not None
+    assert audit_event.actor_user_id == users["secretariat"].id
+    assert audit_event.correlation_id is not None
+    assert str(audit_event.correlation_id) == response.headers["X-Correlation-ID"]
+    assert audit_event.after_values == {
+        "source_minutes_revision_id": str(refs["revision_id"]),
+        "source_decision_id": str(refs["decision_id"]),
+        "target_count": "3",
+        "target_types": "ROLE,UNIT,USER",
+    }
+    assert "Koordinasikan tindak lanjut lintas unit." not in str(audit_event.after_values)
+    assert (
+        session.query(DispositionTarget).filter_by(disposition_id=UUID(result["id"])).count() == 3
+    )
+
+
+def test_disposition_read_and_target_directory_require_authorized_meeting_officials(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=_disposition_payload(session, users, refs),
+        )
+        assert created.status_code == 201, created.text
+
+        dispositions = client.get(f"/api/v1/meetings/{refs['meeting_id']}/dispositions")
+        directory = client.get(
+            f"/api/v1/meetings/{refs['meeting_id']}/disposition-targets?query=PIC"
+        )
+
+        assert dispositions.status_code == 200, dispositions.text
+        assert len(dispositions.json()) == 1
+        assert dispositions.json()[0]["id"] == created.json()["id"]
+        assert directory.status_code == 200, directory.text
+        directory_payload = directory.json()
+        assert directory_payload["query"] == "PIC"
+        assert users["pic_main"].full_name in {
+            entry["full_name"] for entry in directory_payload["users"]
+        }
+        assert users["pic_unassigned"].full_name not in {
+            entry["full_name"] for entry in directory_payload["users"]
+        }
+        assert directory_payload["units"] == []
+        assert {role["role_code"] for role in directory_payload["roles"]} >= {
+            "PIC",
+        }
+        assert "email" not in str(directory_payload)
+        assert "password_hash" not in str(directory_payload)
+        unit_directory = client.get(
+            f"/api/v1/meetings/{refs['meeting_id']}/disposition-targets?query=TEST"
+        )
+        assert unit_directory.status_code == 200
+        assert any(unit["unit_code"] == "TEST-UNIT" for unit in unit_directory.json()["units"])
+        assert (
+            client.get(
+                f"/api/v1/meetings/{refs['meeting_id']}/disposition-targets?query=%20%20"
+            ).status_code
+            == 422
+        )
+
+        for official in ("rector", "warek"):
+            _login(client, users[official])
+            assert (
+                client.get(f"/api/v1/meetings/{refs['meeting_id']}/dispositions").status_code == 200
+            )
+            assert (
+                client.get(
+                    f"/api/v1/meetings/{refs['meeting_id']}/disposition-targets?query=PIC"
+                ).status_code
+                == 200
+            )
+
+        _login(client, users["pic_main"])
+        denied_list = client.get(f"/api/v1/meetings/{refs['meeting_id']}/dispositions")
+        denied_directory = client.get(
+            f"/api/v1/meetings/{refs['meeting_id']}/disposition-targets?query=PIC"
+        )
+        assert denied_list.status_code == 403
+        assert denied_directory.status_code == 403
+
+        _login(client, users["other_rector"])
+        assert client.get(f"/api/v1/meetings/{refs['meeting_id']}/dispositions").status_code == 403
+
+        _login(client, users["mixed_admin_secretariat"])
+        assert client.get(f"/api/v1/meetings/{refs['meeting_id']}/dispositions").status_code == 403
+
+
+def test_action_item_pic_directory_returns_only_assignable_users_in_meeting_scope(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    roles = {
+        role.role_code: role
+        for role in session.scalars(select(Role).where(Role.role_code.in_(("PIC", "SUPER_ADMIN"))))
+    }
+    unit = session.scalar(select(OrganizationUnit))
+    assert unit is not None
+    cross_unit = OrganizationUnit(unit_code="CROSS-UNIT", name="Synthetic Cross Unit")
+    session.add(cross_unit)
+    session.flush()
+    session.add(
+        UserUnitMembership(
+            user_id=users["mixed_rector_pic"].id,
+            unit_id=cross_unit.id,
+            valid_from=datetime.now(UTC).replace(year=datetime.now(UTC).year - 1),
+        )
+    )
+    privileged_pic = User(
+        email="privileged-pic@example.test",
+        full_name="PIC Privileged",
+        password_hash=hash_password("synthetic-password"),
+        is_active=True,
+        roles=[roles["PIC"], roles["SUPER_ADMIN"]],
+    )
+    session.add(privileged_pic)
+    session.flush()
+    session.add(
+        UserUnitMembership(
+            user_id=privileged_pic.id,
+            unit_id=unit.id,
+            valid_from=datetime.now(UTC).replace(year=datetime.now(UTC).year - 1),
+        )
+    )
+    session.commit()
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        directory = client.get(
+            f"/api/v1/action-items/pic-directory?meeting_id={refs['meeting_id']}&query=PIC"
+        )
+        short_query = client.get(
+            f"/api/v1/action-items/pic-directory?meeting_id={refs['meeting_id']}&query=%20%20"
+        )
+        missing_meeting = client.get(
+            f"/api/v1/action-items/pic-directory?meeting_id={uuid4()}&query=PIC"
+        )
+
+        assert directory.status_code == 200, directory.text
+        payload = directory.json()
+        assert payload["query"] == "PIC"
+        assert {entry["full_name"] for entry in payload["pics"]} == {
+            users["pic_main"].full_name,
+            users["pic_support"].full_name,
+            users["mixed_rector_pic"].full_name,
+            users["mixed_manager_pic"].full_name,
+        }
+        unit = session.get(OrganizationUnit, refs["unit_id"])
+        assert unit is not None
+        expected_unit = {"id": str(unit.id), "unit_code": unit.unit_code, "name": unit.name}
+        assert expected_unit in payload["units"]
+        main_pic_entry = next(
+            entry for entry in payload["pics"] if entry["id"] == str(users["pic_main"].id)
+        )
+        assert main_pic_entry["active_units"] == [expected_unit]
+        multi_membership_pic_entry = next(
+            entry for entry in payload["pics"] if entry["id"] == str(users["mixed_rector_pic"].id)
+        )
+        assert {entry["id"] for entry in multi_membership_pic_entry["active_units"]} == {
+            expected_unit["id"],
+            str(cross_unit.id),
+        }
+        assert payload["more_pics"] is False
+        assert "email" not in str(payload)
+        assert "password_hash" not in str(payload)
+        assert short_query.status_code == 422
+        assert missing_meeting.status_code == 404
+
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["rector"])
+        leader_directory = client.get(
+            f"/api/v1/action-items/pic-directory?meeting_id={refs['meeting_id']}&query=PIC"
+        )
+        assert leader_directory.status_code == 403
+
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        assert (
+            client.get(
+                f"/api/v1/action-items/pic-directory?meeting_id={refs['meeting_id']}&query=PIC"
+            ).status_code
+            == 403
+        )
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["other_rector"])
+        assert (
+            client.get(
+                f"/api/v1/action-items/pic-directory?meeting_id={refs['meeting_id']}&query=PIC"
+            ).status_code
+            == 403
+        )
+
+
+def test_action_item_created_from_disposition_keeps_source_link_and_audit_event(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        disposition_response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json={
+                "source_minutes_revision_id": str(refs["revision_id"]),
+                "source_decision_id": str(refs["decision_id"]),
+                "instruction": "Tindak lanjuti keputusan ini.",
+                "targets": [{"target_type": "USER", "user_id": str(users["pic_main"].id)}],
+            },
+        )
+        assert disposition_response.status_code == 201
+        disposition_id = disposition_response.json()["id"]
+
+        payload = _task_payload(
+            refs,
+            main_pic_user_id=str(users["pic_main"].id),
+            disposition_id=disposition_id,
+        )
+        response = client.post("/api/v1/action-items", json=payload)
+
+    assert response.status_code == 201, response.text
+    result = response.json()
+    assert result["disposition_id"] == disposition_id
+    action_item = session.get(ActionItem, UUID(result["id"]))
+    assert action_item is not None
+    assert action_item.disposition_id == UUID(disposition_id)
+    audit_event = session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.object_id == action_item.id,
+            AuditEvent.action == "action_item.created",
+        )
+    )
+    assert audit_event is not None
+    assert audit_event.actor_user_id == users["secretariat"].id
+    assert str(audit_event.correlation_id) == response.headers["X-Correlation-ID"]
+    assert audit_event.after_values == {
+        "source_minutes_revision_id": str(refs["revision_id"]),
+        "source_decision_id": str(refs["decision_id"]),
+        "disposition_id": disposition_id,
+    }
+    assert str(payload["description"]) not in str(audit_event.after_values)
+    assert str(users["pic_main"].id) not in str(audit_event.after_values)
+
+
+def test_action_item_disposition_link_must_match_exact_source(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        disposition_response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json={
+                "source_minutes_revision_id": str(refs["revision_id"]),
+                "source_decision_id": str(refs["decision_id"]),
+                "instruction": "Tindak lanjuti keputusan ini.",
+                "targets": [{"target_type": "USER", "user_id": str(users["pic_main"].id)}],
+            },
+        )
+        assert disposition_response.status_code == 201
+        payload = _task_payload(
+            refs,
+            meeting_id=str(refs["other_meeting_id"]),
+            source_minutes_revision_id=str(refs["other_revision_id"]),
+            source_decision_id=str(refs["other_decision_id"]),
+            main_pic_user_id=str(users["pic_main"].id),
+            disposition_id=disposition_response.json()["id"],
+        )
+        response = client.post("/api/v1/action-items", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Source must be an actionable decision from the specified meeting revision"
+    )
+    session.add(
+        ActionItem(
+            disposition_id=UUID(disposition_response.json()["id"]),
+            meeting_id=refs["other_meeting_id"],
+            source_minutes_revision_id=refs["other_revision_id"],
+            source_decision_id=refs["other_decision_id"],
+            title="Synthetic cross-source task",
+            description="Must be rejected by the source binding constraint",
+            priority="Normal",
+            created_by_id=users["secretariat"].id,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        session.flush()
+    session.rollback()
+    assert session.query(ActionItem).count() == 0
+    assert session.query(AuditEvent).filter_by(action="action_item.created").count() == 0
+
+
+def test_action_item_audit_failure_rolls_back_task_assignment_and_history(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import action_items as action_item_service
+
+    session, users, refs = action_item_context
+    payload = _task_payload(refs, main_pic_user_id=str(users["pic_main"].id))
+
+    def fail_audit(*args: object, **kwargs: object) -> None:
+        raise SQLAlchemyError("synthetic audit write failure")
+
+    monkeypatch.setattr(
+        action_item_service,
+        "append_action_item_created_event",
+        fail_audit,
+        raising=False,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        _login(client, users["secretariat"])
+        response = client.post("/api/v1/action-items", json=payload)
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Action Item and audit event could not be saved"
+    assert session.query(ActionItem).count() == 0
+    assert session.query(ActionItemAssignment).count() == 0
+    assert session.query(ActionItemStatusHistory).count() == 0
+    assert session.query(AuditEvent).filter_by(action="action_item.created").count() == 0
+
+
+def test_assignment_audit_failure_rolls_back_assignment_and_version(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import action_items as action_item_service
+
+    session, users, refs = action_item_context
+
+    def fail_audit(*args: object, **kwargs: object) -> None:
+        raise SQLAlchemyError("synthetic assignment audit failure")
+
+    monkeypatch.setattr(
+        action_item_service,
+        "append_action_item_assignment_changed_event",
+        fail_audit,
+    )
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+    with TestClient(app, raise_server_exceptions=False) as client:
+        _login(client, users["secretariat"])
+        response = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments",
+            json={
+                "assignee_user_id": str(users["pic_support"].id),
+                "pic_origin_unit_id": str(refs["unit_id"]),
+                "assignment_role": "SUPPORTING",
+                "expected_version": 1,
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Action Item and audit event could not be saved"
+    assignments = session.query(ActionItemAssignment).filter_by(action_item_id=UUID(created["id"]))
+    assert assignments.count() == 1
+    item = session.get(ActionItem, UUID(created["id"]))
+    assert item is not None
+    assert item.version == 1
+    assert (
+        session.query(AuditEvent)
+        .filter_by(
+            action="action_item.assignment_changed",
+            object_id=UUID(created["id"]),
+        )
+        .count()
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    "user_name",
+    ["pic_main", "super_admin", "mixed_admin_secretariat", "other_rector", "mixed_rector_pic"],
+)
+def test_disposition_creation_requires_business_role_and_meeting_scope(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    user_name: str,
+) -> None:
+    session, users, refs = action_item_context
+    payload = _disposition_payload(session, users, refs)
+    with TestClient(app) as client:
+        _login(client, users[user_name])
+        response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=payload,
+        )
+
+    assert response.status_code == 403
+    assert session.query(Disposition).count() == 0
+    assert session.query(AuditEvent).filter_by(action="disposition.created").count() == 0
+
+
+def test_disposition_rejects_source_from_another_meeting(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    payload = _disposition_payload(session, users, refs)
+    payload["source_decision_id"] = str(refs["other_decision_id"])
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=payload,
+        )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["detail"] == "Disposition source must belong to this meeting and revision"
+    )
+    assert session.query(Disposition).count() == 0
+    assert session.query(AuditEvent).filter_by(action="disposition.created").count() == 0
+
+
+def test_disposition_rejects_superseded_minutes_revision(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    from app.models.meeting import MinutesRevision
+
+    session.add(
+        MinutesRevision(
+            meeting_id=refs["meeting_id"],
+            revision_number=2,
+            format_version=2,
+            content=None,
+            created_by_id=users["secretariat"].id,
+        )
+    )
+    session.commit()
+    payload = _disposition_payload(session, users, refs)
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=payload,
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Disposition source minutes revision is no longer active"
+    assert session.query(Disposition).count() == 0
+    assert session.query(AuditEvent).filter_by(action="disposition.created").count() == 0
+
+
+def test_disposition_rejects_duplicate_and_inactive_targets(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    payload = _disposition_payload(session, users, refs)
+    payload["targets"] = [
+        {"target_type": "USER", "user_id": str(users["pic_support"].id)},
+        {"target_type": "USER", "user_id": str(users["pic_support"].id)},
+    ]
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        duplicate_response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=payload,
+        )
+
+    assert duplicate_response.status_code == 422
+    assert session.query(Disposition).count() == 0
+
+    payload["targets"] = [{"target_type": "USER", "user_id": str(users["pic_unassigned"].id)}]
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        inactive_response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=payload,
+        )
+
+    assert inactive_response.status_code == 422
+    assert session.query(Disposition).count() == 0
+    assert session.query(AuditEvent).filter_by(action="disposition.created").count() == 0
+
+
+def test_disposition_audit_failure_rolls_back_disposition_and_targets(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import dispositions as disposition_service
+
+    session, users, refs = action_item_context
+    payload = _disposition_payload(session, users, refs)
+
+    def fail_audit(*args: object, **kwargs: object) -> None:
+        raise SQLAlchemyError("synthetic audit write failure")
+
+    monkeypatch.setattr(disposition_service, "append_disposition_created_event", fail_audit)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        _login(client, users["secretariat"])
+        response = client.post(
+            f"/api/v1/meetings/{refs['meeting_id']}/dispositions",
+            json=payload,
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Disposition and audit event could not be saved"
+    assert session.query(Disposition).count() == 0
+    assert session.query(DispositionTarget).count() == 0
+    assert session.query(AuditEvent).filter_by(action="disposition.created").count() == 0
 
 
 def test_write_requires_csrf(
@@ -544,6 +1320,7 @@ def test_assignment_history_keeps_old_main_and_adds_supporting_pic(
             f"/api/v1/action-items/{created['id']}/assignments",
             json={
                 "assignee_user_id": str(users["pic_support"].id),
+                "pic_origin_unit_id": str(refs["unit_id"]),
                 "assignment_role": "SUPPORTING",
                 "expected_version": 1,
                 "reason": "Dukungan pelaksanaan",
@@ -553,6 +1330,7 @@ def test_assignment_history_keeps_old_main_and_adds_supporting_pic(
             f"/api/v1/action-items/{created['id']}/assignments",
             json={
                 "assignee_user_id": str(users["pic_no_membership"].id),
+                "pic_origin_unit_id": str(refs["unit_id"]),
                 "assignment_role": "MAIN",
                 "expected_version": 2,
                 "reason": "Perubahan penanggung jawab",
@@ -580,6 +1358,7 @@ def test_secretariat_can_replace_main_and_preserves_assignment_history(
             f"/api/v1/action-items/{created['id']}/assignments",
             json={
                 "assignee_user_id": str(users["pic_support"].id),
+                "pic_origin_unit_id": str(refs["unit_id"]),
                 "assignment_role": "MAIN",
                 "expected_version": 1,
                 "reason": "Rotasi penanggung jawab",
@@ -595,6 +1374,223 @@ def test_secretariat_can_replace_main_and_preserves_assignment_history(
     assert ended.end_reason == "Rotasi penanggung jawab"
     assert active.assignee_user_id == users["pic_support"].id
     assert active.assignment_role == "MAIN"
+
+
+def test_assignment_changes_are_audited_with_redacted_before_and_after_values(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    cross_unit = OrganizationUnit(unit_code="AUDIT-UNIT", name="Synthetic Audit Unit")
+    session.add(cross_unit)
+    session.flush()
+    session.add(
+        UserUnitMembership(
+            user_id=users["mixed_rector_pic"].id,
+            unit_id=cross_unit.id,
+            valid_from=datetime.now(UTC).replace(year=datetime.now(UTC).year - 1),
+        )
+    )
+    session.commit()
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        supporting = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments",
+            json={
+                "assignee_user_id": str(users["pic_support"].id),
+                "pic_origin_unit_id": str(refs["unit_id"]),
+                "assignment_role": "SUPPORTING",
+                "expected_version": 1,
+                "reason": "Private assignment note must not enter the audit payload",
+            },
+        )
+        replacement = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments",
+            json={
+                "assignee_user_id": str(users["mixed_rector_pic"].id),
+                "pic_origin_unit_id": str(cross_unit.id),
+                "assignment_role": "MAIN",
+                "expected_version": 2,
+                "reason": "Private replacement note must not enter the audit payload",
+            },
+        )
+        ended = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments/{supporting.json()['id']}/end",
+            json={
+                "expected_version": 3,
+                "reason": "Private end note must not enter the audit payload",
+            },
+        )
+
+    assert supporting.status_code == 201, supporting.text
+    assert replacement.status_code == 201, replacement.text
+    assert ended.status_code == 200, ended.text
+    original_assignment = session.scalar(
+        select(ActionItemAssignment).where(
+            ActionItemAssignment.action_item_id == UUID(created["id"]),
+            ActionItemAssignment.assignee_user_id == users["pic_main"].id,
+        )
+    )
+    assert original_assignment is not None
+    events = session.scalars(
+        select(AuditEvent).where(
+            AuditEvent.action == "action_item.assignment_changed",
+            AuditEvent.object_id == UUID(created["id"]),
+        )
+    ).all()
+    by_operation = {}
+    for audit_event in events:
+        assert audit_event.after_values is not None
+        by_operation[audit_event.after_values["operation"]] = audit_event
+    assert set(by_operation) == {"ASSIGNED", "REPLACED", "ENDED"}
+
+    assigned = by_operation["ASSIGNED"]
+    assert assigned.actor_user_id == users["secretariat"].id
+    assert assigned.actor_roles == ["SEKRETARIAT"]
+    assert assigned.result == "SUCCEEDED"
+    assert assigned.correlation_id is not None
+    assert assigned.before_values is None
+    assert assigned.after_values == {
+        "operation": "ASSIGNED",
+        "assignment_id": supporting.json()["id"],
+        "assignee_user_id": str(users["pic_support"].id),
+        "assignment_role": "SUPPORTING",
+        "pic_origin_unit_id": str(refs["unit_id"]),
+    }
+
+    replaced = by_operation["REPLACED"]
+    assert replaced.before_values == {
+        "assignment_id": str(original_assignment.id),
+        "assignee_user_id": str(users["pic_main"].id),
+        "assignment_role": "MAIN",
+        "pic_origin_unit_id": str(refs["unit_id"]),
+    }
+    assert replaced.after_values == {
+        "operation": "REPLACED",
+        "assignment_id": replacement.json()["id"],
+        "assignee_user_id": str(users["mixed_rector_pic"].id),
+        "assignment_role": "MAIN",
+        "pic_origin_unit_id": str(cross_unit.id),
+    }
+
+    ended_event = by_operation["ENDED"]
+    assert ended_event.before_values == {
+        key: value for key, value in assigned.after_values.items() if key != "operation"
+    }
+    assert ended_event.after_values == {
+        "operation": "ENDED",
+        "assignment_id": supporting.json()["id"],
+        "ended_by_user_id": str(users["secretariat"].id),
+    }
+    assert all(
+        "reason" not in (event.before_values or {}) | (event.after_values or {}) for event in events
+    )
+    assert "Private" not in str([event.before_values for event in events])
+    assert "Private" not in str([event.after_values for event in events])
+
+
+def test_assignment_audit_preserves_unknown_legacy_pic_origin_as_null() -> None:
+    event = AuditEventCreate(
+        actor_user_id=uuid4(),
+        actor_roles=["SEKRETARIAT"],
+        action="action_item.assignment_changed",
+        object_type="action_item",
+        object_id=uuid4(),
+        result="SUCCEEDED",
+        before_values={
+            "assignment_id": str(uuid4()),
+            "assignee_user_id": str(uuid4()),
+            "assignment_role": "MAIN",
+            "pic_origin_unit_id": None,
+        },
+        after_values={
+            "operation": "REPLACED",
+            "assignment_id": str(uuid4()),
+            "assignee_user_id": str(uuid4()),
+            "assignment_role": "MAIN",
+            "pic_origin_unit_id": str(uuid4()),
+        },
+    )
+
+    assert event.before_values is not None
+    assert event.before_values["pic_origin_unit_id"] is None
+
+
+def test_meeting_leaders_cannot_manage_assignments_but_operational_manager_can(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    cross_unit = OrganizationUnit(unit_code="CROSS-UNIT", name="Synthetic Cross Unit")
+    session.add(cross_unit)
+    session.flush()
+    session.add(
+        UserUnitMembership(
+            user_id=users["mixed_rector_pic"].id,
+            unit_id=cross_unit.id,
+            valid_from=datetime.now(UTC).replace(year=datetime.now(UTC).year - 1),
+        )
+    )
+    session.commit()
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["rector"])
+        added = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments",
+            json={
+                "assignee_user_id": str(users["mixed_rector_pic"].id),
+                "pic_origin_unit_id": str(cross_unit.id),
+                "assignment_role": "SUPPORTING",
+                "expected_version": 1,
+                "reason": "Dukungan pimpinan",
+            },
+        )
+        assert added.status_code == 403, added.text
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["secretariat"])
+        added = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments",
+            json={
+                "assignee_user_id": str(users["mixed_rector_pic"].id),
+                "pic_origin_unit_id": str(cross_unit.id),
+                "assignment_role": "SUPPORTING",
+                "expected_version": 1,
+                "reason": "Dukungan pimpinan",
+            },
+        )
+        assert added.status_code == 201, added.text
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["other_rector"])
+        denied_end = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments/{added.json()['id']}/end",
+            json={"expected_version": 2, "reason": "Tidak berwenang"},
+        )
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["secretariat"])
+        ended = client.post(
+            f"/api/v1/action-items/{created['id']}/assignments/{added.json()['id']}/end",
+            json={"expected_version": 2, "reason": "Dukungan selesai"},
+        )
+
+    assert added.status_code == 201, added.text
+    assert added.json()["pic_origin_unit"] == {
+        "id": str(cross_unit.id),
+        "unit_code": cross_unit.unit_code,
+        "name": cross_unit.name,
+    }
+    assert denied_end.status_code == 403
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["ended_by_user_id"] == str(users["secretariat"].id)
+    persisted_assignment = session.get(ActionItemAssignment, UUID(added.json()["id"]))
+    assert persisted_assignment is not None
+    assert persisted_assignment.assignee_user_id == users["mixed_rector_pic"].id
+    assert persisted_assignment.ended_by_user_id == users["secretariat"].id
 
 
 def test_pic_can_report_progress_but_cannot_change_official_status_or_read_unassigned_task(
@@ -659,6 +1655,7 @@ def test_rektor_and_warek_can_submit_progress_within_active_reporting_scope(
             f"/api/v1/action-items/{created['id']}/assignments",
             json={
                 "assignee_user_id": str(users["pic_support"].id),
+                "pic_origin_unit_id": str(refs["unit_id"]),
                 "assignment_role": "SUPPORTING",
                 "expected_version": 1,
                 "reason": "Dukungan pelaksanaan",
@@ -720,7 +1717,7 @@ def test_secretariat_with_leadership_role_cannot_report_outside_reporting_scope(
 def test_progress_evidence_upload_download_is_private_and_authorized(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(tmp_path / "private-evidence"))
     get_settings.cache_clear()
@@ -1035,6 +2032,37 @@ def test_clamav_daemon_retries_pending_evidence_after_scanner_recovery(
     assert rejected_download.content != eicar_content
     assert storage_root.stat().st_mode & 0o777 == 0o700
     assert not (storage_root / safe_path.name).exists()
+
+    safe_evidence = session.get(ActionItemEvidence, safe_evidence_id)
+    assert safe_evidence is not None and safe_evidence.storage_key is not None
+    stored_file = storage_root / safe_evidence.storage_key
+    altered_content = safe_content.replace(b"Synthetic", b"synthetic", 1)
+    assert len(altered_content) == len(safe_content)
+    stored_file.write_bytes(altered_content)
+
+    with TestClient(app) as client:
+        _login(client, users["pic_main"])
+        completion_request = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={
+                "report_text": "Meminta verifikasi setelah file berubah",
+                "completion_requested": True,
+            },
+        )
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["secretariat"])
+        verification = client.post(
+            f"/api/v1/action-items/{created['id']}/completion-verifications",
+            json={
+                "expected_version": 1,
+                "progress_update_id": completion_request.json()["id"],
+                "outcome": "VERIFIED",
+            },
+        )
+
+    assert completion_request.status_code == 201, completion_request.text
+    assert verification.status_code == 409
     get_settings.cache_clear()
 
 
@@ -1081,6 +2109,10 @@ def test_clamav_http_upload_is_scanned_by_compose_worker(
         )
         assert other_task_response.status_code == 201, other_task_response.text
         other_task = other_task_response.json()
+        secretariat_role = session.scalar(select(Role).where(Role.role_code == "SEKRETARIAT"))
+        assert secretariat_role is not None
+        users["pic_main"].roles.append(secretariat_role)
+        session.commit()
 
         client.cookies.clear()
         client.headers.clear()
@@ -1090,6 +2122,11 @@ def test_clamav_http_upload_is_scanned_by_compose_worker(
             json={"report_text": "Bukti melalui HTTP Uvicorn"},
         )
         assert progress.status_code == 201, progress.text
+        other_progress = client.post(
+            f"/api/v1/action-items/{other_task['id']}/progress-updates",
+            json={"report_text": "Bukti terinfeksi melalui HTTP Uvicorn"},
+        )
+        assert other_progress.status_code == 201, other_progress.text
         upload = client.post(
             f"/api/v1/action-items/{created['id']}/progress-updates/"
             f"{progress.json()['id']}/evidence/files",
@@ -1109,15 +2146,15 @@ def test_clamav_http_upload_is_scanned_by_compose_worker(
         )
 
         eicar_upload = client.post(
-            f"/api/v1/action-items/{created['id']}/progress-updates/"
-            f"{progress.json()['id']}/evidence/files",
+            f"/api/v1/action-items/{other_task['id']}/progress-updates/"
+            f"{other_progress.json()['id']}/evidence/files",
             files={"file": ("http-eicar.txt", BytesIO(eicar_content), "text/plain")},
         )
         assert eicar_upload.status_code == 201, eicar_upload.text
         assert eicar_upload.json()["scan_status"] == "PENDING"
         assert "storage_key" not in eicar_upload.json()
         eicar_id = UUID(eicar_upload.json()["id"])
-        eicar_url = f"/api/v1/action-items/{created['id']}/evidence/{eicar_id}"
+        eicar_url = f"/api/v1/action-items/{other_task['id']}/evidence/{eicar_id}"
         assert client.get(eicar_url).status_code == 423
 
         pending_scan = session.scalar(
@@ -1194,18 +2231,78 @@ def test_clamav_http_upload_is_scanned_by_compose_worker(
         login(users["rector"])
         download = client.get(evidence_url)
         rejected_download = client.get(eicar_url)
+        client.cookies.clear()
+        client.headers.clear()
+        login(users["pic_main"])
+        clean_completion = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={
+                "report_text": "Pekerjaan siap diverifikasi",
+                "completion_requested": True,
+            },
+        )
+        infected_completion = client.post(
+            f"/api/v1/action-items/{other_task['id']}/progress-updates",
+            json={
+                "report_text": "Pengajuan dengan bukti terinfeksi",
+                "completion_requested": True,
+            },
+        )
+        assert clean_completion.status_code == 201, clean_completion.text
+        assert infected_completion.status_code == 201, infected_completion.text
+        self_review = client.post(
+            f"/api/v1/action-items/{created['id']}/completion-verifications",
+            json={
+                "expected_version": 1,
+                "progress_update_id": clean_completion.json()["id"],
+                "outcome": "VERIFIED",
+            },
+        )
+        assert self_review.status_code == 403
+
+        client.cookies.clear()
+        client.headers.clear()
+        login(users["super_admin"])
+        super_admin_download = client.get(evidence_url)
+
+        client.cookies.clear()
+        client.headers.clear()
+        login(users["secretariat"])
+        secretariat_download = client.get(evidence_url)
+        clean_verification = client.post(
+            f"/api/v1/action-items/{created['id']}/completion-verifications",
+            json={
+                "expected_version": 1,
+                "progress_update_id": clean_completion.json()["id"],
+                "outcome": "VERIFIED",
+            },
+        )
+        infected_verification = client.post(
+            f"/api/v1/action-items/{other_task['id']}/completion-verifications",
+            json={
+                "expected_version": 1,
+                "progress_update_id": infected_completion.json()["id"],
+                "outcome": "VERIFIED",
+            },
+        )
 
     assert download.status_code == 200
     assert download.content == evidence_content
     assert download.headers["cache-control"] == "private, no-store"
     assert rejected_download.status_code == 423
     assert rejected_download.content != eicar_content
+    assert super_admin_download.status_code == 404
+    assert secretariat_download.status_code == 200
+    assert secretariat_download.content == evidence_content
+    assert clean_verification.status_code == 200, clean_verification.text
+    assert clean_verification.json()["official_status"] == "SELESAI"
+    assert infected_verification.status_code == 409
 
 
 def test_super_admin_cannot_upload_or_download_evidence(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(tmp_path / "private-evidence"))
     get_settings.cache_clear()
@@ -1245,7 +2342,7 @@ def test_super_admin_cannot_upload_or_download_evidence(
 def test_upload_transaction_failure_removes_private_file(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     from app.services.action_items import create_file_evidence
     from sqlalchemy.exc import OperationalError
@@ -1285,7 +2382,7 @@ def test_upload_transaction_failure_removes_private_file(
 def test_progress_evidence_enforces_types_size_and_five_item_limit(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(tmp_path / "private-evidence"))
     get_settings.cache_clear()
@@ -1371,11 +2468,17 @@ def test_source_revision_change_marks_task_stale_without_moving_provenance(
 
 def test_completion_requires_verification_and_is_bound_to_report(
     action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(tmp_path / "private-evidence"))
+    get_settings.cache_clear()
     session, users, refs = action_item_context
     with TestClient(app) as client:
         _login(client, users["secretariat"])
         created = _create_task(client, refs, users["pic_main"])
+        created_id = created["id"]
+        assert isinstance(created_id, str)
         direct_completion = client.patch(
             f"/api/v1/action-items/{created['id']}/status",
             json={"expected_version": 1, "to_status": "SELESAI"},
@@ -1386,6 +2489,26 @@ def test_completion_requires_verification_and_is_bound_to_report(
         report = client.post(
             f"/api/v1/action-items/{created['id']}/progress-updates",
             json={"report_text": "Hasil telah diserahkan", "completion_requested": True},
+        )
+        upload = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{report.json()['id']}/evidence/files",
+            files={"file": ("hasil.pdf", BytesIO(b"%PDF-1.7\n%%EOF"), "application/pdf")},
+        )
+        from app.services.action_items import record_evidence_scan_result
+
+        upload_payload = upload.json()
+        evidence_id = upload_payload.get("id")
+        evidence_sha256 = upload_payload.get("sha256")
+        assert isinstance(evidence_id, str)
+        assert isinstance(evidence_sha256, str)
+        record_evidence_scan_result(
+            session,
+            UUID(evidence_id),
+            clean=True,
+            scanner_name="synthetic-test-scanner",
+            scanner_version="1",
+            scanned_sha256=evidence_sha256,
         )
         client.cookies.clear()
         client.headers.clear()
@@ -1401,6 +2524,7 @@ def test_completion_requires_verification_and_is_bound_to_report(
 
     assert direct_completion.status_code == 409
     assert report.status_code == 201
+    assert upload.status_code == 201, upload.text
     assert verified.status_code == 200, verified.text
     payload = verified.json()
     assert payload["official_status"] == "SELESAI"
@@ -1408,5 +2532,341 @@ def test_completion_requires_verification_and_is_bound_to_report(
     verification = payload["completion_verifications"][-1]
     assert status_event["verification_id"] == verification["id"]
     assert verification["progress_update_id"] == report.json()["id"]
-    task = session.get(ActionItem, UUID(created["id"]))
+    task = session.get(ActionItem, UUID(created_id))
     assert task is not None and task.official_status == "SELESAI"
+    get_settings.cache_clear()
+
+
+def test_verified_completion_requires_a_matching_clean_file_evidence(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(tmp_path / "private-evidence"))
+    get_settings.cache_clear()
+    session, users, refs = action_item_context
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        progress = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={"report_text": "Mohon verifikasi", "completion_requested": True},
+        )
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["secretariat"])
+        verification_path = f"/api/v1/action-items/{created['id']}/completion-verifications"
+        request = {
+            "expected_version": 1,
+            "progress_update_id": progress.json()["id"],
+            "outcome": "VERIFIED",
+        }
+        no_evidence = client.post(verification_path, json=request)
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        evidence_progress = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={"report_text": "Bukti hasil pekerjaan"},
+        )
+        upload = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{evidence_progress.json()['id']}/evidence/files",
+            files={"file": ("hasil.pdf", BytesIO(b"%PDF-1.7\n%%EOF"), "application/pdf")},
+        )
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["secretariat"])
+        pending_evidence = client.post(verification_path, json=request)
+
+    assert progress.status_code == 201
+    assert no_evidence.status_code == 409
+    assert upload.status_code == 201, upload.text
+    assert upload.json()["scan_status"] == "PENDING"
+    assert pending_evidence.status_code == 409
+
+    from app.services.action_items import record_evidence_scan_result
+
+    upload_payload = upload.json()
+    evidence_id = upload_payload.get("id")
+    evidence_sha256 = upload_payload.get("sha256")
+    assert isinstance(evidence_id, str)
+    assert isinstance(evidence_sha256, str)
+    record_evidence_scan_result(
+        session,
+        UUID(evidence_id),
+        clean=True,
+        scanner_name="synthetic-test-scanner",
+        scanner_version="1",
+        scanned_sha256=evidence_sha256,
+    )
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        verified = client.post(verification_path, json=request)
+
+    assert verified.status_code == 200, verified.text
+    assert verified.json()["official_status"] == "SELESAI"
+    get_settings.cache_clear()
+
+
+def test_verified_completion_rejects_file_modified_after_clean_scan(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "private-evidence"
+    monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(storage_root))
+    get_settings.cache_clear()
+    session, users, refs = action_item_context
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        report = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={"report_text": "Mohon verifikasi", "completion_requested": True},
+        )
+        content = b"%PDF-1.7\nsynthetic evidence\n%%EOF\n"
+        upload = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{report.json()['id']}/evidence/files",
+            files={"file": ("hasil.pdf", BytesIO(content), "application/pdf")},
+        )
+
+    assert report.status_code == 201
+    assert upload.status_code == 201, upload.text
+    from app.services.action_items import record_evidence_scan_result
+
+    evidence_id = UUID(upload.json()["id"])
+    evidence = session.get(ActionItemEvidence, evidence_id)
+    assert evidence is not None and evidence.storage_key is not None
+    record_evidence_scan_result(
+        session,
+        evidence_id,
+        clean=True,
+        scanner_name="synthetic-test-scanner",
+        scanner_version="1",
+        scanned_sha256=upload.json()["sha256"],
+    )
+    stored_file = storage_root / evidence.storage_key
+    altered_content = b"%PDF-1.7\nsynthetic evIdence\n%%EOF\n"
+    assert len(altered_content) == len(content)
+    stored_file.write_bytes(altered_content)
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        verified = client.post(
+            f"/api/v1/action-items/{created['id']}/completion-verifications",
+            json={
+                "expected_version": 1,
+                "progress_update_id": report.json()["id"],
+                "outcome": "VERIFIED",
+            },
+        )
+
+    assert verified.status_code == 409
+    get_settings.cache_clear()
+
+
+def test_assigned_pic_with_secretariat_role_cannot_review_own_completion_request(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+) -> None:
+    session, users, refs = action_item_context
+    secretariat_role = session.scalar(select(Role).where(Role.role_code == "SEKRETARIAT"))
+    assert secretariat_role is not None
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        users["pic_main"].roles.append(secretariat_role)
+        session.commit()
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        report = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={
+                "report_text": "Mohon verifikasi pekerjaan sendiri",
+                "completion_requested": True,
+            },
+        )
+        review = client.post(
+            f"/api/v1/action-items/{created['id']}/completion-verifications",
+            json={
+                "expected_version": 1,
+                "progress_update_id": report.json()["id"],
+                "outcome": "NEEDS_REVISION",
+                "review_note": "Tidak dapat menilai pengajuan sendiri",
+            },
+        )
+
+    assert report.status_code == 201, report.text
+    assert review.status_code == 403
+
+
+def test_invalid_scanner_response_keeps_evidence_pending_and_undownloadable(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(tmp_path / "private-evidence"))
+    get_settings.cache_clear()
+    session, users, refs = action_item_context
+    content = b"%PDF-1.7\nsynthetic evidence\n%%EOF"
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        report = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={"report_text": "Evidence awaiting scan"},
+        )
+        upload = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{report.json()['id']}/evidence/files",
+            files={"file": ("evidence.pdf", BytesIO(content), "application/pdf")},
+        )
+
+        assert report.status_code == 201, report.text
+        assert upload.status_code == 201, upload.text
+        evidence = session.get(ActionItemEvidence, UUID(upload.json()["id"]))
+        assert evidence is not None
+        assert evidence.storage_key is not None
+        assert evidence.sha256 is not None
+
+        class InvalidScanner(evidence_worker.clamd.ClamdNetworkSocket):
+            def __init__(self) -> None:
+                super().__init__()
+
+            def instream(self, stream: BytesIO) -> object:
+                assert stream.read() == content
+                return {"stream": ("UNKNOWN", None)}
+
+        with pytest.raises(RuntimeError, match="unrecognized scan result"):
+            evidence_worker.scan_one(
+                session,
+                InvalidScanner(),
+                evidence.id,
+                evidence.storage_key,
+                evidence.sha256,
+            )
+
+        download = client.get(f"/api/v1/action-items/{created['id']}/evidence/{evidence.id}")
+
+    latest_scan = session.scalar(
+        select(ActionItemEvidenceScan)
+        .where(ActionItemEvidenceScan.evidence_id == evidence.id)
+        .order_by(ActionItemEvidenceScan.event_number.desc())
+        .limit(1)
+    )
+    assert latest_scan is not None
+    assert latest_scan.scan_status == "PENDING"
+    assert download.status_code == 423
+    assert download.content != content
+    get_settings.cache_clear()
+
+
+def test_rejected_eicar_scan_result_cannot_verify_action_item_completion(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ACTION_ITEM_EVIDENCE_STORAGE_PATH", str(tmp_path / "private-evidence"))
+    get_settings.cache_clear()
+    session, users, refs = action_item_context
+    content = b"%PDF-1.7\nsynthetic EICAR test fixture\n%%EOF"
+
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["pic_main"])
+        report = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates",
+            json={
+                "report_text": "Completion request with EICAR test signature",
+                "completion_requested": True,
+            },
+        )
+        upload = client.post(
+            f"/api/v1/action-items/{created['id']}/progress-updates/"
+            f"{report.json()['id']}/evidence/files",
+            files={"file": ("eicar-test.pdf", BytesIO(content), "application/pdf")},
+        )
+
+        assert report.status_code == 201, report.text
+        assert upload.status_code == 201, upload.text
+        evidence = session.get(ActionItemEvidence, UUID(upload.json()["id"]))
+        assert evidence is not None
+        assert evidence.storage_key is not None
+        assert evidence.sha256 is not None
+
+        class EicarScanner(evidence_worker.clamd.ClamdNetworkSocket):
+            def __init__(self) -> None:
+                super().__init__()
+
+            def instream(self, stream: BytesIO) -> dict[str, tuple[str, str | None]]:
+                assert stream.read() == content
+                return {"stream": ("FOUND", "Eicar-Test-Signature")}
+
+            def version(self) -> str:
+                return "ClamAV synthetic test scanner"
+
+        assert evidence_worker.scan_one(
+            session,
+            EicarScanner(),
+            evidence.id,
+            evidence.storage_key,
+            evidence.sha256,
+        )
+        client.cookies.clear()
+        client.headers.clear()
+        _login(client, users["secretariat"])
+        verification = client.post(
+            f"/api/v1/action-items/{created['id']}/completion-verifications",
+            json={
+                "expected_version": 1,
+                "progress_update_id": report.json()["id"],
+                "outcome": "VERIFIED",
+            },
+        )
+        download = client.get(f"/api/v1/action-items/{created['id']}/evidence/{evidence.id}")
+
+    latest_scan = session.scalar(
+        select(ActionItemEvidenceScan)
+        .where(ActionItemEvidenceScan.evidence_id == evidence.id)
+        .order_by(ActionItemEvidenceScan.event_number.desc())
+        .limit(1)
+    )
+    task = session.get(ActionItem, UUID(created["id"]))
+    assert latest_scan is not None
+    assert latest_scan.scan_status == "REJECTED"
+    assert verification.status_code == 409
+    assert download.status_code == 423
+    assert task is not None
+    assert task.official_status == "BELUM_DIMULAI"
+    assert task.version == 1
+    assert (
+        session.scalar(
+            select(CompletionVerification).where(CompletionVerification.action_item_id == task.id)
+        )
+        is None
+    )
+    assert [
+        row.new_status
+        for row in session.scalars(
+            select(ActionItemStatusHistory)
+            .where(ActionItemStatusHistory.action_item_id == task.id)
+            .order_by(ActionItemStatusHistory.event_number)
+        )
+    ] == ["BELUM_DIMULAI"]
+    get_settings.cache_clear()

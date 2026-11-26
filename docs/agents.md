@@ -32,20 +32,22 @@ Jika dokumen bertentangan, jangan memilih secara diam-diam. Tunjukkan konflik, s
 
 ## 3. Aturan domain SITARA yang tidak boleh dilanggar
 
-- Role terpisah: `SUPER_ADMIN`, `SEKRETARIAT`, `REKTOR`, `WAREK`, `PIC`.
+- Role terpisah: `SUPER_ADMIN`, `SEKRETARIAT`, `MANAGER_LEGAL`, `REKTOR`, `WAREK`, `PIC`.
 - Super Admin bukan akun operasional Sekretariat dan tidak otomatis memiliki kewenangan bisnis Sekretariat.
 - PIC tidak dapat membaca notulen lengkap atau Decision Brief terbatas melalui UI, API, URL langsung, pencarian, ekspor, atau penyimpanan dokumen.
-- Pada sesi live, hanya notulis yang ditunjuk boleh mengedit; pengguna berwenang lainnya read-only.
-- Nomor notulen dimasukkan manual sesuai administrasi.
+- Pengguna aktif Sekretariat, Manager Legal, Rektor, dan Warek dapat membaca seluruh Rapim dan mengedit notulensi saat LIVE; gunakan kontrol konflik revisi. PIC dan Super Admin tetap tidak dapat membaca notulen lengkap.
+- Notulis opsional dipilih saat rapat dibuat untuk atribusi, bukan sebagai gerbang edit; tidak ada serah-terima notulis. Nomor rapat dapat diubah oleh pengelola rapat pada semua status; perubahan lain dibatasi status dan role. Status rapat dikelola Sekretariat dan Manager Legal.
 - Satu putusan dapat menjadi bukan action item, atau menghasilkan beberapa action item.
 - Satu action item memiliki satu PIC utama aktif dan dapat memiliki beberapa PIC pendukung.
-- Hanya Sekretariat berwenang mengubah status resmi tugas.
+- Hanya Sekretariat dan Manager Legal dapat membuat/mengelola tindak lanjut. PIC dapat dipilih dari pengguna inti aktif atau dicatat sebagai nama bebas; unit asal/PJ dan alasan penugasan tidak diminta.
+- Sekretariat dan Manager Legal aktif memiliki wewenang yang sama untuk mengubah status resmi tugas dan memverifikasi penyelesaian. Akun campuran PIC atau Super Admin tetap ditolak.
 - Lima status resmi: `BELUM_DIMULAI`, `BERPROSES`, `TERKENDALA`, `MENUNGGU_ACC`, `SELESAI`.
-- Status `SELESAI` mensyaratkan verifikasi Sekretariat dan riwayat yang konsisten.
+- Status `SELESAI` mensyaratkan verifikasi Sekretariat atau Manager Legal dan riwayat yang konsisten.
 - PIC/pimpinan yang diberi kewenangan dapat mengirim update/catatan, tetapi update tidak boleh langsung mengubah status resmi.
 - Dokumen privat secara default; storage key dan URL publik permanen tidak boleh dikirim kepada pengguna yang tidak berwenang.
 - Audit event mencatat perubahan status, persetujuan, perubahan izin, ekspor terbatas, dan tindakan Super Admin, tanpa menyimpan secret atau isi lengkap dokumen rahasia.
 - AI/OCR hanya menyusun draf/ekstraksi; tidak mengesahkan dokumen atau mengubah status tugas.
+- SITARA tidak menyediakan input atau pemutar rekaman dan tidak mengirim konten Rapim ke layanan eksternal. Integrasi AI/ChatGPT memerlukan persetujuan institusi dan pemeriksaan keamanan sebelum dibuat.
 
 ## 4. Workflow sebelum coding
 

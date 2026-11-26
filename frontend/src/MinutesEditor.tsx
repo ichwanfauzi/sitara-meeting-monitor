@@ -12,10 +12,10 @@ import {
   type MinutesRevision,
   type StructuredMinutesRevisionInput,
 } from './api';
+import MeetingDocumentSelection from './MeetingDocumentSelection';
 
 type LoadState = 'loading' | 'ready' | 'empty' | 'failed';
 type SaveState = 'clean' | 'saved' | 'saving' | 'conflict' | 'statusChanged' | 'error' | 'reloaded';
-type EditorFormat = 'text' | 'structured';
 
 interface DiscussionDraft {
   agenda_id: string;
@@ -26,31 +26,27 @@ interface DiscussionDraft {
 
 interface DecisionDraft {
   decision_text: string;
+  pic_suggestion: string;
+  supporting_pic_suggestion: string;
   output_expected: string;
+  target_kind: 'DATE' | 'TEXT';
   target_date: string;
+  target_text: string;
   is_action_item: boolean;
 }
 
 const STALE_REVISION_DETAIL = 'Minutes changed since the supplied base revision';
 const MEETING_NOT_LIVE_DETAIL = 'Minutes can only be edited while the meeting is LIVE';
 export const UNSAVED_MINUTES_NAVIGATION_WARNING =
-  'Perubahan notulensi belum disimpan. Tinggalkan halaman dan buang draf?';
+  'Perubahan notulensi belum disimpan. Tinggalkan halaman dan buang perubahan?';
 
 const RESTRICTED_ROLES = new Set(['PIC', 'SUPER_ADMIN']);
+const MINUTES_EDITOR_ROLES = new Set(['SEKRETARIAT', 'MANAGER_LEGAL', 'WAREK']);
 
 function formatDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium' }).format(date);
-}
-
-function formatTimestamp(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat('id-ID', {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  }).format(date);
 }
 
 function accessErrorMessage(error: unknown): string {
@@ -78,8 +74,12 @@ function structuredDraftFrom(revision: MinutesRevision | null): DiscussionDraft[
     content: discussion.content,
     decisions: discussion.decisions.map((decision) => ({
       decision_text: decision.decision_text,
+      pic_suggestion: decision.pic_suggestion ?? '',
+      supporting_pic_suggestion: decision.supporting_pic_suggestion ?? '',
       output_expected: decision.output_expected ?? '',
+      target_kind: decision.target_text ? 'TEXT' : 'DATE',
       target_date: decision.target_date ?? '',
+      target_text: decision.target_text ?? '',
       is_action_item: decision.is_action_item,
     })),
   }));
@@ -95,8 +95,11 @@ function structuredSnapshot(discussions: DiscussionDraft[]): StructuredMinutesRe
       content: discussion.content,
       decisions: discussion.decisions.map((decision) => ({
         decision_text: decision.decision_text,
+        pic_suggestion: decision.pic_suggestion.trim() || null,
+        supporting_pic_suggestion: decision.supporting_pic_suggestion.trim() || null,
         output_expected: decision.output_expected.trim() || null,
-        target_date: decision.target_date || null,
+        target_date: decision.target_kind === 'DATE' ? decision.target_date || null : null,
+        target_text: decision.target_kind === 'TEXT' ? decision.target_text.trim() || null : null,
         is_action_item: decision.is_action_item,
       })),
     })),
@@ -118,12 +121,462 @@ function isValidStructuredDraft(discussions: DiscussionDraft[]): boolean {
   );
 }
 
+interface MinutesTableRow {
+  agenda: MeetingSummary['agendas'][number];
+  discussion: DiscussionDraft | null;
+  discussionIndex: number | null;
+}
+
+function tableRowsForMeeting(
+  meeting: MeetingSummary,
+  discussions: DiscussionDraft[],
+): MinutesTableRow[] {
+  return meeting.agendas.flatMap<MinutesTableRow>((agenda) => {
+    const agendaDiscussions = discussions
+      .map((discussion, discussionIndex) => ({ discussion, discussionIndex }))
+      .filter(({ discussion }) => discussion.agenda_id === agenda.id);
+    if (agendaDiscussions.length === 0) {
+      return [
+        {
+          agenda,
+          discussion: null,
+          discussionIndex: null,
+        },
+      ];
+    }
+
+    return agendaDiscussions.map(({ discussion, discussionIndex }) => ({
+      agenda,
+      discussion,
+      discussionIndex,
+    }));
+  });
+}
+
+function updateDecision(
+  discussion: DiscussionDraft,
+  decisionIndex: number,
+  update: (decision: DecisionDraft) => DecisionDraft,
+): DiscussionDraft {
+  return {
+    ...discussion,
+    decisions: discussion.decisions.map((decision, index) =>
+      index === decisionIndex ? update(decision) : decision,
+    ),
+  };
+}
+
+function MinutesGuidedEditor({
+  meeting,
+  discussions,
+  canEdit,
+  loadingRevisions,
+  saveState,
+  onUpdateDiscussion,
+  onAddDiscussion,
+  onRemoveDiscussion,
+}: {
+  meeting: MeetingSummary;
+  discussions: DiscussionDraft[];
+  canEdit: boolean;
+  loadingRevisions: boolean;
+  saveState: SaveState;
+  onUpdateDiscussion: (
+    discussionIndex: number,
+    update: (discussion: DiscussionDraft) => DiscussionDraft,
+  ) => void;
+  onAddDiscussion: (agendaId: string) => void;
+  onRemoveDiscussion: (discussionIndex: number) => void;
+}) {
+  const fieldsDisabled = !canEdit || loadingRevisions || saveState === 'saving';
+  const actionsDisabled = !canEdit || saveState === 'saving';
+
+  return (
+    <section className="minutes-guided-form" aria-label="Form pengisian hasil rapat" tabIndex={0}>
+      {meeting.agendas.length === 0 ? (
+        <p className="minutes-form-empty">
+          Tambahkan agenda pada data rapat sebelum mengisi hasil rapat.
+        </p>
+      ) : (
+        meeting.agendas.map((agenda) => {
+          const agendaDiscussions = discussions.flatMap((discussion, discussionIndex) =>
+            discussion.agenda_id === agenda.id ? [{ discussion, discussionIndex }] : [],
+          );
+          const agendaHeadingId = `minutes-agenda-heading-${agenda.id}`;
+
+          return (
+            <section
+              className="minutes-agenda-card"
+              key={agenda.id}
+              aria-labelledby={agendaHeadingId}
+            >
+              <header className="minutes-agenda-heading">
+                <span>Agenda {agenda.agenda_number}</span>
+                <h3 id={agendaHeadingId}>{agenda.title}</h3>
+              </header>
+              {agendaDiscussions.length === 0 ? (
+                <div className="minutes-agenda-empty">
+                  <p>Belum ada pokok bahasan untuk agenda ini.</p>
+                  <button
+                    className="button button--secondary minutes-row-action"
+                    disabled={actionsDisabled}
+                    onClick={() => onAddDiscussion(agenda.id)}
+                    type="button"
+                  >
+                    Isi pokok bahasan
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="minutes-guided-discussions">
+                    {agendaDiscussions.map(({ discussion, discussionIndex }, index) => {
+                      const discussionHeadingId = `minutes-discussion-heading-${discussionIndex}`;
+
+                      return (
+                        <section
+                          className="minutes-guided-discussion"
+                          key={discussionIndex}
+                          aria-labelledby={discussionHeadingId}
+                        >
+                          <div className="minutes-guided-heading">
+                            <h4 id={discussionHeadingId}>Pokok bahasan {index + 1}</h4>
+                            <button
+                              className="button button--secondary minutes-row-action"
+                              disabled={actionsDisabled}
+                              onClick={() => onRemoveDiscussion(discussionIndex)}
+                              type="button"
+                            >
+                              Hapus bahasan
+                            </button>
+                          </div>
+                          <div className="minutes-guided-fields">
+                            <label className="minutes-table-field">
+                              Judul pokok pembahasan
+                              <input
+                                aria-label={
+                                  'Judul pembahasan ' +
+                                  (discussionIndex + 1) +
+                                  ' agenda ' +
+                                  agenda.agenda_number
+                                }
+                                className="minutes-input"
+                                disabled={fieldsDisabled}
+                                maxLength={500}
+                                value={discussion.subject}
+                                onChange={(event) =>
+                                  onUpdateDiscussion(discussionIndex, (current) => ({
+                                    ...current,
+                                    subject: event.target.value,
+                                  }))
+                                }
+                              />
+                            </label>
+                            <label className="minutes-table-field">
+                              Isi pokok pembahasan
+                              <textarea
+                                aria-label={
+                                  'Isi pembahasan ' +
+                                  (discussionIndex + 1) +
+                                  ' agenda ' +
+                                  agenda.agenda_number
+                                }
+                                className="minutes-textarea minutes-entry-textarea"
+                                disabled={fieldsDisabled}
+                                maxLength={100_000}
+                                rows={5}
+                                value={discussion.content}
+                                onChange={(event) =>
+                                  onUpdateDiscussion(discussionIndex, (current) => ({
+                                    ...current,
+                                    content: event.target.value,
+                                  }))
+                                }
+                              />
+                            </label>
+                          </div>
+
+                          <section className="minutes-guided-decisions">
+                            <h5>Putusan dan arahan</h5>
+                            {discussion.decisions.length === 0 ? (
+                              <p className="minutes-muted">
+                                Belum ada putusan. Tambahkan putusan jika rapat menghasilkan
+                                keputusan atau arahan.
+                              </p>
+                            ) : (
+                              <div className="minutes-guided-decision-list">
+                                {discussion.decisions.map((decision, decisionIndex) => {
+                                  const decisionHeadingId = `minutes-decision-heading-${discussionIndex}-${decisionIndex}`;
+
+                                  return (
+                                    <section
+                                      className="minutes-guided-decision"
+                                      key={decisionIndex}
+                                      aria-labelledby={decisionHeadingId}
+                                    >
+                                      <div className="minutes-guided-heading">
+                                        <h6 id={decisionHeadingId}>Putusan {decisionIndex + 1}</h6>
+                                        <button
+                                          className="button button--secondary minutes-row-action"
+                                          disabled={actionsDisabled}
+                                          onClick={() =>
+                                            onUpdateDiscussion(discussionIndex, (current) => ({
+                                              ...current,
+                                              decisions: current.decisions.filter(
+                                                (_, itemIndex) => itemIndex !== decisionIndex,
+                                              ),
+                                            }))
+                                          }
+                                          type="button"
+                                        >
+                                          Hapus putusan
+                                        </button>
+                                      </div>
+                                      <label className="minutes-table-field">
+                                        Isi putusan/arahan
+                                        <textarea
+                                          aria-label={
+                                            'Isi putusan ' +
+                                            (decisionIndex + 1) +
+                                            ' pembahasan ' +
+                                            (discussionIndex + 1)
+                                          }
+                                          className="minutes-textarea minutes-entry-textarea"
+                                          disabled={fieldsDisabled}
+                                          maxLength={20_000}
+                                          rows={4}
+                                          value={decision.decision_text}
+                                          onChange={(event) =>
+                                            onUpdateDiscussion(discussionIndex, (current) =>
+                                              updateDecision(current, decisionIndex, (item) => ({
+                                                ...item,
+                                                decision_text: event.target.value,
+                                              })),
+                                            )
+                                          }
+                                        />
+                                      </label>
+                                      <label className="minutes-checkbox-label">
+                                        <input
+                                          checked={decision.is_action_item}
+                                          disabled={fieldsDisabled}
+                                          onChange={(event) =>
+                                            onUpdateDiscussion(discussionIndex, (current) =>
+                                              updateDecision(current, decisionIndex, (item) => ({
+                                                ...item,
+                                                is_action_item: event.target.checked,
+                                              })),
+                                            )
+                                          }
+                                          type="checkbox"
+                                        />
+                                        Memerlukan tindak lanjut
+                                      </label>
+                                      {decision.is_action_item && (
+                                        <div className="minutes-guided-follow-up">
+                                          <h6>Rencana tindak lanjut</h6>
+                                          <label className="minutes-table-field">
+                                            PIC usulan
+                                            <input
+                                              aria-label="PIC usulan"
+                                              className="minutes-input"
+                                              disabled={fieldsDisabled}
+                                              maxLength={300}
+                                              value={decision.pic_suggestion}
+                                              onChange={(event) =>
+                                                onUpdateDiscussion(discussionIndex, (current) =>
+                                                  updateDecision(
+                                                    current,
+                                                    decisionIndex,
+                                                    (item) => ({
+                                                      ...item,
+                                                      pic_suggestion: event.target.value,
+                                                    }),
+                                                  ),
+                                                )
+                                              }
+                                            />
+                                          </label>
+                                          <label className="minutes-table-field">
+                                            PIC pendukung (opsional)
+                                            <input
+                                              aria-label="PIC pendukung (opsional)"
+                                              className="minutes-input"
+                                              disabled={fieldsDisabled}
+                                              maxLength={2_000}
+                                              value={decision.supporting_pic_suggestion}
+                                              onChange={(event) =>
+                                                onUpdateDiscussion(discussionIndex, (current) =>
+                                                  updateDecision(
+                                                    current,
+                                                    decisionIndex,
+                                                    (item) => ({
+                                                      ...item,
+                                                      supporting_pic_suggestion: event.target.value,
+                                                    }),
+                                                  ),
+                                                )
+                                              }
+                                            />
+                                          </label>
+                                          <label className="minutes-table-field minutes-guided-output">
+                                            Output yang diharapkan
+                                            <textarea
+                                              aria-label="Output yang diharapkan"
+                                              className="minutes-textarea minutes-entry-textarea"
+                                              disabled={fieldsDisabled}
+                                              maxLength={20_000}
+                                              rows={3}
+                                              value={decision.output_expected}
+                                              onChange={(event) =>
+                                                onUpdateDiscussion(discussionIndex, (current) =>
+                                                  updateDecision(
+                                                    current,
+                                                    decisionIndex,
+                                                    (item) => ({
+                                                      ...item,
+                                                      output_expected: event.target.value,
+                                                    }),
+                                                  ),
+                                                )
+                                              }
+                                            />
+                                          </label>
+                                          <div className="minutes-guided-target">
+                                            <label className="minutes-table-field">
+                                              Jenis target penyelesaian
+                                              <select
+                                                aria-label="Jenis target penyelesaian"
+                                                className="minutes-input"
+                                                disabled={fieldsDisabled}
+                                                value={decision.target_kind}
+                                                onChange={(event) =>
+                                                  onUpdateDiscussion(discussionIndex, (current) =>
+                                                    updateDecision(
+                                                      current,
+                                                      decisionIndex,
+                                                      (item) => ({
+                                                        ...item,
+                                                        target_kind: event.target.value as
+                                                          'DATE' | 'TEXT',
+                                                      }),
+                                                    ),
+                                                  )
+                                                }
+                                              >
+                                                <option value="DATE">Tanggal</option>
+                                                <option value="TEXT">Teks manual</option>
+                                              </select>
+                                            </label>
+                                            <label className="minutes-table-field">
+                                              Target penyelesaian
+                                              {decision.target_kind === 'DATE' ? (
+                                                <input
+                                                  aria-label="Target penyelesaian berupa tanggal"
+                                                  className="minutes-input"
+                                                  disabled={fieldsDisabled}
+                                                  type="date"
+                                                  value={decision.target_date}
+                                                  onChange={(event) =>
+                                                    onUpdateDiscussion(discussionIndex, (current) =>
+                                                      updateDecision(
+                                                        current,
+                                                        decisionIndex,
+                                                        (item) => ({
+                                                          ...item,
+                                                          target_date: event.target.value,
+                                                        }),
+                                                      ),
+                                                    )
+                                                  }
+                                                />
+                                              ) : (
+                                                <input
+                                                  aria-label="Target penyelesaian berupa teks manual"
+                                                  className="minutes-input"
+                                                  disabled={fieldsDisabled}
+                                                  maxLength={500}
+                                                  placeholder="Contoh: minggu kedua Desember"
+                                                  type="text"
+                                                  value={decision.target_text}
+                                                  onChange={(event) =>
+                                                    onUpdateDiscussion(discussionIndex, (current) =>
+                                                      updateDecision(
+                                                        current,
+                                                        decisionIndex,
+                                                        (item) => ({
+                                                          ...item,
+                                                          target_text: event.target.value,
+                                                        }),
+                                                      ),
+                                                    )
+                                                  }
+                                                />
+                                              )}
+                                            </label>
+                                          </div>
+                                        </div>
+                                      )}
+                                    </section>
+                                  );
+                                })}
+                              </div>
+                            )}
+                            <button
+                              className="button button--secondary minutes-row-action"
+                              disabled={actionsDisabled}
+                              onClick={() =>
+                                onUpdateDiscussion(discussionIndex, (current) => ({
+                                  ...current,
+                                  decisions: [
+                                    ...current.decisions,
+                                    {
+                                      decision_text: '',
+                                      pic_suggestion: '',
+                                      supporting_pic_suggestion: '',
+                                      output_expected: '',
+                                      target_kind: 'DATE',
+                                      target_date: '',
+                                      target_text: '',
+                                      is_action_item: false,
+                                    },
+                                  ],
+                                }))
+                              }
+                              type="button"
+                            >
+                              Tambah putusan
+                            </button>
+                          </section>
+                        </section>
+                      );
+                    })}
+                  </div>
+                  <button
+                    className="button button--secondary minutes-row-action"
+                    disabled={actionsDisabled}
+                    onClick={() => onAddDiscussion(agenda.id)}
+                    type="button"
+                  >
+                    Tambah pokok bahasan agenda {agenda.agenda_number}
+                  </button>
+                </>
+              )}
+            </section>
+          );
+        })
+      )}
+    </section>
+  );
+}
+
 function MinutesEditor({
   authenticatedUser,
   onPendingDraftChange,
+  targetMeetingId,
 }: {
   authenticatedUser?: AuthenticatedUser;
   onPendingDraftChange?: (hasPendingDraft: boolean) => void;
+  targetMeetingId?: string;
 }) {
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -131,9 +584,6 @@ function MinutesEditor({
   const [meetings, setMeetings] = useState<MeetingSummary[]>([]);
   const [selectedMeetingId, setSelectedMeetingId] = useState('');
   const [revisions, setRevisions] = useState<MinutesRevision[]>([]);
-  const [content, setContent] = useState('');
-  const [baselineContent, setBaselineContent] = useState('');
-  const [editorFormat, setEditorFormat] = useState<EditorFormat>('structured');
   const [structuredDiscussions, setStructuredDiscussions] = useState<DiscussionDraft[]>([]);
   const [baselineStructuredSnapshot, setBaselineStructuredSnapshot] = useState('[]');
   const [structuredFormatChanged, setStructuredFormatChanged] = useState(false);
@@ -143,6 +593,7 @@ function MinutesEditor({
   const [conflictDraft, setConflictDraft] = useState<string | null>(null);
   const [refreshingMeetingStatus, setRefreshingMeetingStatus] = useState(false);
   const [meetingStatusRefreshFailed, setMeetingStatusRefreshFailed] = useState(false);
+  const [printingMinutes, setPrintingMinutes] = useState(false);
   const requestSequence = useRef(0);
   const selectedMeeting = meetings.find((meeting) => meeting.id === selectedMeetingId) ?? null;
   const latestRevision = activeRevision(revisions);
@@ -155,22 +606,34 @@ function MinutesEditor({
     currentUser &&
     selectedMeeting &&
     !hasRestrictedRole &&
+    currentUser.roles.some((role) => MINUTES_EDITOR_ROLES.has(role)) &&
     selectedMeeting.status === 'LIVE' &&
-    saveState !== 'statusChanged' &&
-    selectedMeeting.notetaker_id === currentUser.id,
+    saveState !== 'statusChanged',
   );
   const structuredSnapshotValue = JSON.stringify(structuredDiscussions);
-  const isDirty =
-    editorFormat === 'text'
-      ? content !== baselineContent
-      : structuredFormatChanged || structuredSnapshotValue !== baselineStructuredSnapshot;
+  const isDirty = structuredFormatChanged || structuredSnapshotValue !== baselineStructuredSnapshot;
   const structuredDraftIsValid = isValidStructuredDraft(structuredDiscussions);
+  const structuredTableRows = selectedMeeting
+    ? tableRowsForMeeting(selectedMeeting, structuredDiscussions)
+    : [];
+  const canPrintMinutes = Boolean(
+    latestRevision?.format_version === 2 && !isDirty && conflictDraft === null,
+  );
   const hasPendingDraft = isDirty || conflictDraft !== null;
 
   useEffect(() => {
     onPendingDraftChange?.(hasPendingDraft);
     return () => onPendingDraftChange?.(false);
   }, [hasPendingDraft, onPendingDraftChange]);
+
+  useEffect(() => {
+    const resetPrintMode = () => {
+      document.body.classList.remove('sitara-print-mode');
+      setPrintingMinutes(false);
+    };
+    window.addEventListener('afterprint', resetPrintMode);
+    return () => window.removeEventListener('afterprint', resetPrintMode);
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -185,22 +648,36 @@ function MinutesEditor({
         if (!mounted) return;
         setCurrentUser(user);
         setMeetings(accessibleMeetings);
-        if (accessibleMeetings.length === 0) {
+        if (targetMeetingId) {
+          const targetMeeting = accessibleMeetings.find(
+            (meeting) => meeting.id === targetMeetingId,
+          );
+          if (!targetMeeting) {
+            setErrorMessage('Rapat tidak termasuk dalam cakupan akses Anda.');
+            setLoadState('failed');
+            return;
+          }
+        } else if (accessibleMeetings.length === 0) {
           setLoadState('empty');
+          return;
+        } else {
+          setSelectedMeetingId('');
+          setLoadState('ready');
           return;
         }
 
-        const firstMeeting = accessibleMeetings[0];
-        setSelectedMeetingId(firstMeeting.id);
-        const meetingRevisions = sortRevisions(await getMinutesRevisions(firstMeeting.id));
+        const initialMeeting = accessibleMeetings.find((meeting) => meeting.id === targetMeetingId);
+        if (!initialMeeting) {
+          setErrorMessage('Rapat tidak termasuk dalam cakupan akses Anda.');
+          setLoadState('failed');
+          return;
+        }
+        setSelectedMeetingId(initialMeeting.id);
+        const meetingRevisions = sortRevisions(await getMinutesRevisions(initialMeeting.id));
         if (!mounted) return;
         setRevisions(meetingRevisions);
         const latest = activeRevision(meetingRevisions);
-        const loadedText = latest?.content ?? '';
         const loadedStructured = structuredDraftFrom(latest);
-        setContent(loadedText);
-        setBaselineContent(loadedText);
-        setEditorFormat(latest?.format_version === 2 || latest === null ? 'structured' : 'text');
         setStructuredDiscussions(loadedStructured);
         setBaselineStructuredSnapshot(JSON.stringify(loadedStructured));
         setStructuredFormatChanged(false);
@@ -218,28 +695,20 @@ function MinutesEditor({
       mounted = false;
       requestSequence.current += 1;
     };
-  }, [authenticatedUser]);
+  }, [authenticatedUser, targetMeetingId]);
 
   async function loadMeetingRevisions(meetingId: string, preserveDraft = false): Promise<void> {
     const requestId = ++requestSequence.current;
-    const localDraft = preserveDraft
-      ? editorFormat === 'text'
-        ? content
-        : structuredDraftText(structuredDiscussions)
-      : null;
+    const localDraft = preserveDraft ? structuredDraftText(structuredDiscussions) : null;
     setLoadingRevisions(true);
     setErrorMessage(null);
     try {
       const meetingRevisions = sortRevisions(await getMinutesRevisions(meetingId));
       if (requestId !== requestSequence.current) return;
       const latest = activeRevision(meetingRevisions);
-      const loadedText = latest?.content ?? '';
       const loadedStructured = structuredDraftFrom(latest);
       setRevisions(meetingRevisions);
       setBaseRevisionId(latest?.id ?? null);
-      setBaselineContent(loadedText);
-      setContent(loadedText);
-      setEditorFormat(latest?.format_version === 2 || latest === null ? 'structured' : 'text');
       setStructuredDiscussions(loadedStructured);
       setBaselineStructuredSnapshot(JSON.stringify(loadedStructured));
       setStructuredFormatChanged(false);
@@ -252,35 +721,6 @@ function MinutesEditor({
     } finally {
       if (requestId === requestSequence.current) setLoadingRevisions(false);
     }
-  }
-
-  async function handleMeetingChange(meetingId: string): Promise<void> {
-    if (
-      !meetingId ||
-      meetingId === selectedMeetingId ||
-      loadingRevisions ||
-      refreshingMeetingStatus ||
-      saveState === 'saving'
-    ) {
-      return;
-    }
-    if (hasPendingDraft && !window.confirm(UNSAVED_MINUTES_NAVIGATION_WARNING)) {
-      return;
-    }
-
-    setSelectedMeetingId(meetingId);
-    setRevisions([]);
-    setContent('');
-    setBaselineContent('');
-    setEditorFormat('structured');
-    setStructuredDiscussions([]);
-    setBaselineStructuredSnapshot('[]');
-    setStructuredFormatChanged(false);
-    setBaseRevisionId(null);
-    setConflictDraft(null);
-    setSaveState('clean');
-    setMeetingStatusRefreshFailed(false);
-    await loadMeetingRevisions(meetingId);
   }
 
   async function refreshMeetingStatus(meetingId: string): Promise<void> {
@@ -296,7 +736,7 @@ function MinutesEditor({
     } catch {
       setMeetingStatusRefreshFailed(true);
       setErrorMessage(
-        'Rapat tidak lagi LIVE. Draf Anda dipertahankan, tetapi status rapat belum dapat diperbarui. Coba muat ulang status rapat.',
+        'Rapat tidak lagi berlangsung. Perubahan yang belum disimpan dipertahankan. Coba muat ulang status rapat.',
       );
     } finally {
       setRefreshingMeetingStatus(false);
@@ -308,7 +748,7 @@ function MinutesEditor({
       !canEdit ||
       !selectedMeeting ||
       !isDirty ||
-      (editorFormat === 'structured' && !structuredDraftIsValid) ||
+      !structuredDraftIsValid ||
       loadingRevisions ||
       saveState === 'saving'
     ) {
@@ -320,17 +760,13 @@ function MinutesEditor({
     try {
       const savedRevision = await createMinutesRevision(
         selectedMeeting.id,
-        editorFormat === 'text' ? content : structuredSnapshot(structuredDiscussions),
+        structuredSnapshot(structuredDiscussions),
         baseRevisionId,
       );
       const updatedRevisions = sortRevisions([...revisions, savedRevision]);
-      const savedText = savedRevision.content ?? '';
       const savedStructured = structuredDraftFrom(savedRevision);
       setRevisions(updatedRevisions);
       setBaseRevisionId(savedRevision.id);
-      setContent(savedText);
-      setBaselineContent(savedText);
-      setEditorFormat(savedRevision.format_version === 2 ? 'structured' : 'text');
       setStructuredDiscussions(savedStructured);
       setBaselineStructuredSnapshot(JSON.stringify(savedStructured));
       setStructuredFormatChanged(false);
@@ -342,11 +778,9 @@ function MinutesEditor({
         error.status === 409 &&
         error.message === STALE_REVISION_DETAIL
       ) {
-        setConflictDraft(
-          editorFormat === 'text' ? content : structuredDraftText(structuredDiscussions),
-        );
+        setConflictDraft(structuredDraftText(structuredDiscussions));
         setErrorMessage(
-          'Ada revisi terbaru. Draf Anda dipertahankan; muat revisi terbaru sebelum melanjutkan.',
+          'Notulensi sudah diperbarui oleh pengguna lain. Perubahan Anda disimpan sementara; muat notulensi terbaru untuk melanjutkan.',
         );
         setSaveState('conflict');
       } else if (
@@ -354,11 +788,11 @@ function MinutesEditor({
         error.status === 409 &&
         error.message === MEETING_NOT_LIVE_DETAIL
       ) {
-        setConflictDraft(
-          editorFormat === 'text' ? content : structuredDraftText(structuredDiscussions),
-        );
+        setConflictDraft(structuredDraftText(structuredDiscussions));
         setSaveState('statusChanged');
-        setErrorMessage('Rapat tidak lagi LIVE. Draf Anda dipertahankan dan tidak dikirim ulang.');
+        setErrorMessage(
+          'Rapat tidak lagi berlangsung. Perubahan Anda disimpan sementara dan belum tersimpan ke notulensi.',
+        );
         await refreshMeetingStatus(selectedMeeting.id);
       } else {
         setErrorMessage(accessErrorMessage(error));
@@ -415,28 +849,31 @@ function MinutesEditor({
     }
   }
 
-  function beginStructuredRevision(): void {
-    setEditorFormat('structured');
-    setStructuredDiscussions([]);
-    setBaselineStructuredSnapshot('[]');
-    setStructuredFormatChanged(true);
-    setSaveState('clean');
-    setErrorMessage(null);
+  function printMinutes(): void {
+    document.body.classList.add('sitara-print-mode');
+    setPrintingMinutes(true);
+    window.setTimeout(() => window.print(), 0);
+  }
+
+  if (loadState === 'ready' && !selectedMeeting) {
+    return (
+      <MeetingDocumentSelection
+        meetings={meetings}
+        documentName="Notulensi rapat"
+        routePrefix="#notulensi"
+      />
+    );
   }
 
   return (
     <section className="minutes-page" aria-labelledby="minutes-page-title">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">RAPIM · NOTULENSI</p>
-          <h1 id="minutes-page-title">Editor notulensi</h1>
-          <p className="page-description">
-            Perubahan disimpan sebagai revisi baru setelah dikonfirmasi server.
-          </p>
+          <h1 id="minutes-page-title">Notulensi rapat</h1>
         </div>
       </div>
 
-      {loadState === 'loading' && <p role="status">Memuat rapat dan revisi notulensi…</p>}
+      {loadState === 'loading' && <p role="status">Memuat rapat dan notulensi…</p>}
       {loadState === 'failed' && (
         <p className="minutes-alert" role="alert">
           {errorMessage}
@@ -449,472 +886,335 @@ function MinutesEditor({
       )}
 
       {loadState === 'ready' && selectedMeeting && (
-        <div className="minutes-layout">
-          <section
-            className="surface-panel minutes-context"
-            aria-labelledby="meeting-context-title"
-          >
-            <div className="section-heading">
-              <div>
-                <p className="section-kicker">KONTEKS RAPAT</p>
-                <h2 id="meeting-context-title">Pilih rapat</h2>
-              </div>
-              <span
-                className={`meeting-status meeting-status--${selectedMeeting.status.toLowerCase()}`}
-              >
-                {selectedMeeting.status}
-              </span>
-            </div>
-
-            <label className="minutes-field-label" htmlFor="minutes-meeting-select">
-              Rapat yang dibuka
-            </label>
-            <select
-              id="minutes-meeting-select"
-              aria-label="Pilih rapat"
-              className="minutes-select"
-              value={selectedMeetingId}
-              disabled={loadingRevisions || refreshingMeetingStatus || saveState === 'saving'}
-              onChange={(event) => void handleMeetingChange(event.target.value)}
+        <>
+          <a className="repository-back-link" href="#notulensi">
+            Kembali ke daftar rapat
+          </a>
+          <div className="minutes-layout">
+            <section
+              className="surface-panel minutes-context"
+              aria-labelledby="meeting-context-title"
             >
-              {meetings.map((meeting) => (
-                <option key={meeting.id} value={meeting.id}>
-                  {meeting.meeting_number} · {meeting.title}
-                </option>
-              ))}
-            </select>
+              <div className="section-heading">
+                <div>
+                  <h2 id="meeting-context-title">Rapat terpilih</h2>
+                </div>
+                <span
+                  className={`meeting-status meeting-status--${selectedMeeting.status.toLowerCase()}`}
+                >
+                  {selectedMeeting.status}
+                </span>
+              </div>
 
-            <div className="minutes-meeting-meta">
-              <h3>{selectedMeeting.title}</h3>
-              <p>
-                <strong>{selectedMeeting.meeting_number}</strong>
-                <span> · </span>
-                {formatDate(selectedMeeting.meeting_date)}
-              </p>
-            </div>
+              <div className="minutes-meeting-meta">
+                <h3>{selectedMeeting.title}</h3>
+                <p>
+                  <strong>{selectedMeeting.meeting_number}</strong>
+                  <span> · </span>
+                  {formatDate(selectedMeeting.meeting_date)}
+                </p>
+              </div>
 
-            <div className="minutes-agendas">
-              <h3>Agenda</h3>
-              {selectedMeeting.agendas.length > 0 ? (
-                <ol>
-                  {selectedMeeting.agendas.map((agenda) => (
-                    <li key={agenda.id}>
-                      <span>{agenda.title}</span>
-                      {agenda.agenda_description && <small>{agenda.agenda_description}</small>}
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <p className="minutes-muted">Belum ada agenda pada data rapat ini.</p>
-              )}
-            </div>
-
-            <div className="minutes-active-revision" aria-live="polite">
-              <p className="section-kicker">REVISI AKTIF</p>
-              {latestRevision ? (
-                <>
-                  <strong>Revisi aktif: {latestRevision.revision_number}</strong>
-                  <span>Pembuat (ID): {latestRevision.created_by_id}</span>
-                  <span>Dibuat {formatTimestamp(latestRevision.created_at)}</span>
-                </>
-              ) : (
-                <strong>Belum ada revisi aktif</strong>
-              )}
-            </div>
-
-            <details className="minutes-history">
-              <summary>Riwayat revisi ({revisions.length})</summary>
-              {revisions.length > 0 ? (
-                <ol>
-                  {sortRevisions(revisions)
-                    .slice()
-                    .reverse()
-                    .map((revision) => (
-                      <li key={revision.id}>
-                        <strong>Revisi {revision.revision_number}</strong>
-                        <span>{formatTimestamp(revision.created_at)}</span>
+              <div className="minutes-agendas">
+                <h3>Agenda</h3>
+                {selectedMeeting.agendas.length > 0 ? (
+                  <ol>
+                    {selectedMeeting.agendas.map((agenda) => (
+                      <li key={agenda.id}>
+                        <span>{agenda.title}</span>
+                        {agenda.agenda_description && <small>{agenda.agenda_description}</small>}
                       </li>
                     ))}
-                </ol>
-              ) : (
-                <p>Belum ada revisi notulensi.</p>
-              )}
-            </details>
-          </section>
-
-          <section
-            className="surface-panel minutes-editor-panel"
-            aria-labelledby="minutes-editor-title"
-          >
-            <div className="section-heading">
-              <div>
-                <p className="section-kicker">ISI RESMI</p>
-                <h2 id="minutes-editor-title">Notulensi rapat</h2>
+                  </ol>
+                ) : (
+                  <p className="minutes-muted">Belum ada agenda pada data rapat ini.</p>
+                )}
               </div>
-              {canEdit ? (
-                <span className="minutes-role-badge">Notulis yang ditunjuk</span>
-              ) : (
-                <span className="minutes-role-badge minutes-role-badge--readonly">Baca saja</span>
+            </section>
+
+            <section
+              className="surface-panel minutes-editor-panel"
+              aria-labelledby="minutes-editor-title"
+            >
+              <div className="section-heading">
+                <div>
+                  <h2 id="minutes-editor-title">Isi resmi</h2>
+                </div>
+                {canEdit ? (
+                  <span className="minutes-role-badge">Dapat menyunting</span>
+                ) : (
+                  <span className="minutes-role-badge minutes-role-badge--readonly">Baca saja</span>
+                )}
+              </div>
+
+              {errorMessage && (
+                <p className="minutes-alert" role="alert">
+                  {errorMessage}
+                </p>
               )}
-            </div>
+              {saveState === 'reloaded' && (
+                <p className="minutes-notice" role="status">
+                  Notulensi terbaru dimuat. Perubahan sebelumnya tetap tersedia sementara.
+                </p>
+              )}
+              {conflictDraft !== null && (
+                <details className="minutes-preserved-draft">
+                  <summary>Perubahan lokal yang belum tersimpan</summary>
+                  <pre>{conflictDraft}</pre>
+                </details>
+              )}
 
-            {errorMessage && (
-              <p className="minutes-alert" role="alert">
-                {errorMessage}
-              </p>
-            )}
-            {saveState === 'reloaded' && (
-              <p className="minutes-notice" role="status">
-                Revisi terbaru dimuat. Draf lokal tidak dikirim ulang.
-              </p>
-            )}
-            {conflictDraft !== null && (
-              <details className="minutes-preserved-draft" open>
-                <summary>Draf lokal yang dipertahankan</summary>
-                <pre>{conflictDraft}</pre>
-              </details>
-            )}
+              {selectedMeeting.status !== 'ARCHIVED' && (
+                <div className="minutes-structured-editor">
+                  {latestLegacyRevision?.content && (
+                    <details className="minutes-legacy-source">
+                      <summary>Buka catatan notulensi terdahulu</summary>
+                      <pre>{latestLegacyRevision.content}</pre>
+                    </details>
+                  )}
+                  <MinutesGuidedEditor
+                    meeting={selectedMeeting}
+                    discussions={structuredDiscussions}
+                    canEdit={canEdit}
+                    loadingRevisions={loadingRevisions}
+                    saveState={saveState}
+                    onUpdateDiscussion={updateDiscussion}
+                    onAddDiscussion={addDiscussion}
+                    onRemoveDiscussion={removeDiscussion}
+                  />
+                </div>
+              )}
 
-            {editorFormat === 'text' ? (
-              <div className="minutes-text-editor">
-                <label className="minutes-field-label" htmlFor="minutes-content">
-                  Isi notulensi
-                </label>
-                <textarea
-                  id="minutes-content"
-                  className="minutes-textarea"
-                  rows={18}
-                  maxLength={1_000_000}
-                  value={content}
-                  disabled={!canEdit || loadingRevisions || saveState === 'saving'}
-                  onChange={(event) => {
-                    setContent(event.target.value);
-                    if (saveState === 'conflict') setConflictDraft(event.target.value);
-                    if (
-                      saveState === 'saved' ||
-                      saveState === 'error' ||
-                      saveState === 'reloaded'
-                    ) {
-                      setSaveState('clean');
-                      setErrorMessage(null);
-                    }
-                  }}
-                />
-                {latestRevision?.format_version === 1 && (
-                  <div className="minutes-notice">
-                    <p>
-                      Revisi teks lama tetap utuh di riwayat. Catatan tidak dipindahkan otomatis;
-                      salin secara sadar ke agenda yang tepat.
-                    </p>
+              <div className="minutes-editor-footer">
+                <p className={`minutes-save-state minutes-save-state--${saveState}`} role="status">
+                  {loadingRevisions
+                    ? 'Memuat notulensi…'
+                    : saveState === 'saving'
+                      ? 'Menyimpan notulensi…'
+                      : saveState === 'saved'
+                        ? 'Notulensi tersimpan.'
+                        : saveState === 'conflict'
+                          ? 'Penyimpanan tertahan karena ada perubahan yang lebih baru.'
+                          : saveState === 'statusChanged'
+                            ? 'Perubahan dipertahankan; rapat tidak lagi berlangsung.'
+                            : saveState === 'error'
+                              ? 'Penyimpanan gagal.'
+                              : saveState === 'reloaded'
+                                ? 'Notulensi terbaru sudah dimuat.'
+                                : isDirty
+                                  ? 'Perubahan belum disimpan.'
+                                  : latestRevision
+                                    ? 'Notulensi sudah tersimpan.'
+                                    : 'Belum ada notulensi tersimpan.'}
+                </p>
+                <div className="minutes-actions">
+                  {saveState === 'conflict' && (
                     <button
                       className="button button--secondary"
                       type="button"
-                      disabled={!canEdit || isDirty || loadingRevisions || saveState === 'saving'}
-                      onClick={beginStructuredRevision}
+                      disabled={loadingRevisions}
+                      onClick={() => void handleReloadLatest()}
                     >
-                      Mulai notulensi terstruktur
+                      {loadingRevisions ? 'Memuat…' : 'Muat notulensi terbaru'}
                     </button>
-                  </div>
-                )}
+                  )}
+                  {meetingStatusRefreshFailed && (
+                    <button
+                      className="button button--secondary"
+                      type="button"
+                      disabled={refreshingMeetingStatus}
+                      onClick={() => void handleReloadMeetingStatus()}
+                    >
+                      {refreshingMeetingStatus ? 'Memuat status…' : 'Muat ulang status rapat'}
+                    </button>
+                  )}
+                  {canEdit && selectedMeeting.status === 'LIVE' && (
+                    <button
+                      className="button button--primary"
+                      type="button"
+                      disabled={
+                        !isDirty ||
+                        !structuredDraftIsValid ||
+                        loadingRevisions ||
+                        saveState === 'saving' ||
+                        saveState === 'conflict'
+                      }
+                      onClick={() => void handleSave()}
+                    >
+                      {saveState === 'saving' ? 'Menyimpan…' : 'Simpan notulensi'}
+                    </button>
+                  )}
+                </div>
               </div>
-            ) : (
-              <div className="minutes-structured-editor">
-                <p className="minutes-muted">
-                  Setiap pembahasan dan putusan disimpan dalam snapshot revisi lengkap di bawah
-                  agendanya.
-                </p>
-                {latestLegacyRevision?.content && (
-                  <details className="minutes-legacy-source">
-                    <summary>
-                      Buka teks lama dari revisi {latestLegacyRevision.revision_number}
-                    </summary>
-                    <pre>{latestLegacyRevision.content}</pre>
-                  </details>
-                )}
-                {selectedMeeting.agendas.length === 0 ? (
-                  <p className="minutes-readonly-note">
-                    Tambahkan agenda pada data rapat sebelum mencatat pembahasan terstruktur.
-                  </p>
-                ) : (
-                  selectedMeeting.agendas.map((agenda) => {
-                    const agendaDiscussions = structuredDiscussions
-                      .map((discussion, index) => ({ discussion, index }))
-                      .filter(({ discussion }) => discussion.agenda_id === agenda.id);
-                    return (
-                      <section className="minutes-agenda-editor" key={agenda.id}>
-                        <h3>
-                          Agenda {agenda.agenda_number}: {agenda.title}
-                        </h3>
-                        {agendaDiscussions.length > 0 ? (
-                          agendaDiscussions.map(({ discussion, index }, agendaIndex) => (
-                            <article className="minutes-discussion-editor" key={index}>
-                              <div className="minutes-discussion-heading">
-                                <h4>Pembahasan {agendaIndex + 1}</h4>
-                                <button
-                                  className="button button--secondary"
-                                  type="button"
-                                  disabled={!canEdit || saveState === 'saving'}
-                                  onClick={() => removeDiscussion(index)}
-                                >
-                                  Hapus pembahasan
-                                </button>
-                              </div>
-                              <label className="minutes-field-label">
-                                Judul pembahasan {agendaIndex + 1} agenda {agenda.agenda_number}
-                                <input
-                                  className="minutes-input"
-                                  aria-label={`Judul pembahasan ${agendaIndex + 1} agenda ${agenda.agenda_number}`}
-                                  maxLength={500}
-                                  value={discussion.subject}
-                                  disabled={!canEdit || loadingRevisions || saveState === 'saving'}
-                                  onChange={(event) =>
-                                    updateDiscussion(index, (current) => ({
-                                      ...current,
-                                      subject: event.target.value,
-                                    }))
-                                  }
-                                />
-                              </label>
-                              <label className="minutes-field-label">
-                                Isi pembahasan {agendaIndex + 1} agenda {agenda.agenda_number}
-                                <textarea
-                                  className="minutes-textarea"
-                                  aria-label={`Isi pembahasan ${agendaIndex + 1} agenda ${agenda.agenda_number}`}
-                                  rows={6}
-                                  maxLength={100_000}
-                                  value={discussion.content}
-                                  disabled={!canEdit || loadingRevisions || saveState === 'saving'}
-                                  onChange={(event) =>
-                                    updateDiscussion(index, (current) => ({
-                                      ...current,
-                                      content: event.target.value,
-                                    }))
-                                  }
-                                />
-                              </label>
-                              {discussion.decisions.map((decision, decisionIndex) => (
-                                <div className="minutes-decision-editor" key={decisionIndex}>
-                                  <label className="minutes-field-label">
-                                    Isi putusan {decisionIndex + 1} pembahasan {agendaIndex + 1}
-                                    <textarea
-                                      className="minutes-textarea"
-                                      aria-label={`Isi putusan ${decisionIndex + 1} pembahasan ${agendaIndex + 1}`}
-                                      rows={3}
-                                      maxLength={20_000}
-                                      value={decision.decision_text}
-                                      disabled={
-                                        !canEdit || loadingRevisions || saveState === 'saving'
-                                      }
-                                      onChange={(event) =>
-                                        updateDiscussion(index, (current) => ({
-                                          ...current,
-                                          decisions: current.decisions.map((item, itemIndex) =>
-                                            itemIndex === decisionIndex
-                                              ? { ...item, decision_text: event.target.value }
-                                              : item,
-                                          ),
-                                        }))
-                                      }
-                                    />
-                                  </label>
-                                  <label className="minutes-field-label">
-                                    Hasil yang diharapkan
-                                    <textarea
-                                      className="minutes-textarea"
-                                      rows={2}
-                                      maxLength={20_000}
-                                      value={decision.output_expected}
-                                      disabled={
-                                        !canEdit || loadingRevisions || saveState === 'saving'
-                                      }
-                                      onChange={(event) =>
-                                        updateDiscussion(index, (current) => ({
-                                          ...current,
-                                          decisions: current.decisions.map((item, itemIndex) =>
-                                            itemIndex === decisionIndex
-                                              ? { ...item, output_expected: event.target.value }
-                                              : item,
-                                          ),
-                                        }))
-                                      }
-                                    />
-                                  </label>
-                                  <label className="minutes-field-label">
-                                    Target tanggal
-                                    <input
-                                      className="minutes-input"
-                                      type="date"
-                                      value={decision.target_date}
-                                      disabled={
-                                        !canEdit || loadingRevisions || saveState === 'saving'
-                                      }
-                                      onChange={(event) =>
-                                        updateDiscussion(index, (current) => ({
-                                          ...current,
-                                          decisions: current.decisions.map((item, itemIndex) =>
-                                            itemIndex === decisionIndex
-                                              ? { ...item, target_date: event.target.value }
-                                              : item,
-                                          ),
-                                        }))
-                                      }
-                                    />
-                                  </label>
-                                  <label className="minutes-checkbox-label">
-                                    <input
-                                      type="checkbox"
-                                      checked={decision.is_action_item}
-                                      disabled={
-                                        !canEdit || loadingRevisions || saveState === 'saving'
-                                      }
-                                      onChange={(event) =>
-                                        updateDiscussion(index, (current) => ({
-                                          ...current,
-                                          decisions: current.decisions.map((item, itemIndex) =>
-                                            itemIndex === decisionIndex
-                                              ? { ...item, is_action_item: event.target.checked }
-                                              : item,
-                                          ),
-                                        }))
-                                      }
-                                    />
-                                    Putusan ini memerlukan tindak lanjut
-                                  </label>
-                                  <button
-                                    className="button button--secondary"
-                                    type="button"
-                                    disabled={!canEdit || saveState === 'saving'}
-                                    onClick={() =>
-                                      updateDiscussion(index, (current) => ({
-                                        ...current,
-                                        decisions: current.decisions.filter(
-                                          (_, itemIndex) => itemIndex !== decisionIndex,
-                                        ),
-                                      }))
-                                    }
-                                  >
-                                    Hapus putusan
-                                  </button>
-                                </div>
-                              ))}
-                              <button
-                                className="button button--secondary"
-                                type="button"
-                                disabled={!canEdit || saveState === 'saving'}
-                                onClick={() =>
-                                  updateDiscussion(index, (current) => ({
-                                    ...current,
-                                    decisions: [
-                                      ...current.decisions,
-                                      {
-                                        decision_text: '',
-                                        output_expected: '',
-                                        target_date: '',
-                                        is_action_item: false,
-                                      },
-                                    ],
-                                  }))
-                                }
-                              >
-                                Tambah putusan pembahasan {agendaIndex + 1}
-                              </button>
-                            </article>
-                          ))
-                        ) : (
-                          <p className="minutes-muted">Belum ada pembahasan pada agenda ini.</p>
-                        )}
-                        <button
-                          className="button button--secondary"
-                          type="button"
-                          disabled={!canEdit || saveState === 'saving'}
-                          onClick={() => addDiscussion(agenda.id)}
-                        >
-                          Tambah pembahasan agenda {agenda.agenda_number}
-                        </button>
-                      </section>
-                    );
-                  })
-                )}
-              </div>
-            )}
 
-            <div className="minutes-editor-footer">
-              <p className={`minutes-save-state minutes-save-state--${saveState}`} role="status">
-                {loadingRevisions
-                  ? 'Memuat revisi…'
-                  : saveState === 'saving'
-                    ? 'Menyimpan revisi…'
-                    : saveState === 'saved'
-                      ? `Tersimpan sebagai revisi ${latestRevision?.revision_number ?? ''}.`
-                      : saveState === 'conflict'
-                        ? 'Penyimpanan tertahan karena revisi berubah.'
-                        : saveState === 'statusChanged'
-                          ? 'Draf dipertahankan; rapat tidak lagi LIVE.'
-                          : saveState === 'error'
-                            ? 'Penyimpanan gagal.'
-                            : saveState === 'reloaded'
-                              ? 'Revisi terbaru sudah dimuat.'
-                              : isDirty
-                                ? 'Perubahan belum disimpan.'
-                                : latestRevision
-                                  ? 'Notulensi mengikuti revisi server.'
-                                  : 'Belum ada revisi notulensi.'}
-              </p>
-              <div className="minutes-actions">
-                {saveState === 'conflict' && (
-                  <button
-                    className="button button--secondary"
-                    type="button"
-                    disabled={loadingRevisions}
-                    onClick={() => void handleReloadLatest()}
-                  >
-                    {loadingRevisions ? 'Memuat…' : 'Muat revisi terbaru'}
-                  </button>
-                )}
-                {meetingStatusRefreshFailed && (
-                  <button
-                    className="button button--secondary"
-                    type="button"
-                    disabled={refreshingMeetingStatus}
-                    onClick={() => void handleReloadMeetingStatus()}
-                  >
-                    {refreshingMeetingStatus ? 'Memuat status…' : 'Muat ulang status rapat'}
-                  </button>
-                )}
-                {canEdit && selectedMeeting.status === 'LIVE' && (
+              <section
+                className={`minutes-final-output${printingMinutes ? ' sitara-print-target' : ''}`}
+                aria-labelledby="minutes-preview-title"
+              >
+                <div className="minutes-final-toolbar">
+                  <div>
+                    <h3 id="minutes-preview-title">Pratinjau tabel</h3>
+                  </div>
                   <button
                     className="button button--primary"
+                    disabled={!canPrintMinutes}
+                    onClick={printMinutes}
                     type="button"
-                    disabled={
-                      !isDirty ||
-                      (editorFormat === 'structured' && !structuredDraftIsValid) ||
-                      loadingRevisions ||
-                      saveState === 'saving' ||
-                      saveState === 'conflict'
-                    }
-                    onClick={() => void handleSave()}
                   >
-                    {saveState === 'saving' ? 'Menyimpan…' : 'Simpan revisi'}
+                    Cetak hasil notulensi
                   </button>
-                )}
-              </div>
-            </div>
+                </div>
+                <header className="minutes-print-heading">
+                  <p className="minutes-print-institution">INSTITUT TEKNOLOGI PLN</p>
+                  <h2>NOTULA RAPAT</h2>
+                  <p className="minutes-print-meeting-title">{selectedMeeting.title}</p>
+                  <dl>
+                    <div>
+                      <dt>Nomor</dt>
+                      <dd>{selectedMeeting.meeting_number}</dd>
+                    </div>
+                    <div>
+                      <dt>Hari/Tanggal</dt>
+                      <dd>{formatDate(selectedMeeting.meeting_date)}</dd>
+                    </div>
+                    <div>
+                      <dt>Waktu</dt>
+                      <dd>
+                        {selectedMeeting.start_time ?? '—'}
+                        {selectedMeeting.end_time ? `–${selectedMeeting.end_time}` : ''}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Tempat</dt>
+                      <dd>{selectedMeeting.location ?? '—'}</dd>
+                    </div>
+                  </dl>
+                </header>
+                <div className="minutes-table-scroll minutes-preview-scroll">
+                  <table className="minutes-preview-table" aria-label="Pratinjau hasil rapat">
+                    <thead>
+                      <tr>
+                        <th scope="col">No.</th>
+                        <th scope="col">Agenda/Pokok Bahasan</th>
+                        <th scope="col">Putusan/Arahan &amp; Tindak Lanjut</th>
+                        <th scope="col">PIC</th>
+                        <th scope="col">PIC pendukung</th>
+                        <th scope="col">Output</th>
+                        <th scope="col">Target</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {structuredTableRows.map((row, rowIndex) => {
+                        const decisions = row.discussion?.decisions ?? [];
+                        return (
+                          <tr key={row.agenda.id + '-' + (row.discussionIndex ?? 'empty')}>
+                            <td className="minutes-print-number">{rowIndex + 1}</td>
+                            <td>
+                              <strong>{row.agenda.title}</strong>
+                              {row.discussion ? (
+                                <>
+                                  {row.discussion.subject && <h3>{row.discussion.subject}</h3>}
+                                  <p>{row.discussion.content}</p>
+                                </>
+                              ) : (
+                                <p>Belum ada pokok pembahasan.</p>
+                              )}
+                            </td>
+                            <td className="minutes-preview-cell-list">
+                              {decisions.length ? (
+                                decisions.map((decision, decisionIndex) => (
+                                  <div className="minutes-preview-decision" key={decisionIndex}>
+                                    <p>
+                                      <strong>{decisionIndex + 1}.</strong> {decision.decision_text}
+                                    </p>
+                                    <small>
+                                      {decision.is_action_item
+                                        ? 'Memerlukan tindak lanjut'
+                                        : 'Tidak memerlukan tindak lanjut'}
+                                    </small>
+                                  </div>
+                                ))
+                              ) : (
+                                <p>Belum ada putusan/arahan.</p>
+                              )}
+                            </td>
+                            <td className="minutes-preview-cell-list">
+                              {decisions.length ? (
+                                decisions.map((decision, decisionIndex) => (
+                                  <p key={decisionIndex}>
+                                    {decision.pic_suggestion || 'Belum ditentukan'}
+                                  </p>
+                                ))
+                              ) : (
+                                <p>Belum ditentukan</p>
+                              )}
+                            </td>
+                            <td className="minutes-preview-cell-list">
+                              {decisions.length ? (
+                                decisions.map((decision, decisionIndex) => (
+                                  <p key={decisionIndex}>
+                                    {decision.supporting_pic_suggestion || 'Belum ditentukan'}
+                                  </p>
+                                ))
+                              ) : (
+                                <p>Belum ditentukan</p>
+                              )}
+                            </td>
+                            <td className="minutes-preview-cell-list">
+                              {decisions.length ? (
+                                decisions.map((decision, decisionIndex) => (
+                                  <p key={decisionIndex}>
+                                    {decision.output_expected || 'Belum ditentukan'}
+                                  </p>
+                                ))
+                              ) : (
+                                <p>Belum ditentukan</p>
+                              )}
+                            </td>
+                            <td className="minutes-preview-cell-list">
+                              {decisions.length ? (
+                                decisions.map((decision, decisionIndex) => (
+                                  <p key={decisionIndex}>
+                                    {decision.target_kind === 'DATE'
+                                      ? decision.target_date
+                                        ? formatDate(decision.target_date)
+                                        : 'Belum ditentukan'
+                                      : decision.target_text || 'Belum ditentukan'}
+                                  </p>
+                                ))
+                              ) : (
+                                <p>Belum ditentukan</p>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="minutes-print-note">
+                  PIC pada notulen merupakan usulan. Penetapan dan pemantauan tindak lanjut
+                  dilakukan melalui Action Item. Decision Brief disusun sebagai ringkasan editorial
+                  dari putusan sumber.
+                </p>
+              </section>
 
-            {saveState === 'statusChanged' && (
-              <p className="minutes-readonly-note">
-                Status rapat berubah. Draf yang belum tersimpan dipertahankan dan penyuntingan
-                dinonaktifkan.
-              </p>
-            )}
-            {!canEdit && saveState !== 'statusChanged' && (
-              <p className="minutes-readonly-note">
-                {selectedMeeting.status !== 'LIVE'
-                  ? 'Rapat tidak sedang berlangsung; notulensi hanya dapat dibaca.'
-                  : 'Hanya notulis yang ditunjuk dapat menyunting selama rapat berlangsung.'}
-              </p>
-            )}
-          </section>
-        </div>
+              {saveState === 'statusChanged' && (
+                <p className="minutes-readonly-note">
+                  Status rapat berubah. Perubahan yang belum tersimpan dipertahankan dan
+                  penyuntingan dinonaktifkan.
+                </p>
+              )}
+              {!canEdit && saveState !== 'statusChanged' && (
+                <p className="minutes-readonly-note">
+                  {selectedMeeting.status !== 'LIVE'
+                    ? 'Rapat tidak sedang berlangsung; notulensi hanya dapat dibaca.'
+                    : 'Penyuntingan saat rapat berlangsung tersedia untuk Warek, Sekretariat, dan Manager Legal.'}
+                </p>
+              )}
+            </section>
+          </div>
+        </>
       )}
     </section>
   );
