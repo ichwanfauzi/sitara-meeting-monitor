@@ -11,20 +11,17 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
-def _drop_sqlite_guards() -> None:
-    for trigger_name in (
-        "trg_action_items_insert_guard",
-        "trg_action_items_update_guard",
-        "trg_action_items_no_delete",
-        "trg_status_histories_guard",
-        "trg_assignments_update_guard",
-        "trg_assignments_no_delete",
-        "trg_progress_updates_assignment",
-    ):
-        # Trigger names are drawn only from this fixed tuple.
-        # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
-        # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
-        op.execute(f"DROP TRIGGER {trigger_name}")
+def _drop_sqlite_guards(*, include_unit_provenance: bool = False) -> None:
+    op.execute("DROP TRIGGER trg_action_items_insert_guard")
+    op.execute("DROP TRIGGER trg_action_items_update_guard")
+    op.execute("DROP TRIGGER trg_action_items_no_delete")
+    op.execute("DROP TRIGGER trg_action_items_disposition_immutable")
+    op.execute("DROP TRIGGER trg_status_histories_guard")
+    op.execute("DROP TRIGGER trg_assignments_update_guard")
+    op.execute("DROP TRIGGER trg_assignments_no_delete")
+    op.execute("DROP TRIGGER trg_progress_updates_assignment")
+    if include_unit_provenance:
+        op.execute("DROP TRIGGER trg_assignments_pic_origin_immutable")
 
 
 def _create_sqlite_action_item_guards(*, include_responsible_unit: bool) -> None:
@@ -46,13 +43,8 @@ def _create_sqlite_action_item_guards(*, include_responsible_unit: bool) -> None
         END
         """
     )
-    responsible_unit_guard = (
-        "OR NEW.responsible_unit_id IS NOT OLD.responsible_unit_id"
-        if include_responsible_unit
-        else ""
-    )
     op.execute(
-        f"""
+        """
         CREATE TRIGGER trg_action_items_update_guard
         BEFORE UPDATE ON action_items
         BEGIN
@@ -62,7 +54,6 @@ def _create_sqlite_action_item_guards(*, include_responsible_unit: bool) -> None
                 OR NEW.disposition_id IS NOT OLD.disposition_id
                 OR NEW.created_by_id IS NOT OLD.created_by_id
                 OR NEW.created_at IS NOT OLD.created_at
-                {responsible_unit_guard}
                 THEN RAISE(
                     ABORT, 'Action Item source and creation provenance are immutable'
                 ) END;
@@ -99,6 +90,16 @@ def _create_sqlite_action_item_guards(*, include_responsible_unit: bool) -> None
         END
         """
     )
+    op.execute(
+        """
+        CREATE TRIGGER trg_action_items_disposition_immutable
+        BEFORE UPDATE OF disposition_id ON action_items
+        WHEN NEW.disposition_id IS NOT OLD.disposition_id
+        BEGIN
+            SELECT RAISE(ABORT, 'Action Item disposition is immutable');
+        END
+        """
+    )
     if include_responsible_unit:
         op.execute(
             """
@@ -113,11 +114,8 @@ def _create_sqlite_action_item_guards(*, include_responsible_unit: bool) -> None
 
 
 def _create_sqlite_assignment_guards(*, include_pic_origin_unit: bool) -> None:
-    origin_guard = (
-        "OR NEW.pic_origin_unit_id IS NOT OLD.pic_origin_unit_id" if include_pic_origin_unit else ""
-    )
     op.execute(
-        f"""
+        """
         CREATE TRIGGER trg_assignments_update_guard
         BEFORE UPDATE ON assignments
         BEGIN
@@ -128,7 +126,6 @@ def _create_sqlite_assignment_guards(*, include_pic_origin_unit: bool) -> None:
                 OR NEW.assignment_role IS NOT OLD.assignment_role
                 OR NEW.started_at IS NOT OLD.started_at
                 OR NEW.assignment_reason IS NOT OLD.assignment_reason
-                {origin_guard}
                 OR NEW.ended_at IS NULL
                 OR NEW.ended_by_user_id IS NULL
                 OR NEW.end_reason IS NULL
@@ -137,6 +134,17 @@ def _create_sqlite_assignment_guards(*, include_pic_origin_unit: bool) -> None:
         END
         """
     )
+    if include_pic_origin_unit:
+        op.execute(
+            """
+            CREATE TRIGGER trg_assignments_pic_origin_immutable
+            BEFORE UPDATE OF pic_origin_unit_id ON assignments
+            WHEN NEW.pic_origin_unit_id IS NOT OLD.pic_origin_unit_id
+            BEGIN
+                SELECT RAISE(ABORT, 'Assignment history is immutable');
+            END
+            """
+        )
     op.execute(
         """
         CREATE TRIGGER trg_assignments_no_delete
@@ -296,7 +304,7 @@ def downgrade() -> None:
     dialect = connection.dialect.name
     if dialect == "sqlite":
         op.execute("DROP TRIGGER trg_action_items_responsible_unit_immutable")
-        _drop_sqlite_guards()
+        _drop_sqlite_guards(include_unit_provenance=True)
     else:
         op.execute("DROP TRIGGER trg_action_items_responsible_unit_immutable ON action_items")
         op.execute("DROP FUNCTION reject_action_item_responsible_unit_change()")

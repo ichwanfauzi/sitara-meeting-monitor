@@ -70,19 +70,24 @@ def _set_audit_constraints(*, include_content_events: bool) -> None:
         )
 
     if dialect == "sqlite":
-        for operation in ("UPDATE", "DELETE"):
-            # Operation values are selected from this fixed tuple.
-            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
-            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
-            op.execute(
-                f"""
-                CREATE TRIGGER trg_audit_events_no_{operation.lower()}
-                BEFORE {operation} ON audit_events
-                BEGIN
-                    SELECT RAISE(ABORT, 'Audit event history is append-only');
-                END
-                """
-            )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_update
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_delete
+            BEFORE DELETE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
 
 
 def upgrade() -> None:

@@ -52,19 +52,24 @@ def _set_audit_event_constraints(*, allow_action_items: bool) -> None:
             )
 
     if dialect == "sqlite":
-        for operation in ("UPDATE", "DELETE"):
-            # Operation and trigger names are drawn only from this fixed tuple.
-            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
-            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
-            op.execute(
-                f"""
-                CREATE TRIGGER trg_audit_events_no_{operation.lower()}
-                BEFORE {operation} ON audit_events
-                BEGIN
-                    SELECT RAISE(ABORT, 'Audit event history is append-only');
-                END
-                """
-            )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_update
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_delete
+            BEFORE DELETE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
 
 
 def _create_sqlite_action_item_triggers(*, include_disposition: bool) -> None:
@@ -86,18 +91,14 @@ def _create_sqlite_action_item_triggers(*, include_disposition: bool) -> None:
         END
         """
     )
-    disposition_guard = (
-        "OR NEW.disposition_id IS NOT OLD.disposition_id" if include_disposition else ""
-    )
     op.execute(
-        f"""
+        """
         CREATE TRIGGER trg_action_items_update_guard
         BEFORE UPDATE ON action_items
         BEGIN
             SELECT CASE WHEN NEW.meeting_id IS NOT OLD.meeting_id
                 OR NEW.source_minutes_revision_id IS NOT OLD.source_minutes_revision_id
                 OR NEW.source_decision_id IS NOT OLD.source_decision_id
-                {disposition_guard}
                 OR NEW.created_by_id IS NOT OLD.created_by_id
                 OR NEW.created_at IS NOT OLD.created_at
                 THEN RAISE(
@@ -127,6 +128,17 @@ def _create_sqlite_action_item_triggers(*, include_disposition: bool) -> None:
         END
         """
     )
+    if include_disposition:
+        op.execute(
+            """
+            CREATE TRIGGER trg_action_items_disposition_immutable
+            BEFORE UPDATE OF disposition_id ON action_items
+            WHEN NEW.disposition_id IS NOT OLD.disposition_id
+            BEGIN
+                SELECT RAISE(ABORT, 'Action Item disposition is immutable');
+            END
+            """
+        )
     op.execute(
         """
         CREATE TRIGGER trg_action_items_no_delete
@@ -168,16 +180,12 @@ def _create_sqlite_status_history_trigger() -> None:
     )
 
 
-def _drop_sqlite_action_item_triggers() -> None:
-    for trigger_name in (
-        "trg_action_items_insert_guard",
-        "trg_action_items_update_guard",
-        "trg_action_items_no_delete",
-    ):
-        # Trigger names are drawn only from this fixed tuple.
-        # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
-        # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
-        op.execute(f"DROP TRIGGER {trigger_name}")
+def _drop_sqlite_action_item_triggers(*, include_disposition: bool) -> None:
+    op.execute("DROP TRIGGER trg_action_items_insert_guard")
+    op.execute("DROP TRIGGER trg_action_items_update_guard")
+    op.execute("DROP TRIGGER trg_action_items_no_delete")
+    if include_disposition:
+        op.execute("DROP TRIGGER trg_action_items_disposition_immutable")
 
 
 def upgrade() -> None:
@@ -193,7 +201,7 @@ def upgrade() -> None:
         unique=True,
     )
     if dialect == "sqlite":
-        _drop_sqlite_action_item_triggers()
+        _drop_sqlite_action_item_triggers(include_disposition=False)
         op.execute("DROP TRIGGER trg_status_histories_guard")
     with op.batch_alter_table(
         "action_items",
@@ -257,7 +265,7 @@ def downgrade() -> None:
 
     dialect = connection.dialect.name
     if dialect == "sqlite":
-        _drop_sqlite_action_item_triggers()
+        _drop_sqlite_action_item_triggers(include_disposition=True)
         op.execute("DROP TRIGGER trg_status_histories_guard")
         _set_audit_event_constraints(allow_action_items=False)
     if dialect == "postgresql":

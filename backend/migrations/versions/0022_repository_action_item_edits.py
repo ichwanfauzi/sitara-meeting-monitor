@@ -55,35 +55,54 @@ def _set_audit_constraints(*, include_edit_events: bool) -> None:
             f"(action IN ({action_items}) AND object_type = 'action_item')",
         )
     if dialect == "sqlite":
-        for operation in ("UPDATE", "DELETE"):
-            # Operation and trigger names are drawn from this fixed tuple.
-            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
-            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
-            op.execute(
-                f"""
-                CREATE TRIGGER trg_audit_events_no_{operation.lower()}
-                BEFORE {operation} ON audit_events
-                BEGIN
-                    SELECT RAISE(ABORT, 'Audit event history is append-only');
-                END
-                """
-            )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_update
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_delete
+            BEFORE DELETE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
 
 
 def _drop_sqlite_action_item_triggers() -> list[str]:
     connection = op.get_bind()
-    trigger_rows = connection.exec_driver_sql(
-        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND sql IS NOT NULL"
-    ).all()
-    affected_triggers = [
-        (name, sql)
-        for name, table_name, sql in trigger_rows
-        if table_name in {"action_items", "status_histories"} or "action_items" in sql
+    trigger_names = (
+        "trg_status_histories_no_update",
+        "trg_status_histories_no_delete",
+        "trg_action_items_insert_guard",
+        "trg_action_items_update_guard",
+        "trg_action_items_no_delete",
+        "trg_action_items_disposition_immutable",
+        "trg_action_items_responsible_unit_immutable",
+        "trg_status_histories_guard",
+    )
+    trigger_sql = [
+        connection.execute(
+            sa.text("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = :name"),
+            {"name": trigger_name},
+        ).scalar_one()
+        for trigger_name in trigger_names
     ]
-    for name, _ in affected_triggers:
-        quoted_name = '"' + name.replace('"', '""') + '"'
-        op.execute(f"DROP TRIGGER {quoted_name}")
-    return [sql for _, sql in affected_triggers]
+    op.execute("DROP TRIGGER trg_status_histories_no_update")
+    op.execute("DROP TRIGGER trg_status_histories_no_delete")
+    op.execute("DROP TRIGGER trg_action_items_insert_guard")
+    op.execute("DROP TRIGGER trg_action_items_update_guard")
+    op.execute("DROP TRIGGER trg_action_items_no_delete")
+    op.execute("DROP TRIGGER trg_action_items_disposition_immutable")
+    op.execute("DROP TRIGGER trg_action_items_responsible_unit_immutable")
+    op.execute("DROP TRIGGER trg_status_histories_guard")
+    return trigger_sql
 
 
 def _restore_sqlite_action_item_triggers(trigger_sql: list[str]) -> None:
