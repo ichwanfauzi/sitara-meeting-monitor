@@ -261,6 +261,7 @@ $clamavImageCreated = $false
 $testRunnerImage = $null
 $testRunnerImageCreated = $false
 $clamavContainerId = $null
+$clamavPaused = $false
 $postgresId = $null
 $daemonWorkerId = $null
 
@@ -359,10 +360,10 @@ try {
         $workerImage,
         "heads"
     ) -Quiet
-    if ($alembicHeads -notmatch "0011_evidence_scan_quarantine\s+\(head\)") {
+    if ($alembicHeads -notmatch "0020_minutes_pic_suggestion\s+\(head\)") {
         throw "The built evidence-scanner image does not contain the expected Alembic head"
     }
-    Write-Host "Built evidence-scanner image migration head: 0011_evidence_scan_quarantine"
+    Write-Host "Built evidence-scanner image migration head: 0020_minutes_pic_suggestion"
 
     foreach ($network in @($networkName, $scannerNetworkName, $egressNetworkName)) {
         if ((Get-DockerIds -Arguments @(
@@ -638,8 +639,8 @@ try {
         "-Atc",
         "SELECT version_num FROM alembic_version"
     ) -Quiet).Trim()
-    if ($revision -ne "0011_evidence_scan_quarantine") {
-        throw "Disposable database migration head was '$revision', expected 0011_evidence_scan_quarantine"
+    if ($revision -ne "0020_minutes_pic_suggestion") {
+        throw "Disposable database migration head was '$revision', expected 0020_minutes_pic_suggestion"
     }
     Write-Host "Disposable database migration head: $revision"
 
@@ -893,6 +894,12 @@ WHERE e.original_filename = 'daemon-safe.pdf'
     Write-Host "Observed worker connection-failure log after $([math]::Round($outageTimer.Elapsed.TotalSeconds, 1)) seconds:"
     Write-Host ($outageEvidenceLines -join [Environment]::NewLine)
     Write-Host "Disposable PostgreSQL confirms daemon-safe.pdf|PENDING| during the outage."
+    Assert-OwnedContainer `
+        -ContainerId $clamavContainerId `
+        -ExpectedName $clamavName `
+        -ProjectName $e2eProjectName
+    $null = Invoke-DockerChecked -Arguments @("pause", $clamavContainerId) -Quiet
+    $clamavPaused = $true
     $null = Invoke-DockerChecked -Arguments @(
         "network",
         "connect",
@@ -902,6 +909,39 @@ WHERE e.original_filename = 'daemon-safe.pdf'
         $clamavContainerId
     ) -Quiet
     Assert-OwnedNetwork -NetworkName $testScannerNetwork -ProjectName $e2eProjectName -ExpectedInternal $true
+    $timeoutTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $timeoutLogs = ""
+    while ($timeoutTimer.Elapsed.TotalSeconds -lt 30) {
+        $timeoutLogs = Invoke-DockerChecked -Arguments @("logs", $daemonWorkerId) -Quiet
+        if ($timeoutLogs -match "(?i)TimeoutError|timed out") {
+            break
+        }
+        if ((Get-ContainerStatus -ContainerId $daemonWorkerId) -ne "running") {
+            throw "Evidence-scanner daemon exited during the ClamAV timeout test"
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    if ($timeoutLogs -notmatch "(?i)TimeoutError|timed out") {
+        throw "Evidence-scanner did not record a ClamAV socket timeout within 30 seconds"
+    }
+    $timeoutStatus = (Invoke-DockerChecked -Arguments @(
+        "exec",
+        $postgresId,
+        "psql",
+        "-U",
+        "sitara_e2e",
+        "-d",
+        "sitara_clamav_e2e",
+        "-At",
+        "-c",
+        $pendingStatusSql
+    ) -Quiet).Trim()
+    if ($timeoutStatus -ne "daemon-safe.pdf|PENDING|") {
+        throw "Disposable PostgreSQL did not keep evidence PENDING during the ClamAV timeout: $timeoutStatus"
+    }
+    Write-Host "ClamAV socket timeout was observed; disposable PostgreSQL kept daemon-safe.pdf PENDING."
+    $null = Invoke-DockerChecked -Arguments @("unpause", $clamavContainerId) -Quiet
+    $clamavPaused = $false
     $null = Invoke-DockerChecked -Arguments @(
         "exec",
         $daemonWorkerId,
@@ -977,6 +1017,20 @@ catch {
     $mainError = $_
 }
 finally {
+    if ($clamavPaused -and $clamavContainerId) {
+        try {
+            Assert-OwnedContainer `
+                -ContainerId $clamavContainerId `
+                -ExpectedName $clamavName `
+                -ProjectName $e2eProjectName
+            $null = Invoke-DockerChecked -Arguments @("unpause", $clamavContainerId) -Quiet
+            $clamavPaused = $false
+        }
+        catch {
+            $cleanupErrors.Add("could not safely unpause the disposable ClamAV container: $($_.Exception.Message)")
+        }
+    }
+
     if ($dockerVerified) {
         try {
             $projectContainers = Get-DockerIds -Arguments @(

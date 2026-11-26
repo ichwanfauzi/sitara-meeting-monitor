@@ -8,7 +8,7 @@ This workspace uses the clean starter as the technical foundation and preserves 
 
 SITARA (Sistem Informasi Tindak Lanjut Rapat dan Arahan) — clean starter repository for a new implementation.
    
-> **Important:** This is not a production-ready system. Backend foundations include Argon2id authentication, server-side sessions, role-scoped Rapim APIs, structured minutes and Decision Brief drafts, plus Action Item APIs for assignments, progress, and evidence. File evidence uses private storage and a single ClamAV scanner worker in Docker Compose. The dashboard remains synthetic; complete Action Item frontend workflows, Decision Brief approval/finalization, production rollout, and backup/restore readiness remain incomplete.
+> **Important:** This is not a production-ready system. The current Rapim flow supports structured minutes, linked Decision Briefs, searchable meeting selection, and role-aware meeting/task screens. The expected core roster is Rektor, four Wareks, Secretariat, and Manager Legal. The local development Manager Legal account uses a synthetic `users.sitara.test` address; production provisioning requires an official work email. SITARA does not record or upload meeting audio and has no ChatGPT integration; prepared meeting points are entered into the structured minutes table for human review. Production migration/rollout, browser E2E, and backup/restore readiness remain unverified.
 
 ## Stack
 
@@ -49,8 +49,9 @@ the development-only override:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
-This publishes PostgreSQL only on `127.0.0.1`; `POSTGRES_PORT` selects that
-host-side development port. Host-run backend processes use `DATABASE_URL` with
+This publishes PostgreSQL only on `127.0.0.1` through a development-only TCP
+proxy; `POSTGRES_PORT` selects that host-side development port. The database
+stays on its internal networks. Host-run backend processes use `DATABASE_URL` with
 hostname `localhost`. If you change `POSTGRES_PORT` from its default of `5432`,
 also update the port in the host-run `DATABASE_URL` to match. Containerized API
 and worker processes use `DATABASE_URL_CONTAINER` with hostname `postgres`. Do
@@ -61,7 +62,7 @@ not use the development override for production.
    and set `LOGIN_RATE_LIMIT_HMAC_KEY` in `.env`. Login returns `503` until this key is set.
 2. Start PostgreSQL:
    ```powershell
-   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
+   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres-port-proxy
    docker compose ps
    ```
 3. Backend setup from the repository root:
@@ -78,6 +79,7 @@ not use the development override for production.
    ruff format --check .
    mypy app
    pytest
+   pip-audit --skip-editable
    cd ..
    ```
 5. Start the API from the repository root (settings read `.env` from current directory):
@@ -147,6 +149,12 @@ pre-commit run --all-files
 - Create a separate disposable test database for integration tests.
 - Before production, add and test authorization policies/triggers for official status changes, audit history, and document access.
 
+### Initial local/test accounts
+
+`backend/app/seed_initial_users.py` creates the seven initial core-user accounts: Rektor, four Wareks, Secretariat, and Manager Legal. The local Manager Legal account uses the synthetic address `herry.zulkarnaen@users.sitara.test`; production provisioning requires an official work email. Run `python -m app.seed_initial_users` from `backend` only after independently creating and migrating a separate local PostgreSQL database. Set `APP_ENV` to `development` or `testing` and `SITARA_SEED_DATABASE_URL` to that local database; the command verifies the database name and migration head (`0027_brief_optional_priority`) before writing. It refuses non-PostgreSQL, non-local, production-named, and unversioned targets. The default seed does not create Super Admin. Passwords are written once to a restricted file outside the repository. Never commit or share that file. If upgrading a local database that already has the original six accounts and their credential file, pass a new `--credentials-file` path when adding Manager Legal; existing credential files are never overwritten.
+
+For an isolated, disposable **testing** database only, `python -m app.seed_initial_users --include-demo-pics` additionally creates synthetic PIC A/B/C accounts in the `SITARA-DEMO` unit and reporting lines from every seeded Rektor/Warek to each PIC. This option requires `APP_ENV=testing` and a local database name ending in `_test` or `_testing`; it is rejected for development databases. If the seven initial accounts were seeded earlier and their credential file already exists, provide a new `--credentials-file` path for the PIC passwords; existing credential files are never overwritten. Do not use demo personas in shared development or production.
+
 ## Backup and rollback (before deployment)
 
 - Back up PostgreSQL and private document storage as separate but coordinated assets.
@@ -160,7 +168,7 @@ pre-commit run --all-files
 
 - Complete authentication and server-side RBAC/object-level authorization.
 - Confirm PIC cannot access full minutes/Decision Brief using direct URL, API, search, exports, or changed IDs.
-- Enforce that only Secretariat can change an official task status, at the API and database boundary where appropriate.
+- Enforce that authorized Secretariat and Manager Legal users can change official task status, at the API and database boundary where appropriate; deny PIC and Super Admin roles.
 - Add secure cookies/CSRF controls if cookie authentication is used, rate limiting, safe upload validation, and private file serving.
 - Configure TLS, least-privilege DB credentials, firewall rules, secret rotation, security headers, and log redaction.
 - Review every scanner finding; document any accepted exception. Do not automatically suppress findings to get a green build.
@@ -169,6 +177,7 @@ pre-commit run --all-files
 
 Read these before implementing a feature:
 
+- [`docs/LOCAL_DEMO_GUIDE.md`](docs/LOCAL_DEMO_GUIDE.md) — local synthetic-data demo steps and safety limits.
 - [`docs/PRD.md`](docs/PRD.md) — problem statement, actors, business flows, functional requirements, business rules, and acceptance criteria.
 - [`docs/system_design.md`](docs/system_design.md) — visual direction, color/typography tokens, role-aware navigation, UI components, page states, and document-export guidance.
 - [`docs/architecture.md`](docs/architecture.md) — stack, module boundaries, data model, auth/security, API conventions, deployment, and recovery.
@@ -179,6 +188,6 @@ These are draft v1.0 documents. Review explicit open decisions in each document 
 
 ## Current scope
 
-Included: dashboard UI with clearly labeled synthetic data; FastAPI health, auth, meeting, Decision Brief, and Action Item APIs; structured minutes and organization-scope foundations; source-bound tasks, assignments, progress, verification, and private evidence storage; one ClamAV evidence-scanner worker in Docker Compose; PostgreSQL-backed login rate limiting; tests and quality tooling; and CI workflow.
+Included: role-scoped Rapim and Action Item screens; meeting status and task verification controls for Secretariat and Manager Legal; searchable meeting lists; structured minutes/Decision Brief linkage; in-app notifications; and named or user-based PIC assignments. SITARA does not capture or play meeting audio and has no ChatGPT integration. Production migration and rollout remain unverified.
 
-Not included yet: supported account and organization provisioning, complete production-wide authorization/RBAC, production migration rollout verification, real-time collaboration, Decision Brief review/approval/finalization, Action Item frontend workflows, notifications, OCR, exports, final document templates, production deployment, and backup/restore automation. The dashboard still displays synthetic data and is not connected to these APIs. Minutes revisions and Decision Brief drafts are immutable and revision-bound. PIC and Super Admin cannot read full minutes or briefs; during `LIVE`, only the designated notetaker may append a minutes revision. Super Admin also cannot use Secretariat review or lifecycle permissions.
+Production roster provisioning, migration rollout verification, real-time collaboration, formal Decision Brief publication, OCR, final document templates, production deployment, and backup/restore automation remain incomplete. Meeting and Decision Brief records remain revision-bound. Secretariat, Manager Legal, Rektor, and Warek may edit LIVE minutes; an optional notetaker is recorded for attribution only. PIC and Super Admin remain denied full minutes access.

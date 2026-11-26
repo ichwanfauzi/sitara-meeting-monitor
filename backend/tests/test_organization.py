@@ -11,6 +11,7 @@ from app.services.organization import (
     can_access_task_scope,
     can_assign_pic,
     has_active_unit_membership,
+    is_active_action_manager,
     is_active_secretariat,
     is_in_reporting_scope,
 )
@@ -40,14 +41,25 @@ def organization_context() -> Iterator[
 
     roles = {
         code: Role(role_code=code, role_name=code.replace("_", " ").title())
-        for code in {"SEKRETARIAT", "REKTOR", "WAREK", "PIC", "SUPER_ADMIN", "PEGAWAI"}
+        for code in {
+            "SEKRETARIAT",
+            "MANAGER_LEGAL",
+            "REKTOR",
+            "WAREK",
+            "PIC",
+            "SUPER_ADMIN",
+            "PEGAWAI",
+        }
     }
     session.add_all(roles.values())
     users: dict[str, User] = {}
     for key, role_codes in {
         "secretariat": ["SEKRETARIAT"],
+        "manager_legal": ["MANAGER_LEGAL"],
+        "mixed_manager_pic": ["MANAGER_LEGAL", "PIC"],
         "mixed_secretariat_admin": ["SEKRETARIAT", "SUPER_ADMIN"],
         "rector": ["REKTOR"],
+        "warek": ["WAREK"],
         "other_rector": ["REKTOR"],
         "pic_main": ["PIC"],
         "pic_support": ["PIC"],
@@ -93,7 +105,15 @@ def organization_context() -> Iterator[
             )
         )
 
-    for key in ("secretariat", "rector", "pic_support", "mixed_rector_pic"):
+    for key in (
+        "secretariat",
+        "manager_legal",
+        "mixed_manager_pic",
+        "rector",
+        "warek",
+        "pic_support",
+        "mixed_rector_pic",
+    ):
         add_membership(users[key])
     add_membership(users["pic_main"], end=NOW + timedelta(days=30))
     add_membership(users["pic_unassigned"])
@@ -109,6 +129,7 @@ def organization_context() -> Iterator[
 
     for manager, subordinate in (
         ("rector", "pic_main"),
+        ("warek", "pic_support"),
         ("mixed_rector_pic", "pic_main"),
         ("pic_main", "pic_support"),
         ("other_rector", "pic_main"),
@@ -200,6 +221,27 @@ def test_task_scope_is_role_and_organization_scoped(
         supporting_pic_user_ids=assignees - {users["pic_main"].id},
         at=NOW,
     )
+    assert can_access_task_scope(
+        session,
+        users["manager_legal"],
+        main_pic_user_id=users["pic_main"].id,
+        supporting_pic_user_ids=set(),
+        at=NOW,
+    )
+    assert can_access_task_scope(
+        session,
+        users["mixed_manager_pic"],
+        main_pic_user_id=users["mixed_manager_pic"].id,
+        supporting_pic_user_ids=set(),
+        at=NOW,
+    )
+    assert not can_access_task_scope(
+        session,
+        users["mixed_manager_pic"],
+        main_pic_user_id=users["pic_main"].id,
+        supporting_pic_user_ids=set(),
+        at=NOW,
+    )
     assert not can_access_task_scope(
         session,
         users["mixed_secretariat_admin"],
@@ -265,16 +307,67 @@ def test_task_scope_is_role_and_organization_scoped(
     )
 
 
-def test_only_active_secretariat_can_assign_active_pic_with_unit_membership(
+def test_task_operators_and_meeting_leaders_can_assign_from_the_core_roster(
     organization_context: tuple[Session, dict[str, User], dict[str, OrganizationUnit]],
 ) -> None:
-    session, users, _ = organization_context
+    session, users, units = organization_context
+    session.add(
+        UserUnitMembership(
+            user_id=users["pic_unassigned"].id,
+            unit_id=units["university"].id,
+            valid_from=NOW - timedelta(days=1),
+        )
+    )
+    session.commit()
 
     assert is_active_secretariat(session, users["secretariat"])
     assert not is_active_secretariat(session, users["mixed_secretariat_admin"])
-    assert can_assign_pic(session, users["secretariat"], users["pic_main"].id, at=NOW)
-    assert not can_assign_pic(session, users["rector"], users["pic_main"].id, at=NOW)
+    assert is_active_action_manager(session, users["secretariat"])
+    assert is_active_action_manager(session, users["manager_legal"])
+    assert not is_active_action_manager(session, users["mixed_manager_pic"])
+    assert can_assign_pic(session, users["secretariat"], users["manager_legal"].id, at=NOW)
+    assert can_assign_pic(session, users["manager_legal"], users["warek"].id, at=NOW)
+    assert not can_assign_pic(session, users["mixed_manager_pic"], users["warek"].id, at=NOW)
+    assert not can_assign_pic(session, users["rector"], users["warek"].id, at=NOW)
+    assert not can_assign_pic(session, users["warek"], users["rector"].id, at=NOW)
+    assert not can_assign_pic(session, users["secretariat"], users["pic_main"].id, at=NOW)
+    assert not is_in_reporting_scope(session, users["warek"].id, users["pic_unassigned"].id, at=NOW)
+    assert not can_assign_pic(session, users["warek"], users["pic_unassigned"].id, at=NOW)
+    assert can_assign_pic(session, users["secretariat"], users["mixed_rector_pic"].id, at=NOW)
+    assert not can_assign_pic(session, users["mixed_rector_pic"], users["pic_main"].id, at=NOW)
     assert not can_assign_pic(session, users["secretariat"], users["ordinary"].id, at=NOW)
     assert not can_assign_pic(session, users["secretariat"], UUID(int=0), at=NOW)
     assert not can_assign_pic(session, users["secretariat"], users["pic_inactive"].id, at=NOW)
     assert not can_assign_pic(session, users["secretariat"], users["pic_no_membership"].id, at=NOW)
+
+
+def test_manager_legal_matches_secretariat_task_scope_and_assignment_authority(
+    organization_context: tuple[Session, dict[str, User], dict[str, OrganizationUnit]],
+) -> None:
+    session, users, _ = organization_context
+
+    assert is_active_action_manager(session, users["manager_legal"])
+    assert can_access_task_scope(
+        session,
+        users["manager_legal"],
+        main_pic_user_id=users["pic_main"].id,
+        supporting_pic_user_ids=set(),
+        at=NOW,
+    )
+    assert can_assign_pic(session, users["manager_legal"], users["warek"].id, at=NOW)
+    assert not is_active_action_manager(session, users["mixed_manager_pic"])
+    assert can_access_task_scope(
+        session,
+        users["mixed_manager_pic"],
+        main_pic_user_id=users["mixed_manager_pic"].id,
+        supporting_pic_user_ids=set(),
+        at=NOW,
+    )
+    assert not can_access_task_scope(
+        session,
+        users["mixed_manager_pic"],
+        main_pic_user_id=users["pic_main"].id,
+        supporting_pic_user_ids=set(),
+        at=NOW,
+    )
+    assert not can_assign_pic(session, users["mixed_manager_pic"], users["warek"].id, at=NOW)

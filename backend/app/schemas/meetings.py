@@ -8,6 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.models.meeting import MeetingStatus, MinutesReviewResult
 
+DecisionBriefApprovalEventName = Literal["SUBMITTED", "WITHDRAWN", "APPROVED", "REJECTED"]
+DecisionBriefApprovalState = Literal[
+    "DRAFT", "PENDING_APPROVAL", "APPROVED", "REJECTED", "WITHDRAWN"
+]
+
 
 class MeetingCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -19,7 +24,6 @@ class MeetingCreate(BaseModel):
     start_time: time | None = None
     end_time: time | None = None
     location: str | None = Field(default=None, max_length=300)
-    chairperson_id: UUID | None = None
     notetaker_id: UUID | None = None
 
     @field_validator("meeting_number", "title", "meeting_type")
@@ -45,15 +49,81 @@ class MeetingCreate(BaseModel):
         return self
 
 
+class MeetingMetadataUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(gt=0)
+    meeting_number: str | None = Field(default=None, max_length=150)
+    title: str | None = Field(default=None, max_length=300)
+    meeting_type: str | None = Field(default=None, max_length=100)
+    meeting_date: date | None = None
+    start_time: time | None = None
+    end_time: time | None = None
+    location: str | None = Field(default=None, max_length=300)
+
+    @field_validator("meeting_number", "title", "meeting_type")
+    @classmethod
+    def strip_required_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("Field cannot be blank")
+        return value
+
+    @field_validator("location")
+    @classmethod
+    def strip_location(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @model_validator(mode="after")
+    def validate_changes(self) -> "MeetingMetadataUpdate":
+        changes = self.model_fields_set - {"expected_version"}
+        if not changes:
+            raise ValueError("At least one meeting field must be updated")
+        if (
+            ("meeting_number" in changes and self.meeting_number is None)
+            or ("title" in changes and self.title is None)
+            or ("meeting_type" in changes and self.meeting_type is None)
+            or ("meeting_date" in changes and self.meeting_date is None)
+        ):
+            raise ValueError("Title, meeting type, and meeting date cannot be null")
+        if self.start_time and self.end_time and self.end_time < self.start_time:
+            raise ValueError("end_time must be after start_time")
+        return self
+
+
 class AgendaCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    agenda_number: int = Field(gt=0)
+    expected_version: int | None = Field(default=None, gt=0)
     title: str = Field(min_length=1, max_length=500)
     agenda_description: str | None = Field(default=None, max_length=10_000)
-    lead_user_id: UUID | None = None
+    pic_suggestion: str | None = Field(default=None, max_length=300)
+    supporting_pic_suggestion: str | None = Field(default=None, max_length=2_000)
     duration_minutes: int | None = Field(default=None, gt=0, le=1440)
-    sort_order: int = Field(default=0, ge=0)
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title cannot be blank")
+        return value
+
+
+class AgendaUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(gt=0)
+    title: str = Field(min_length=1, max_length=500)
+    agenda_description: str | None = Field(default=None, max_length=10_000)
+    pic_suggestion: str | None = Field(default=None, max_length=300)
+    supporting_pic_suggestion: str | None = Field(default=None, max_length=2_000)
+    duration_minutes: int | None = Field(default=None, gt=0, le=1440)
 
     @field_validator("title")
     @classmethod
@@ -67,16 +137,15 @@ class AgendaCreate(BaseModel):
 class MeetingParticipantCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_version: int | None = Field(default=None, gt=0)
     user_id: UUID
-    participant_title: str | None = Field(default=None, max_length=200)
 
-    @field_validator("participant_title")
-    @classmethod
-    def strip_participant_title(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        return value or None
+
+class NotetakerHandoverCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(gt=0)
+    new_notetaker_id: UUID
 
 
 class MeetingTransitionRequest(BaseModel):
@@ -105,8 +174,10 @@ class MinutesDecisionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision_text: str = Field(min_length=1, max_length=20_000)
+    pic_suggestion: str | None = Field(default=None, max_length=300)
     output_expected: str | None = Field(default=None, max_length=20_000)
     target_date: date | None = None
+    target_text: str | None = Field(default=None, max_length=500)
     is_action_item: bool = False
 
     @field_validator("decision_text")
@@ -116,6 +187,14 @@ class MinutesDecisionCreate(BaseModel):
             raise ValueError("Decision text cannot be blank")
         return value
 
+    @field_validator("pic_suggestion")
+    @classmethod
+    def strip_pic_suggestion(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
     @field_validator("output_expected")
     @classmethod
     def strip_output_expected(cls, value: str | None) -> str | None:
@@ -123,6 +202,20 @@ class MinutesDecisionCreate(BaseModel):
             return None
         value = value.strip()
         return value or None
+
+    @field_validator("target_text")
+    @classmethod
+    def strip_target_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @model_validator(mode="after")
+    def allow_one_target_value(self) -> "MinutesDecisionCreate":
+        if self.target_date is not None and self.target_text is not None:
+            raise ValueError("Choose either a target date or manual target text")
+        return self
 
 
 class MinutesDiscussionCreate(BaseModel):
@@ -176,8 +269,10 @@ class MinutesRevisionCreate(BaseModel):
             total_text_length += len(discussion.subject or "") + len(discussion.content)
             total_decisions += len(discussion.decisions)
             for decision in discussion.decisions:
-                total_text_length += len(decision.decision_text) + len(
-                    decision.output_expected or ""
+                total_text_length += (
+                    len(decision.decision_text)
+                    + len(decision.output_expected or "")
+                    + len(decision.target_text or "")
                 )
         if total_text_length > 1_000_000:
             raise ValueError("Minutes snapshot cannot exceed 1,000,000 text characters")
@@ -190,16 +285,19 @@ class DecisionBriefDecisionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision_id: UUID
-    priority: str = Field(min_length=1, max_length=100)
+    brief_text: str = Field(default="", max_length=20_000)
+    priority: str = Field(default="", max_length=100)
     editorial_note: str | None = Field(default=None, max_length=4_000)
 
     @field_validator("priority")
     @classmethod
     def strip_priority(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("priority cannot be blank")
-        return value
+        return value.strip()
+
+    @field_validator("brief_text")
+    @classmethod
+    def strip_brief_text(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("editorial_note")
     @classmethod
@@ -242,13 +340,28 @@ class DecisionBriefVersionCreate(BaseModel):
         return self
 
 
+class DecisionBriefRejectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=4_000)
+
+    @field_validator("reason")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("rejection reason cannot be blank")
+        return value
+
+
 class AgendaResponse(BaseModel):
     id: UUID
     meeting_id: UUID
     agenda_number: int
     title: str
     agenda_description: str | None
-    lead_user_id: UUID | None
+    pic_suggestion: str | None
+    supporting_pic_suggestion: str | None
     duration_minutes: int | None
     sort_order: int
 
@@ -256,8 +369,26 @@ class AgendaResponse(BaseModel):
 class MeetingParticipantResponse(BaseModel):
     user_id: UUID
     participant_name: str
-    attendance_status: str
     participant_title: str | None
+
+
+class MeetingParticipantOptionResponse(BaseModel):
+    id: UUID
+    full_name: str
+    job_title: str | None
+    roles: list[str]
+
+
+class NotetakerHandoverResponse(BaseModel):
+    id: UUID
+    meeting_id: UUID
+    from_notetaker_id: UUID | None
+    to_notetaker_id: UUID
+    requested_by_user_id: UUID
+    requested_at: datetime
+    status: Literal["PENDING", "APPROVED"]
+    approved_by_user_id: UUID | None
+    approved_at: datetime | None
 
 
 class MeetingResponse(BaseModel):
@@ -269,10 +400,10 @@ class MeetingResponse(BaseModel):
     start_time: time | None
     end_time: time | None
     location: str | None
-    chairperson_id: UUID | None
-    notetaker_id: UUID | None
     created_by_id: UUID
+    notetaker_id: UUID | None
     status: MeetingStatus
+    version: int
     created_at: datetime
     updated_at: datetime
     agendas: list[AgendaResponse]
@@ -295,8 +426,10 @@ class MinutesDecisionResponse(BaseModel):
     discussion_id: UUID
     decision_number: int
     decision_text: str
+    pic_suggestion: str | None
     output_expected: str | None
     target_date: date | None
+    target_text: str | None
     is_action_item: bool
 
 
@@ -327,9 +460,21 @@ class DecisionBriefDecisionResponse(BaseModel):
     source_agenda_title: str
     source_discussion_id: UUID
     source_discussion_subject: str | None
+    brief_text: str | None
     priority: str
     editorial_note: str | None
     position: int
+
+
+class DecisionBriefApprovalEventResponse(BaseModel):
+    id: UUID
+    event_number: int
+    event_type: DecisionBriefApprovalEventName
+    actor_user_id: UUID
+    actor_roles: list[str]
+    reason: str | None
+    correlation_id: UUID | None
+    occurred_at: datetime
 
 
 class DecisionBriefVersionResponse(BaseModel):
@@ -342,4 +487,6 @@ class DecisionBriefVersionResponse(BaseModel):
     created_by_id: UUID
     created_at: datetime
     is_stale: bool
+    approval_state: DecisionBriefApprovalState
+    approval_events: list[DecisionBriefApprovalEventResponse]
     decisions: list[DecisionBriefDecisionResponse]

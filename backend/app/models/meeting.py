@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     Date,
@@ -42,6 +43,18 @@ class MeetingStatus(StrEnum):
 class MinutesReviewResult(StrEnum):
     VALID = "VALID"
     INVALID = "INVALID"
+
+
+class NotetakerHandoverStatus(StrEnum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+
+
+class DecisionBriefApprovalEventType(StrEnum):
+    SUBMITTED = "SUBMITTED"
+    WITHDRAWN = "WITHDRAWN"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
 
 
 MEETING_STATUS_TYPE = SqlEnum(
@@ -81,6 +94,7 @@ class Meeting(Base):
             "(finalized_at IS NOT NULL AND finalized_by_id IS NOT NULL)",
             name="ck_meetings_finalized_fields",
         ),
+        CheckConstraint("version > 0", name="ck_meetings_version_positive"),
         Index("ix_meetings_date_status", "meeting_date", "status"),
     )
 
@@ -121,6 +135,9 @@ class Meeting(Base):
         onupdate=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
+    version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
 
     creator: Mapped["User"] = relationship(
         back_populates="meetings_created", foreign_keys=[created_by_id]
@@ -144,6 +161,61 @@ class Meeting(Base):
     minutes_revisions: Mapped[list["MinutesRevision"]] = relationship(
         back_populates="meeting", order_by="MinutesRevision.revision_number"
     )
+
+
+class MeetingNotetakerHandover(Base):
+    __tablename__ = "meeting_notetaker_handovers"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'APPROVED')",
+            name="ck_meeting_notetaker_handovers_status",
+        ),
+        CheckConstraint(
+            "from_notetaker_id IS NULL OR from_notetaker_id <> to_notetaker_id",
+            name="ck_meeting_notetaker_handovers_distinct_users",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND approved_by_user_id IS NULL AND approved_at IS NULL) OR "
+            "(status = 'APPROVED' AND approved_by_user_id IS NOT NULL AND approved_at IS NOT NULL)",
+            name="ck_meeting_notetaker_handovers_approval_state",
+        ),
+        Index(
+            "ix_meeting_notetaker_handovers_meeting_requested",
+            "meeting_id",
+            "requested_at",
+        ),
+        Index(
+            "uq_meeting_notetaker_handovers_pending",
+            "meeting_id",
+            unique=True,
+            postgresql_where=text("status = 'PENDING'"),
+            sqlite_where=text("status = 'PENDING'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    meeting_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("meetings.id", ondelete="RESTRICT"), nullable=False
+    )
+    from_notetaker_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    to_notetaker_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default=NotetakerHandoverStatus.PENDING.value, nullable=False
+    )
+    approved_by_user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class MeetingStatusEvent(Base):
@@ -272,6 +344,14 @@ class MinutesDecision(Base):
             "output_expected IS NULL OR length(output_expected) <= 20000",
             name="ck_minutes_decisions_output_expected",
         ),
+        CheckConstraint(
+            "target_date IS NULL OR target_text IS NULL",
+            name="ck_minutes_decisions_single_target_value",
+        ),
+        CheckConstraint(
+            "target_text IS NULL OR length(target_text) <= 500",
+            name="ck_minutes_decisions_target_text_length",
+        ),
         ForeignKeyConstraint(
             ["meeting_id", "minutes_revision_id", "discussion_id"],
             [
@@ -302,8 +382,10 @@ class MinutesDecision(Base):
     discussion_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     decision_number: Mapped[int] = mapped_column(Integer, nullable=False)
     decision_text: Mapped[str] = mapped_column(Text, nullable=False)
+    pic_suggestion: Mapped[str | None] = mapped_column(String(300))
     output_expected: Mapped[str | None] = mapped_column(Text)
     target_date: Mapped[date | None] = mapped_column(Date)
+    target_text: Mapped[str | None] = mapped_column(Text)
     is_action_item: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
@@ -368,7 +450,7 @@ class DecisionBriefDecision(Base):
     __table_args__ = (
         CheckConstraint("position > 0", name="ck_decision_brief_decisions_position_positive"),
         CheckConstraint(
-            "length(trim(priority)) > 0 AND length(priority) <= 100",
+            "priority = '' OR (length(trim(priority)) > 0 AND length(priority) <= 100)",
             name="ck_decision_brief_decisions_priority",
         ),
         CheckConstraint(
@@ -407,6 +489,73 @@ class DecisionBriefDecision(Base):
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     priority: Mapped[str] = mapped_column(String(100), nullable=False)
     editorial_note: Mapped[str | None] = mapped_column(Text)
+    brief_text: Mapped[str | None] = mapped_column(Text)
+
+
+class DecisionBriefApprovalEvent(Base):
+    """Append-only lifecycle event for one immutable Decision Brief version."""
+
+    __tablename__ = "decision_brief_approval_events"
+    __table_args__ = (
+        CheckConstraint("event_number > 0", name="ck_decision_brief_approval_events_number"),
+        CheckConstraint(
+            "event_type IN ('SUBMITTED', 'WITHDRAWN', 'APPROVED', 'REJECTED')",
+            name="ck_decision_brief_approval_events_type",
+        ),
+        CheckConstraint(
+            "(event_type = 'REJECTED' AND reason IS NOT NULL "
+            "AND length(trim(reason)) > 0 AND length(reason) <= 4000) OR "
+            "(event_type <> 'REJECTED' AND reason IS NULL)",
+            name="ck_decision_brief_approval_events_reason",
+        ),
+        ForeignKeyConstraint(
+            ["meeting_id", "brief_version_id", "source_minutes_revision_id"],
+            [
+                "decision_brief_versions.meeting_id",
+                "decision_brief_versions.id",
+                "decision_brief_versions.source_minutes_revision_id",
+            ],
+            name="fk_decision_brief_approval_events_version_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["actor_user_id"],
+            ["users.id"],
+            name="fk_decision_brief_approval_events_actor",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "brief_version_id",
+            "event_number",
+            name="uq_decision_brief_approval_events_number",
+        ),
+        Index(
+            "ix_decision_brief_approval_events_version",
+            "brief_version_id",
+            "event_number",
+        ),
+        Index(
+            "uq_decision_brief_approval_events_terminal",
+            "brief_version_id",
+            unique=True,
+            sqlite_where=text("event_type IN ('APPROVED', 'REJECTED')"),
+            postgresql_where=text("event_type IN ('APPROVED', 'REJECTED')"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    meeting_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    brief_version_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    source_minutes_revision_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    event_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor_user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    actor_roles: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    correlation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False
+    )
 
 
 class MinutesReview(Base):
@@ -492,6 +641,8 @@ class Agenda(Base):
     agenda_number: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     agenda_description: Mapped[str | None] = mapped_column(Text)
+    pic_suggestion: Mapped[str | None] = mapped_column(String(300))
+    supporting_pic_suggestion: Mapped[str | None] = mapped_column(String(2_000))
     lead_user_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT")
     )

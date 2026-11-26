@@ -2,6 +2,7 @@
 
 from datetime import UTC, date, datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -23,6 +24,13 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+# Register the referenced table for ActionItem's composite disposition foreign key.
+from app.models import disposition as _disposition_models  # noqa: F401
+from app.models.organization import OrganizationUnit
+
+if TYPE_CHECKING:
+    from app.models.auth import User
 
 
 def utc_now() -> datetime:
@@ -74,6 +82,11 @@ class ActionItem(Base):
         CheckConstraint(ACTION_ITEM_STATUS_CHECK, name="ck_action_items_official_status"),
         CheckConstraint("version > 0", name="ck_action_items_version_positive"),
         CheckConstraint(
+            "(deleted_at IS NULL AND deleted_by_id IS NULL) OR "
+            "(deleted_at IS NOT NULL AND deleted_by_id IS NOT NULL)",
+            name="ck_action_items_deleted_actor_pair",
+        ),
+        CheckConstraint(
             "(official_status = 'SELESAI' AND completed_at IS NOT NULL) OR "
             "(official_status <> 'SELESAI' AND completed_at IS NULL)",
             name="ck_action_items_completed_at_status",
@@ -104,11 +117,38 @@ class ActionItem(Base):
             name="fk_action_items_exact_source_decision",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            [
+                "disposition_id",
+                "meeting_id",
+                "source_minutes_revision_id",
+                "source_decision_id",
+            ],
+            [
+                "dispositions.id",
+                "dispositions.meeting_id",
+                "dispositions.source_minutes_revision_id",
+                "dispositions.source_decision_id",
+            ],
+            name="fk_action_items_disposition_source",
+            ondelete="RESTRICT",
+        ),
         Index("ix_action_items_meeting_status", "meeting_id", "official_status"),
         Index("ix_action_items_source_revision", "meeting_id", "source_minutes_revision_id"),
+        Index("ix_action_items_disposition_id", "disposition_id"),
+        Index("ix_action_items_responsible_unit_id", "responsible_unit_id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    disposition_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    responsible_unit_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "organization_units.id",
+            name="fk_action_items_responsible_unit",
+            ondelete="RESTRICT",
+        ),
+    )
     meeting_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     source_minutes_revision_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     source_decision_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
@@ -134,9 +174,17 @@ class ActionItem(Base):
         server_default=text("CURRENT_TIMESTAMP"),
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_by_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_action_items_deleted_by_user", ondelete="RESTRICT"),
+    )
 
     assignments: Mapped[list["ActionItemAssignment"]] = relationship(
         back_populates="action_item", order_by=lambda: ActionItemAssignment.started_at
+    )
+    responsible_unit: Mapped["OrganizationUnit | None"] = relationship(
+        "OrganizationUnit", foreign_keys=[responsible_unit_id]
     )
     progress_updates: Mapped[list["ProgressUpdate"]] = relationship(
         back_populates="action_item", order_by=lambda: ProgressUpdate.submitted_at
@@ -171,6 +219,12 @@ class ActionItemAssignment(Base):
             name="ck_assignments_reason_length",
         ),
         CheckConstraint(
+            "(assignee_user_id IS NOT NULL AND assignee_display_name IS NULL) OR "
+            "(assignee_user_id IS NULL AND assignee_display_name IS NOT NULL "
+            "AND length(trim(assignee_display_name)) > 0)",
+            name="ck_assignments_user_or_display_name",
+        ),
+        CheckConstraint(
             "end_reason IS NULL OR length(end_reason) <= 4000",
             name="ck_assignments_end_reason_length",
         ),
@@ -200,15 +254,25 @@ class ActionItemAssignment(Base):
             sqlite_where=text("ended_at IS NULL"),
         ),
         Index("ix_assignments_assignee_active", "assignee_user_id", "ended_at"),
+        Index("ix_assignments_pic_origin_unit_id", "pic_origin_unit_id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     action_item_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    assignee_user_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    assignee_user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT")
     )
+    assignee_display_name: Mapped[str | None] = mapped_column(String(200))
     assigned_by_user_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    pic_origin_unit_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "organization_units.id",
+            name="fk_assignments_pic_origin_unit",
+            ondelete="RESTRICT",
+        ),
     )
     assignment_role: Mapped[AssignmentRole] = mapped_column(String(20), nullable=False)
     started_at: Mapped[datetime] = mapped_column(
@@ -222,6 +286,10 @@ class ActionItemAssignment(Base):
     end_reason: Mapped[str | None] = mapped_column(Text)
 
     action_item: Mapped[ActionItem] = relationship(back_populates="assignments")
+    assignee: Mapped["User | None"] = relationship(foreign_keys=[assignee_user_id])
+    pic_origin_unit: Mapped["OrganizationUnit | None"] = relationship(
+        "OrganizationUnit", foreign_keys=[pic_origin_unit_id]
+    )
 
 
 class ProgressUpdate(Base):

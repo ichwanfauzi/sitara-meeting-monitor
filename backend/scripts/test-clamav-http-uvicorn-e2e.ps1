@@ -755,10 +755,10 @@ try {
     $currentRevision = Invoke-DockerChecked -Arguments (
         $composePrefix + @("run", "--rm", "migration", "alembic", "current")
     ) -Quiet
-    if ($currentRevision -notmatch "0011_evidence_scan_quarantine") {
-        throw "The disposable HTTP E2E database is not at migration head 0011"
+    if ($currentRevision -notmatch "0020_minutes_pic_suggestion") {
+        throw "The disposable HTTP E2E database is not at migration head 0020_minutes_pic_suggestion"
     }
-    Write-Host "Disposable database revision: 0011_evidence_scan_quarantine."
+    Write-Host "Disposable database revision: 0020_minutes_pic_suggestion."
 
     $null = Invoke-DockerChecked -Arguments ($composePrefix + @("up", "--detach", "api")) -Quiet
     $apiId = (Invoke-DockerChecked -Arguments ($composePrefix + @("ps", "-q", "api")) -Quiet).Trim()

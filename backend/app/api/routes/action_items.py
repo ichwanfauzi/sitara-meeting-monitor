@@ -1,11 +1,12 @@
 """Authorized Action Item endpoints."""
 
+import logging
 from datetime import date, datetime
-from typing import Annotated, NoReturn, TypedDict
+from typing import Annotated, NoReturn, TypedDict, cast
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
@@ -34,8 +35,12 @@ from app.schemas.action_items import (
     ActionItemResponse,
     ActionItemStatusChange,
     ActionItemStatusHistoryResponse,
+    ActionItemUpdate,
+    AssignablePicDirectoryResponse,
     CompletionReviewCreate,
     CompletionVerificationResponse,
+    OrganizationUnitDirectoryResponse,
+    OrganizationUnitReference,
     ProgressUpdateCreate,
     ProgressUpdateResponse,
 )
@@ -49,16 +54,20 @@ from app.services.action_items import (
     ActionItemAssigneeInvalid,
     ActionItemAssignmentConflict,
     ActionItemConcurrencyConflict,
+    ActionItemEditConflict,
     ActionItemEvidenceDenied,
     ActionItemEvidenceLimitExceeded,
     ActionItemEvidenceQuarantined,
     ActionItemEvidenceStorageNotConfigured,
     ActionItemNotFound,
     ActionItemPermissionDenied,
+    ActionItemPersistenceError,
+    ActionItemPicSearchInvalid,
     ActionItemProgressDenied,
     ActionItemSourceInvalid,
     ActionItemSourceNotActive,
     ActionItemStatusTransitionInvalid,
+    ActionItemUnitInvalid,
     ActionItemVerificationInvalid,
     ActionItemVerificationRequired,
     change_action_item_status,
@@ -67,19 +76,24 @@ from app.services.action_items import (
     create_file_evidence,
     create_link_evidence,
     create_progress_update,
+    delete_action_item,
     end_assignment,
     get_action_item_for_actor,
     get_evidence_file_for_actor,
     list_action_item_assignments,
     list_action_items,
+    list_active_action_item_units,
     list_completion_verifications,
     list_progress_updates,
     list_status_history,
     review_completion,
+    search_assignable_pics,
     source_revision_is_stale,
+    update_action_item,
 )
 
 router = APIRouter(prefix="/action-items", tags=["action-items"])
+logger = logging.getLogger(__name__)
 Identity = tuple[UserSession, User]
 CurrentIdentity = Annotated[Identity, Depends(get_current_identity)]
 DatabaseSession = Annotated[Session, Depends(get_db)]
@@ -90,6 +104,8 @@ class _ActionItemResponseFields(TypedDict):
     meeting_id: UUID
     source_minutes_revision_id: UUID
     source_decision_id: UUID
+    disposition_id: UUID | None
+    responsible_unit: OrganizationUnitReference | None
     source_revision_is_stale: bool
     title: str
     description: str
@@ -102,6 +118,7 @@ class _ActionItemResponseFields(TypedDict):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    deleted_at: datetime | None
     active_assignments: list[ActionItemAssignmentResponse]
 
 
@@ -110,12 +127,24 @@ def _serialize_assignment(item: ActionItemAssignment) -> ActionItemAssignmentRes
         id=item.id,
         action_item_id=item.action_item_id,
         assignee_user_id=item.assignee_user_id,
+        assignee_display_name=item.assignee_display_name,
+        assignee_name=(
+            item.assignee.full_name if item.assignee is not None else item.assignee_display_name
+        ),
+        pic_origin_unit=(
+            OrganizationUnitReference(
+                id=item.pic_origin_unit.id,
+                unit_code=item.pic_origin_unit.unit_code,
+                name=item.pic_origin_unit.name,
+            )
+            if item.pic_origin_unit is not None
+            else None
+        ),
         assigned_by_user_id=item.assigned_by_user_id,
         assignment_role=item.assignment_role,
         started_at=item.started_at,
         ended_at=item.ended_at,
         ended_by_user_id=item.ended_by_user_id,
-        assignment_reason=item.assignment_reason,
         end_reason=item.end_reason,
     )
 
@@ -203,6 +232,16 @@ def _serialize_action_item(
         "meeting_id": item.meeting_id,
         "source_minutes_revision_id": item.source_minutes_revision_id,
         "source_decision_id": item.source_decision_id,
+        "disposition_id": item.disposition_id,
+        "responsible_unit": (
+            OrganizationUnitReference(
+                id=item.responsible_unit.id,
+                unit_code=item.responsible_unit.unit_code,
+                name=item.responsible_unit.name,
+            )
+            if item.responsible_unit is not None
+            else None
+        ),
         "source_revision_is_stale": source_revision_is_stale(session, item),
         "title": item.title,
         "description": item.description,
@@ -215,6 +254,7 @@ def _serialize_action_item(
         "created_at": item.created_at,
         "updated_at": item.updated_at,
         "completed_at": item.completed_at,
+        "deleted_at": item.deleted_at,
         "active_assignments": [
             _serialize_assignment(assignment)
             for assignment in assignment_history
@@ -279,6 +319,11 @@ def _raise_action_item_error(error: Exception) -> NoReturn:
             status_code=422,
             detail="PIC must be active, eligible, and have an active unit membership",
         )
+    if isinstance(error, ActionItemUnitInvalid):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Selected unit is inactive or is not an active PIC membership",
+        )
     if isinstance(error, ActionItemSourceInvalid):
         raise HTTPException(
             status_code=422,
@@ -289,10 +334,20 @@ def _raise_action_item_error(error: Exception) -> NoReturn:
             status_code=status.HTTP_409_CONFLICT,
             detail="Source minutes revision is no longer active",
         )
+    if isinstance(error, ActionItemPersistenceError):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Action Item and audit event could not be saved",
+        )
     if isinstance(error, ActionItemConcurrencyConflict):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Action Item has changed; reload it before retrying",
+        )
+    if isinstance(error, ActionItemEditConflict):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Completed Action Items are archived and cannot be edited or deleted",
         )
     if isinstance(error, ActionItemAssignmentConflict):
         raise HTTPException(
@@ -325,6 +380,7 @@ def get_action_items(
     offset: Annotated[int, Query(ge=0)] = 0,
     meeting_id: UUID | None = None,
     official_status: ActionItemStatus | None = None,
+    include_deleted: bool = False,
 ) -> list[ActionItemResponse]:
     items = list_action_items(
         session,
@@ -333,6 +389,7 @@ def get_action_items(
         offset=offset,
         meeting_id=meeting_id,
         official_status=official_status,
+        include_deleted=include_deleted,
     )
     return [
         _serialize_action_item(session, item, include_history=False)  # type: ignore[list-item]
@@ -340,20 +397,131 @@ def get_action_items(
     ]
 
 
+@router.patch("/{action_item_id}", response_model=ActionItemResponse)
+def patch_action_item(
+    action_item_id: UUID,
+    data: ActionItemUpdate,
+    identity: CurrentIdentity,
+    session: DatabaseSession,
+    _csrf: Annotated[None, Depends(require_csrf)],
+) -> ActionItemResponse:
+    try:
+        item = update_action_item(session, identity[1], action_item_id, data)
+    except (
+        ActionItemNotFound,
+        ActionItemPermissionDenied,
+        ActionItemConcurrencyConflict,
+        ActionItemEditConflict,
+        ActionItemPersistenceError,
+    ) as error:
+        _raise_action_item_error(error)
+    return _serialize_action_item(session, item, include_history=False)  # type: ignore[return-value]
+
+
+@router.delete("/{action_item_id}", response_model=ActionItemResponse)
+def remove_action_item(
+    action_item_id: UUID,
+    identity: CurrentIdentity,
+    session: DatabaseSession,
+    _csrf: Annotated[None, Depends(require_csrf)],
+    expected_version: Annotated[int, Query(ge=1)],
+) -> ActionItemResponse:
+    try:
+        item = delete_action_item(
+            session,
+            identity[1],
+            action_item_id,
+            expected_version=expected_version,
+        )
+    except (
+        ActionItemNotFound,
+        ActionItemPermissionDenied,
+        ActionItemConcurrencyConflict,
+        ActionItemEditConflict,
+        ActionItemPersistenceError,
+    ) as error:
+        _raise_action_item_error(error)
+    return _serialize_action_item(session, item, include_history=False)  # type: ignore[return-value]
+
+
+@router.get("/pic-directory", response_model=AssignablePicDirectoryResponse)
+def get_assignable_pic_directory(
+    identity: CurrentIdentity,
+    session: DatabaseSession,
+    meeting_id: UUID,
+    query: Annotated[str, Query(min_length=0, max_length=100)] = "",
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> AssignablePicDirectoryResponse:
+    try:
+        return search_assignable_pics(
+            session,
+            identity[1],
+            meeting_id,
+            query=query,
+            limit=limit,
+        )
+    except ActionItemNotFound as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Meeting not found",
+        ) from error
+    except ActionItemPermissionDenied as error:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Action Item access denied",
+        ) from error
+    except ActionItemPicSearchInvalid as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PIC search must contain at least two non-whitespace characters",
+        ) from error
+
+
+@router.get("/units", response_model=OrganizationUnitDirectoryResponse)
+def get_action_item_units(
+    identity: CurrentIdentity,
+    session: DatabaseSession,
+    meeting_id: UUID,
+) -> OrganizationUnitDirectoryResponse:
+    try:
+        return list_active_action_item_units(session, identity[1], meeting_id)
+    except ActionItemNotFound as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Meeting not found",
+        ) from error
+    except ActionItemPermissionDenied as error:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Action Item access denied",
+        ) from error
+
+
 @router.post("", response_model=ActionItemDetailResponse, status_code=status.HTTP_201_CREATED)
 def post_action_item(
     data: ActionItemCreate,
+    request: Request,
     identity: CurrentIdentity,
     session: DatabaseSession,
     _csrf: Annotated[None, Depends(require_csrf)],
 ) -> ActionItemDetailResponse:
+    correlation_id = cast(UUID | None, getattr(request.state, "correlation_id", None))
     try:
-        item = create_action_item(session, identity[1], data)
+        item = create_action_item(
+            session,
+            identity[1],
+            data,
+            correlation_id=correlation_id,
+        )
+    except ActionItemPersistenceError as error:
+        logger.exception("Action Item transaction failed; correlation_id=%s", correlation_id)
+        _raise_action_item_error(error)
     except (
         ActionItemAssigneeInvalid,
         ActionItemPermissionDenied,
         ActionItemSourceInvalid,
         ActionItemSourceNotActive,
+        ActionItemUnitInvalid,
     ) as error:
         _raise_action_item_error(error)
     return _serialize_action_item(session, item, include_history=True)  # type: ignore[return-value]
@@ -380,18 +548,27 @@ def get_action_item_detail(
 def post_assignment(
     action_item_id: UUID,
     data: ActionItemAssignmentCreate,
+    request: Request,
     identity: CurrentIdentity,
     session: DatabaseSession,
     _csrf: Annotated[None, Depends(require_csrf)],
 ) -> ActionItemAssignmentResponse:
+    correlation_id = cast(UUID | None, getattr(request.state, "correlation_id", None))
     try:
         assignment = create_assignment(
-            session, identity[1], action_item_id, data, data.expected_version
+            session,
+            identity[1],
+            action_item_id,
+            data,
+            data.expected_version,
+            correlation_id=correlation_id,
         )
     except (
         ActionItemNotFound,
+        ActionItemPersistenceError,
         ActionItemPermissionDenied,
         ActionItemAssigneeInvalid,
+        ActionItemUnitInvalid,
         ActionItemAssignmentConflict,
         ActionItemConcurrencyConflict,
     ) as error:
@@ -407,14 +584,24 @@ def post_end_assignment(
     action_item_id: UUID,
     assignment_id: UUID,
     data: ActionItemAssignmentEnd,
+    request: Request,
     identity: CurrentIdentity,
     session: DatabaseSession,
     _csrf: Annotated[None, Depends(require_csrf)],
 ) -> ActionItemAssignmentResponse:
+    correlation_id = cast(UUID | None, getattr(request.state, "correlation_id", None))
     try:
-        assignment = end_assignment(session, identity[1], action_item_id, assignment_id, data)
+        assignment = end_assignment(
+            session,
+            identity[1],
+            action_item_id,
+            assignment_id,
+            data,
+            correlation_id=correlation_id,
+        )
     except (
         ActionItemNotFound,
+        ActionItemPersistenceError,
         ActionItemPermissionDenied,
         ActionItemAssignmentConflict,
         ActionItemConcurrencyConflict,

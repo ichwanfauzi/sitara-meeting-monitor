@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Protocol, cast
+
 import pytest
 from app.core.config import Settings
 from pydantic import ValidationError
@@ -19,7 +21,22 @@ _SETTINGS_ENV_KEYS = (
     "CLAMAV_PORT",
     "CLAMAV_TIMEOUT_SECONDS",
     "EVIDENCE_SCAN_POLL_SECONDS",
+    "NOTIFICATION_EMAIL_ENABLED",
+    "NOTIFICATION_EMAIL_TEST_RECIPIENT",
+    "NOTIFICATION_EMAIL_POLL_SECONDS",
+    "NOTIFICATION_EMAIL_MAX_ATTEMPTS",
+    "NOTIFICATION_EMAIL_RETRY_BASE_SECONDS",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_TIMEOUT_SECONDS",
+    "SMTP_USERNAME",
+    "SMTP_PASSWORD",
+    "SMTP_FROM_EMAIL",
 )
+
+
+class _SettingsFactory(Protocol):
+    def __call__(self, *, _env_file: None) -> Settings: ...
 
 
 @pytest.fixture
@@ -30,7 +47,9 @@ def isolated_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _settings() -> Settings:
-    return Settings(_env_file=None)
+    # Pydantic Settings supports this runtime option, but its generated constructor type omits it.
+    settings_factory = cast(_SettingsFactory, Settings)
+    return settings_factory(_env_file=None)
 
 
 def test_clamav_settings_have_safe_local_defaults(
@@ -42,6 +61,9 @@ def test_clamav_settings_have_safe_local_defaults(
     assert settings.clamav_port == 3310
     assert settings.clamav_timeout_seconds == 30
     assert settings.evidence_scan_poll_seconds == 5
+    assert not settings.notification_email_enabled
+    assert settings.smtp_host == "smtp.gmail.com"
+    assert settings.smtp_port == 587
 
 
 def test_clamav_settings_read_environment_variables(

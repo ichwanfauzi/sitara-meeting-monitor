@@ -5,12 +5,244 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from app.core.config import get_settings
-from app.models.auth import User, UserSession
-from app.models.meeting import Meeting, MeetingStatus, MinutesRevision
-from sqlalchemy import UniqueConstraint, create_engine, inspect, text
+from app.models.auth import User
+from app.models.meeting import (
+    DecisionBriefApprovalEvent,
+    DecisionBriefVersion,
+    Meeting,
+    MeetingStatus,
+    MinutesRevision,
+)
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+
+
+def test_alembic_revision_identifiers_fit_version_column() -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    revisions = list(ScriptDirectory.from_config(config).walk_revisions())
+
+    assert revisions
+    assert all(len(revision.revision) <= 32 for revision in revisions)
+
+
+def test_decision_brief_priority_migration_allows_blank_and_keeps_append_only_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "decision-brief-priority.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+
+    try:
+        command.upgrade(config, "0026_notification_email_delivery")
+        command.upgrade(config, "head")
+        constraints = inspect(engine).get_check_constraints("decision_brief_decisions")
+        priority_check = next(
+            item["sqltext"]
+            for item in constraints
+            if item["name"] == "ck_decision_brief_decisions_priority"
+        )
+        with engine.connect() as connection:
+            guards = set(
+                connection.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'trigger' AND tbl_name = 'decision_brief_decisions'"
+                    )
+                ).scalars()
+            )
+        assert "priority = '' OR" in priority_check
+        assert {
+            "trg_decision_brief_decisions_no_update",
+            "trg_decision_brief_decisions_no_delete",
+        } <= guards
+
+        command.downgrade(config, "0026_notification_email_delivery")
+        downgraded_constraints = inspect(engine).get_check_constraints("decision_brief_decisions")
+        downgraded_priority_check = next(
+            item["sqltext"]
+            for item in downgraded_constraints
+            if item["name"] == "ck_decision_brief_decisions_priority"
+        )
+        assert "length(trim(priority)) > 0" in downgraded_priority_check
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_content_audit_migration_accepts_save_events_and_preserves_append_only_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "content-audit.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id, meeting_id, minutes_id, brief_id, source_id = (str(uuid4()) for _ in range(5))
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE users (id CHAR(32) PRIMARY KEY, email VARCHAR(320) NOT NULL, "
+                    "full_name VARCHAR(200) NOT NULL, password_hash VARCHAR(255) NOT NULL, "
+                    "is_active BOOLEAN NOT NULL)"
+                )
+            )
+            connection.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO alembic_version (version_num) "
+                    "VALUES ('0023_minutes_manual_target')"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE TABLE audit_events ("
+                    "id CHAR(32) NOT NULL, actor_user_id CHAR(32) NOT NULL, "
+                    "actor_roles JSON NOT NULL, action VARCHAR(100) NOT NULL, "
+                    "object_type VARCHAR(50) NOT NULL, object_id CHAR(32) NOT NULL, "
+                    "result VARCHAR(20) NOT NULL, correlation_id CHAR(32), "
+                    "before_values JSON, after_values JSON, "
+                    "occurred_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+                    "CONSTRAINT pk_audit_events PRIMARY KEY (id), "
+                    "CONSTRAINT fk_audit_events_actor_user_id_users "
+                    "FOREIGN KEY(actor_user_id) REFERENCES users (id) ON DELETE RESTRICT, "
+                    "CONSTRAINT ck_audit_events_action CHECK (action IN "
+                    "('meeting.status_changed', 'meeting.metadata_updated', "
+                    "'meeting.agenda_changed', 'meeting.participant_changed', "
+                    "'meeting.notetaker_handover_requested', "
+                    "'meeting.notetaker_handover_approved', 'decision_brief.submitted', "
+                    "'decision_brief.withdrawn', 'decision_brief.approved', "
+                    "'decision_brief.rejected', 'disposition.created', "
+                    "'action_item.created', 'action_item.assignment_changed', "
+                    "'action_item.updated', 'action_item.deleted')), "
+                    "CONSTRAINT ck_audit_events_object_type CHECK (object_type IN "
+                    "('meeting', 'decision_brief_version', 'disposition', 'action_item')), "
+                    "CONSTRAINT ck_audit_events_action_object_pair CHECK ("
+                    "(action IN ('meeting.status_changed', 'meeting.metadata_updated', "
+                    "'meeting.agenda_changed', 'meeting.participant_changed', "
+                    "'meeting.notetaker_handover_requested', "
+                    "'meeting.notetaker_handover_approved') AND object_type = 'meeting') OR "
+                    "(action IN ('decision_brief.submitted', 'decision_brief.withdrawn', "
+                    "'decision_brief.approved', 'decision_brief.rejected') "
+                    "AND object_type = 'decision_brief_version') OR "
+                    "(action = 'disposition.created' AND object_type = 'disposition') OR "
+                    "(action IN ('action_item.created', 'action_item.assignment_changed', "
+                    "'action_item.updated', 'action_item.deleted') "
+                    "AND object_type = 'action_item')), "
+                    "CONSTRAINT ck_audit_events_result CHECK "
+                    "(result IN ('SUCCEEDED', 'DENIED')))"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE TRIGGER trg_audit_events_no_update BEFORE UPDATE ON audit_events "
+                    "BEGIN SELECT RAISE(ABORT, 'Audit event history is append-only'); END"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE TRIGGER trg_audit_events_no_delete BEFORE DELETE ON audit_events "
+                    "BEGIN SELECT RAISE(ABORT, 'Audit event history is append-only'); END"
+                )
+            )
+        command.upgrade(config, "0024_content_audit_events")
+        command.downgrade(config, "0023_minutes_manual_target")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0023_minutes_manual_target"
+            )
+        command.upgrade(config, "0024_content_audit_events")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, 'content-audit@example.test', 'Synthetic Audit User', "
+                    "'synthetic-only-not-used', 1)"
+                ),
+                {"id": actor_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'minutes.revised', 'meeting', "
+                    ":object_id, 'SUCCEEDED', :before_values, :after_values)"
+                ),
+                {
+                    "id": str(uuid4()),
+                    "actor_id": actor_id,
+                    "roles": '["SEKRETARIAT"]',
+                    "object_id": meeting_id,
+                    "before_values": None,
+                    "after_values": (
+                        f'{{"revision_id":"{minutes_id}","revision_number":"1",'
+                        '"format_version":"2","decision_count":"1"}'
+                    ),
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'decision_brief.saved', "
+                    "'decision_brief_version', :object_id, 'SUCCEEDED', NULL, :after_values)"
+                ),
+                {
+                    "id": str(uuid4()),
+                    "actor_id": actor_id,
+                    "roles": '["SEKRETARIAT"]',
+                    "object_id": brief_id,
+                    "after_values": (
+                        f'{{"meeting_id":"{meeting_id}",'
+                        f'"source_minutes_revision_id":"{source_id}",'
+                        '"version_number":"1","decision_count":"1"}'
+                    ),
+                },
+            )
+
+        with engine.connect() as connection:
+            content_event_count = connection.execute(
+                text(
+                    "SELECT count(*) FROM audit_events "
+                    "WHERE action IN ('minutes.revised', 'decision_brief.saved')"
+                )
+            ).scalar_one()
+        assert content_event_count == 2
+        with (
+            pytest.raises(IntegrityError, match="Audit event history is append-only"),
+            engine.begin() as connection,
+        ):
+            connection.execute(
+                text("UPDATE audit_events SET result = 'DENIED' WHERE action = 'minutes.revised'")
+            )
+        with pytest.raises(RuntimeError, match="minutes or Decision Brief audit events exist"):
+            command.downgrade(config, "0023_minutes_manual_target")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0024_content_audit_events"
+            )
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
 
 
 def test_initial_migration_creates_identity_schema_and_seed_roles(
@@ -57,15 +289,55 @@ def test_initial_migration_creates_identity_schema_and_seed_roles(
             "action_item_evidence_scans",
             "completion_verifications",
             "status_histories",
+            "audit_events",
+            "dispositions",
+            "disposition_targets",
+            "meeting_notetaker_handovers",
+            "decision_brief_approval_events",
             "alembic_version",
         } <= tables
-        assert role_codes == {"SUPER_ADMIN", "SEKRETARIAT", "REKTOR", "WAREK", "PIC"}
+        assert role_codes == {
+            "SUPER_ADMIN",
+            "SEKRETARIAT",
+            "MANAGER_LEGAL",
+            "REKTOR",
+            "WAREK",
+            "PIC",
+        }
         review_foreign_keys = inspect(engine).get_foreign_keys("minutes_reviews")
         assert any(
             foreign_key["referred_table"] == "minutes_revisions"
             and foreign_key["constrained_columns"] == ["meeting_id", "minutes_revision_id"]
             and foreign_key["referred_columns"] == ["meeting_id", "id"]
             for foreign_key in review_foreign_keys
+        )
+        action_item_columns = {
+            column["name"] for column in inspect(engine).get_columns("action_items")
+        }
+        assert {"disposition_id", "responsible_unit_id"} <= action_item_columns
+        assignment_columns = {
+            column["name"] for column in inspect(engine).get_columns("assignments")
+        }
+        assert "pic_origin_unit_id" in assignment_columns
+        meeting_columns = {column["name"] for column in inspect(engine).get_columns("meetings")}
+        assert "version" in meeting_columns
+        handover_indexes = inspect(engine).get_indexes("meeting_notetaker_handovers")
+        assert any(
+            index["name"] == "uq_meeting_notetaker_handovers_pending" and index["unique"]
+            for index in handover_indexes
+        )
+        action_item_foreign_keys = inspect(engine).get_foreign_keys("action_items")
+        assert any(
+            foreign_key["name"] == "fk_action_items_disposition_source"
+            and foreign_key["referred_table"] == "dispositions"
+            and foreign_key["constrained_columns"]
+            == [
+                "disposition_id",
+                "meeting_id",
+                "source_minutes_revision_id",
+                "source_decision_id",
+            ]
+            for foreign_key in action_item_foreign_keys
         )
         with engine.connect() as connection:
             trigger_names = set(
@@ -85,6 +357,8 @@ def test_initial_migration_creates_identity_schema_and_seed_roles(
             "trg_status_histories_no_update",
             "trg_status_histories_no_delete",
             "trg_action_items_insert_guard",
+            "trg_action_items_update_guard",
+            "trg_action_items_no_delete",
             "trg_assignments_update_guard",
             "trg_progress_updates_assignment",
             "trg_action_item_evidence_limit",
@@ -93,6 +367,12 @@ def test_initial_migration_creates_identity_schema_and_seed_roles(
             "trg_action_item_evidence_scans_guard",
             "trg_action_item_evidence_scans_no_update",
             "trg_action_item_evidence_scans_no_delete",
+            "trg_audit_events_no_update",
+            "trg_audit_events_no_delete",
+            "trg_meeting_notetaker_handover_approve_once",
+            "trg_meeting_notetaker_handover_no_delete",
+            "trg_decision_brief_approval_events_no_update",
+            "trg_decision_brief_approval_events_no_delete",
         } <= trigger_names
 
         actor_id = uuid4()
@@ -138,13 +418,14 @@ def test_initial_migration_creates_identity_schema_and_seed_roles(
                 connection.execute(text("DELETE FROM minutes_revisions"))
                 connection.commit()
             connection.rollback()
+        inspector = inspect(engine)
         email_unique_constraint = any(
-            constraint.name is None and [column.name for column in constraint.columns] == ["email"]
-            for constraint in User.__table__.constraints
-            if isinstance(constraint, UniqueConstraint)
+            constraint.get("column_names") == ["email"]
+            for constraint in inspector.get_unique_constraints("users")
         )
         session_user_index = any(
-            index.name == "ix_user_sessions_user_id" for index in UserSession.__table__.indexes
+            index.get("name") == "ix_user_sessions_user_id"
+            for index in inspector.get_indexes("user_sessions")
         )
         assert email_unique_constraint
         assert session_user_index
@@ -153,6 +434,1071 @@ def test_initial_migration_creates_identity_schema_and_seed_roles(
         assert "users" not in inspect(engine).get_table_names()
         engine.dispose()
     finally:
+        get_settings.cache_clear()
+
+
+def test_in_app_notification_migration_guards_nonempty_downgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "in-app-notifications.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE users (id CHAR(32) PRIMARY KEY, email VARCHAR(320) NOT NULL, "
+                    "full_name VARCHAR(200) NOT NULL, password_hash VARCHAR(512) NOT NULL, "
+                    "is_active BOOLEAN NOT NULL)"
+                )
+            )
+            connection.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO alembic_version (version_num) VALUES ('0024_content_audit_events')"
+                )
+            )
+        command.upgrade(config, "0026_notification_email_delivery")
+
+        assert "notifications" in inspect(engine).get_table_names()
+        command.downgrade(config, "0024_content_audit_events")
+        assert "notifications" not in inspect(engine).get_table_names()
+        command.upgrade(config, "0026_notification_email_delivery")
+
+        recipient_id = uuid4().hex
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, 'notification-migration@example.test', "
+                    "'Penerima Sintetis', 'synthetic-test-hash', 1)"
+                ),
+                {"id": recipient_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO notifications "
+                    "(id, recipient_user_id, event_key, notification_type, message, "
+                    "target_type, target_id) VALUES "
+                    "(:id, :recipient_id, 'synthetic-event', 'ACTION_ITEM_STATUS_CHANGED', "
+                    "'Status tindak lanjut terkait berubah.', 'ACTION_ITEM', :target_id)"
+                ),
+                {"id": uuid4().hex, "recipient_id": recipient_id, "target_id": uuid4().hex},
+            )
+
+        with pytest.raises(RuntimeError, match="Cannot downgrade while in-app notifications"):
+            command.downgrade(config, "0024_content_audit_events")
+
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM notifications")).scalar_one() == 1
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0025_in_app_notifications"
+            )
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_notification_email_migration_preserves_existing_rows_and_guards_delivery_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "notification-email.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    recipient_id, notification_id, target_id = (uuid4().hex for _ in range(3))
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE users (id CHAR(32) PRIMARY KEY, email VARCHAR(320) NOT NULL, "
+                    "full_name VARCHAR(200) NOT NULL, password_hash VARCHAR(512) NOT NULL, "
+                    "is_active BOOLEAN NOT NULL)"
+                )
+            )
+            connection.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO alembic_version (version_num) VALUES ('0024_content_audit_events')"
+                )
+            )
+        command.upgrade(config, "0025_in_app_notifications")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, 'notification@example.test', 'Penerima', 'synthetic-hash', 1)"
+                ),
+                {"id": recipient_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO notifications "
+                    "(id, recipient_user_id, event_key, notification_type, message, "
+                    "target_type, target_id) VALUES "
+                    "(:id, :recipient_id, 'legacy-event', 'ACTION_ITEM_STATUS_CHANGED', "
+                    "'Status berubah.', 'ACTION_ITEM', :target_id)"
+                ),
+                {
+                    "id": notification_id,
+                    "recipient_id": recipient_id,
+                    "target_id": target_id,
+                },
+            )
+
+        command.upgrade(config, "0026_notification_email_delivery")
+        with engine.connect() as connection:
+            email_state = connection.execute(
+                text("SELECT email_status, email_attempts FROM notifications WHERE id = :id"),
+                {"id": notification_id},
+            ).one()
+        assert email_state == ("DISABLED", 0)
+
+        command.downgrade(config, "0025_in_app_notifications")
+        columns = {column["name"] for column in inspect(engine).get_columns("notifications")}
+        assert "email_status" not in columns
+        command.upgrade(config, "0026_notification_email_delivery")
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE notifications SET email_status = 'SENT', email_attempts = 1, "
+                    "email_sent_at = CURRENT_TIMESTAMP WHERE id = :id"
+                ),
+                {"id": notification_id},
+            )
+
+        with pytest.raises(RuntimeError, match="notification email delivery history"):
+            command.downgrade(config, "0025_in_app_notifications")
+
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM notifications")).scalar_one() == 1
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0026_notification_email_delivery"
+            )
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_action_item_unit_provenance_migration_preserves_legacy_rows_and_blocks_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "action_item_unit_provenance.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id, unit_id, meeting_id, revision_id, agenda_id, discussion_id, decision_id = map(
+        str, (uuid4(), uuid4(), uuid4(), uuid4(), uuid4(), uuid4(), uuid4())
+    )
+    legacy_item_id, legacy_assignment_id = map(str, (uuid4(), uuid4()))
+    attributed_item_id, attributed_assignment_id = map(str, (uuid4(), uuid4()))
+
+    try:
+        command.upgrade(config, "0017_decision_brief_approval")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, 'provenance-migration@example.test', 'Synthetic Actor', "
+                    "'synthetic-only-not-used', 1)"
+                ),
+                {"id": actor_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO organization_units (id, unit_code, name, is_active) "
+                    "VALUES (:id, 'PROVENANCE-UNIT', 'Synthetic Provenance Unit', 1)"
+                ),
+                {"id": unit_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO meetings (id, meeting_number, title, meeting_date, created_by_id) "
+                    "VALUES (:id, 'PROVENANCE-001', 'Synthetic meeting', '2026-11-15', :actor)"
+                ),
+                {"id": meeting_id, "actor": actor_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO minutes_revisions "
+                    "(id, meeting_id, revision_number, format_version, content, created_by_id) "
+                    "VALUES (:id, :meeting, 1, 2, NULL, :actor)"
+                ),
+                {"id": revision_id, "meeting": meeting_id, "actor": actor_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO agendas (id, meeting_id, agenda_number, title) "
+                    "VALUES (:id, :meeting, 1, 'Synthetic agenda')"
+                ),
+                {"id": agenda_id, "meeting": meeting_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO minutes_discussions "
+                    "(id, meeting_id, minutes_revision_id, agenda_id, discussion_number, content) "
+                    "VALUES (:id, :meeting, :revision, :agenda, 1, 'Synthetic discussion')"
+                ),
+                {
+                    "id": discussion_id,
+                    "meeting": meeting_id,
+                    "revision": revision_id,
+                    "agenda": agenda_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO minutes_decisions "
+                    "(id, meeting_id, minutes_revision_id, discussion_id, decision_number, "
+                    "decision_text, is_action_item) "
+                    "VALUES (:id, :meeting, :revision, :discussion, 1, 'Synthetic decision', 1)"
+                ),
+                {
+                    "id": decision_id,
+                    "meeting": meeting_id,
+                    "revision": revision_id,
+                    "discussion": discussion_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO action_items "
+                    "(id, meeting_id, source_minutes_revision_id, source_decision_id, title, "
+                    "description, priority, official_status, created_by_id) "
+                    "VALUES (:id, :meeting, :revision, :decision, 'Legacy task', 'Synthetic task', "
+                    "'Penting', 'BELUM_DIMULAI', :actor)"
+                ),
+                {
+                    "id": legacy_item_id,
+                    "meeting": meeting_id,
+                    "revision": revision_id,
+                    "decision": decision_id,
+                    "actor": actor_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO assignments "
+                    "(id, action_item_id, assignee_user_id, assigned_by_user_id, assignment_role) "
+                    "VALUES (:id, :item, :actor, :actor, 'MAIN')"
+                ),
+                {"id": legacy_assignment_id, "item": legacy_item_id, "actor": actor_id},
+            )
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            legacy_unit_values = connection.execute(
+                text(
+                    "SELECT i.responsible_unit_id, a.pic_origin_unit_id "
+                    "FROM action_items i JOIN assignments a ON a.action_item_id = i.id "
+                    "WHERE i.id = :id"
+                ),
+                {"id": legacy_item_id},
+            ).one()
+        assert legacy_unit_values == (None, None)
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO action_items "
+                    "(id, meeting_id, source_minutes_revision_id, source_decision_id, title, "
+                    "description, priority, official_status, created_by_id, responsible_unit_id) "
+                    "VALUES (:id, :meeting, :revision, :decision, 'Attributed task', "
+                    "'Synthetic task', 'Penting', 'BELUM_DIMULAI', :actor, :unit)"
+                ),
+                {
+                    "id": attributed_item_id,
+                    "meeting": meeting_id,
+                    "revision": revision_id,
+                    "decision": decision_id,
+                    "actor": actor_id,
+                    "unit": unit_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO assignments "
+                    "(id, action_item_id, assignee_user_id, assigned_by_user_id, "
+                    "assignment_role, pic_origin_unit_id) "
+                    "VALUES (:id, :item, :actor, :actor, 'MAIN', :unit)"
+                ),
+                {
+                    "id": attributed_assignment_id,
+                    "item": attributed_item_id,
+                    "actor": actor_id,
+                    "unit": unit_id,
+                },
+            )
+
+        with engine.begin() as connection, pytest.raises(IntegrityError, match="responsible unit"):
+            connection.execute(
+                text("UPDATE action_items SET responsible_unit_id = NULL WHERE id = :id"),
+                {"id": attributed_item_id},
+            )
+        with (
+            engine.begin() as connection,
+            pytest.raises(IntegrityError, match="Assignment history"),
+        ):
+            connection.execute(
+                text("UPDATE assignments SET pic_origin_unit_id = NULL WHERE id = :id"),
+                {"id": attributed_assignment_id},
+            )
+        with pytest.raises(RuntimeError, match="unit provenance is populated"):
+            command.downgrade(config, "0017_decision_brief_approval")
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0018_action_item_unit_provenance"
+            )
+            attributed_values = connection.execute(
+                text(
+                    "SELECT i.responsible_unit_id, a.pic_origin_unit_id "
+                    "FROM action_items i JOIN assignments a ON a.action_item_id = i.id "
+                    "WHERE i.id = :id"
+                ),
+                {"id": attributed_item_id},
+            ).one()
+        assert attributed_values == (unit_id, unit_id)
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_action_item_assignment_audit_migration_extends_constraints_and_guards_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "action_item_assignment_audit.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id = str(uuid4())
+    item_id = str(uuid4())
+    event_id = str(uuid4())
+
+    try:
+        command.upgrade(config, "0018_action_item_unit_provenance")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, :email, :full_name, :password_hash, :is_active)"
+                ),
+                {
+                    "id": actor_id,
+                    "email": "assignment-audit-migration@example.test",
+                    "full_name": "Synthetic Assignment Audit Actor",
+                    "password_hash": "synthetic-only-not-used",
+                    "is_active": True,
+                },
+            )
+
+        command.upgrade(config, "head")
+        checks = {
+            constraint["name"]
+            for constraint in inspect(engine).get_check_constraints("audit_events")
+        }
+        assert {
+            "ck_audit_events_action",
+            "ck_audit_events_object_type",
+            "ck_audit_events_action_object_pair",
+        } <= checks
+        event_values = {
+            "id": event_id,
+            "actor_id": actor_id,
+            "roles": '["SEKRETARIAT"]',
+            "item_id": item_id,
+            "result": "SUCCEEDED",
+            "before_values": None,
+            "after_values": '{"operation":"ASSIGNED","assignment_id":"'
+            + str(uuid4())
+            + '","assignee_user_id":"'
+            + str(uuid4())
+            + '","assignment_role":"SUPPORTING","pic_origin_unit_id":"'
+            + str(uuid4())
+            + '"}',
+        }
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'action_item.assignment_changed', "
+                    "'action_item', :item_id, :result, :before_values, :after_values)"
+                ),
+                event_values,
+            )
+
+        with engine.begin() as connection, pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'action_item.assignment_changed', "
+                    "'meeting', :item_id, :result, :before_values, :after_values)"
+                ),
+                {**event_values, "id": str(uuid4())},
+            )
+
+        with engine.connect() as connection, pytest.raises(IntegrityError, match="append-only"):
+            connection.execute(
+                text("UPDATE audit_events SET result = 'DENIED' WHERE id = :id"),
+                {"id": event_id},
+            )
+
+        with pytest.raises(RuntimeError, match="assignment audit history exists"):
+            command.downgrade(config, "0018_action_item_unit_provenance")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0019_assignment_audit"
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM audit_events "
+                        "WHERE action = 'action_item.assignment_changed'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_meeting_live_edit_migration_adds_scoped_handover_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "meeting_live_editing.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id = str(uuid4())
+    recipient_id = str(uuid4())
+    meeting_id = str(uuid4())
+    handover_id = str(uuid4())
+
+    try:
+        command.upgrade(config, "head")
+        with engine.begin() as connection:
+            for user_id, email in (
+                (actor_id, "handover-actor@example.test"),
+                (recipient_id, "handover-recipient@example.test"),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                        "VALUES (:id, :email, :full_name, :password_hash, 1)"
+                    ),
+                    {
+                        "id": user_id,
+                        "email": email,
+                        "full_name": "Synthetic Handover User",
+                        "password_hash": "synthetic-only-not-used",
+                    },
+                )
+            connection.execute(
+                text(
+                    "INSERT INTO meetings "
+                    "(id, meeting_number, title, meeting_date, created_by_id, status) "
+                    "VALUES (:id, 'HANDOVER-MIGRATION-001', 'Synthetic meeting', "
+                    "'2026-10-15', :actor_id, 'LIVE')"
+                ),
+                {"id": meeting_id, "actor_id": actor_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO meeting_notetaker_handovers "
+                    "(id, meeting_id, from_notetaker_id, to_notetaker_id, "
+                    "requested_by_user_id, status) "
+                    "VALUES (:id, :meeting_id, :actor_id, :recipient_id, :actor_id, 'PENDING')"
+                ),
+                {
+                    "id": handover_id,
+                    "meeting_id": meeting_id,
+                    "actor_id": actor_id,
+                    "recipient_id": recipient_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, after_values) "
+                    "VALUES (:id, :actor_id, '[]', 'meeting.agenda_changed', "
+                    "'meeting', :meeting_id, 'SUCCEEDED', '{\"operation\":\"CREATED\"}')"
+                ),
+                {"id": str(uuid4()), "actor_id": actor_id, "meeting_id": meeting_id},
+            )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE meeting_notetaker_handovers SET status = 'APPROVED', "
+                    "approved_by_user_id = :actor_id, approved_at = CURRENT_TIMESTAMP "
+                    "WHERE id = :id"
+                ),
+                {"actor_id": actor_id, "id": handover_id},
+            )
+
+        with engine.connect() as connection:
+            with pytest.raises(IntegrityError, match="immutable"):
+                connection.execute(
+                    text(
+                        "UPDATE meeting_notetaker_handovers "
+                        "SET to_notetaker_id = :recipient_id WHERE id = :id"
+                    ),
+                    {"recipient_id": actor_id, "id": handover_id},
+                )
+                connection.commit()
+            connection.rollback()
+            with pytest.raises(IntegrityError, match="append-only"):
+                connection.execute(
+                    text("DELETE FROM meeting_notetaker_handovers WHERE id = :id"),
+                    {"id": handover_id},
+                )
+                connection.commit()
+            connection.rollback()
+
+        with pytest.raises(RuntimeError, match="meeting edit history"):
+            command.downgrade(config, "0015_action_item_dispositions")
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_decision_brief_approval_migration_adds_append_only_event_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "decision_brief_approval.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id = uuid4()
+    meeting_id = uuid4()
+    revision_id = uuid4()
+    brief_version_id = uuid4()
+
+    try:
+        command.upgrade(config, "0016_meeting_live_editing")
+        with Session(engine) as session:
+            actor = User(
+                id=actor_id,
+                email="brief-approval-migration@example.test",
+                full_name="Synthetic Brief Approver",
+                password_hash="synthetic-only-not-used",
+                is_active=True,
+            )
+            meeting = Meeting(
+                id=meeting_id,
+                meeting_number="BRIEF-APPROVAL-MIGRATION-001",
+                title="Synthetic approval migration meeting",
+                meeting_date=date.today(),
+                created_by_id=actor_id,
+                status=MeetingStatus.DRAFT,
+            )
+            revision = MinutesRevision(
+                id=revision_id,
+                meeting_id=meeting_id,
+                revision_number=1,
+                content="Synthetic migration minutes",
+                created_by_id=actor_id,
+            )
+            version = DecisionBriefVersion(
+                id=brief_version_id,
+                meeting_id=meeting_id,
+                source_minutes_revision_id=revision_id,
+                version_number=1,
+                summary="Synthetic immutable Decision Brief",
+                created_by_id=actor_id,
+            )
+            session.add_all([actor, meeting, revision, version])
+            session.commit()
+
+        command.upgrade(config, "head")
+        with Session(engine) as session:
+            session.add(
+                DecisionBriefApprovalEvent(
+                    meeting_id=meeting_id,
+                    brief_version_id=brief_version_id,
+                    source_minutes_revision_id=revision_id,
+                    event_number=1,
+                    event_type="SUBMITTED",
+                    actor_user_id=actor_id,
+                    actor_roles=["SEKRETARIAT"],
+                )
+            )
+            session.commit()
+
+        with engine.connect() as connection:
+            with pytest.raises(IntegrityError, match="append-only"):
+                connection.execute(
+                    text("UPDATE decision_brief_approval_events SET event_type = 'WITHDRAWN'")
+                )
+                connection.commit()
+            connection.rollback()
+            with pytest.raises(IntegrityError, match="append-only"):
+                connection.execute(text("DELETE FROM decision_brief_approval_events"))
+                connection.commit()
+            connection.rollback()
+
+        assert "decision_brief_approval_events" in inspect(engine).get_table_names()
+        assert any(
+            index["name"] == "uq_decision_brief_approval_events_terminal" and index["unique"]
+            for index in inspect(engine).get_indexes("decision_brief_approval_events")
+        )
+        with pytest.raises(RuntimeError, match="Decision Brief approval history"):
+            command.downgrade(config, "0016_meeting_live_editing")
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_user_job_title_migration_preserves_rows_and_blocks_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "user_job_title.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    user_id = str(uuid4())
+
+    try:
+        command.upgrade(config, "0011_evidence_scan_quarantine")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, :email, :full_name, :password_hash, :is_active)"
+                ),
+                {
+                    "id": user_id,
+                    "email": "job-title-migration@example.test",
+                    "full_name": "Synthetic Existing User",
+                    "password_hash": "synthetic-only-not-used",
+                    "is_active": True,
+                },
+            )
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            user = connection.execute(
+                text("SELECT full_name, job_title FROM users WHERE id = :id"),
+                {"id": user_id},
+            ).one()
+            migration_head = connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+        assert user == ("Synthetic Existing User", None)
+        assert migration_head == "0027_brief_optional_priority"
+
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE users SET job_title = 'Synthetic title' WHERE id = :id"),
+                {"id": user_id},
+            )
+        with pytest.raises(RuntimeError, match="provisioned titles"):
+            command.downgrade(config, "0011_evidence_scan_quarantine")
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0012_user_job_title"
+            )
+            assert (
+                connection.execute(
+                    text("SELECT job_title FROM users WHERE id = :id"), {"id": user_id}
+                ).scalar_one()
+                == "Synthetic title"
+            )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE users SET job_title = NULL WHERE id = :id"),
+                {"id": user_id},
+            )
+        command.downgrade(config, "0011_evidence_scan_quarantine")
+        assert "job_title" not in inspect(engine).get_columns("users")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT full_name FROM users WHERE id = :id"), {"id": user_id}
+                ).scalar_one()
+                == "Synthetic Existing User"
+            )
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_audit_event_migration_is_append_only_and_refuses_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "audit_events.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id = str(uuid4())
+    event_id = str(uuid4())
+
+    try:
+        command.upgrade(config, "0012_user_job_title")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, :email, :full_name, :password_hash, :is_active)"
+                ),
+                {
+                    "id": actor_id,
+                    "email": "audit-migration@example.test",
+                    "full_name": "Synthetic Audit Actor",
+                    "password_hash": "synthetic-only-not-used",
+                    "is_active": True,
+                },
+            )
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0027_brief_optional_priority"
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, correlation_id, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, :action, :object_type, :object_id, "
+                    ":result, :correlation_id, :before_values, :after_values)"
+                ),
+                {
+                    "id": event_id,
+                    "actor_id": actor_id,
+                    "roles": '["SEKRETARIAT"]',
+                    "action": "meeting.status_changed",
+                    "object_type": "meeting",
+                    "object_id": str(uuid4()),
+                    "result": "SUCCEEDED",
+                    "correlation_id": str(uuid4()),
+                    "before_values": '{"status":"DRAFT"}',
+                    "after_values": '{"status":"LIVE"}',
+                },
+            )
+            connection.commit()
+
+        with engine.connect() as connection:
+            with pytest.raises(IntegrityError, match="append-only"):
+                connection.execute(
+                    text("UPDATE audit_events SET result = 'DENIED' WHERE id = :id"),
+                    {"id": event_id},
+                )
+                connection.commit()
+            connection.rollback()
+            with pytest.raises(IntegrityError, match="append-only"):
+                connection.execute(
+                    text("DELETE FROM audit_events WHERE id = :id"), {"id": event_id}
+                )
+                connection.commit()
+            connection.rollback()
+
+        with pytest.raises(RuntimeError, match="audit event history exists"):
+            command.downgrade(config, "0012_user_job_title")
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0013_audit_foundation"
+            )
+            assert connection.execute(text("SELECT count(*) FROM audit_events")).scalar_one() == 1
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_disposition_migration_extends_audit_constraints_and_guards_downgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "disposition_migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id = str(uuid4())
+    disposition_id = str(uuid4())
+    event_id = str(uuid4())
+    base_event = {
+        "id": event_id,
+        "actor_id": actor_id,
+        "roles": '["SEKRETARIAT"]',
+        "object_id": disposition_id,
+        "result": "SUCCEEDED",
+        "correlation_id": str(uuid4()),
+        "before_values": None,
+        "after_values": '{"target_count":"1","target_types":"USER"}',
+    }
+
+    try:
+        command.upgrade(config, "0012_user_job_title")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, :email, :full_name, :password_hash, :is_active)"
+                ),
+                {
+                    "id": actor_id,
+                    "email": "disposition-migration@example.test",
+                    "full_name": "Synthetic Disposition Actor",
+                    "password_hash": "synthetic-only-not-used",
+                    "is_active": True,
+                },
+            )
+        command.upgrade(config, "0013_audit_foundation")
+        command.upgrade(config, "head")
+
+        assert {"dispositions", "disposition_targets"} <= set(inspect(engine).get_table_names())
+        audit_checks = {
+            constraint["name"]
+            for constraint in inspect(engine).get_check_constraints("audit_events")
+        }
+        assert "ck_audit_events_action_object_pair" in audit_checks
+        target_checks = {
+            constraint["name"]
+            for constraint in inspect(engine).get_check_constraints("disposition_targets")
+        }
+        assert "ck_disposition_targets_target_shape" in target_checks
+        target_indexes = {
+            index["name"] for index in inspect(engine).get_indexes("disposition_targets")
+        }
+        assert {
+            "uq_disposition_targets_user",
+            "uq_disposition_targets_unit",
+            "uq_disposition_targets_role",
+        } <= target_indexes
+        with engine.connect() as connection:
+            trigger_names = set(
+                connection.execute(
+                    text("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+                ).scalars()
+            )
+        assert {
+            "trg_audit_events_no_update",
+            "trg_audit_events_no_delete",
+        } <= trigger_names
+
+        with pytest.raises(IntegrityError), engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO disposition_targets "
+                    "(id, disposition_id, target_type) VALUES (:id, :disposition_id, 'USER')"
+                ),
+                {"id": str(uuid4()), "disposition_id": str(uuid4())},
+            )
+
+        with engine.begin() as connection, pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, correlation_id, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'disposition.created', 'meeting', "
+                    ":object_id, :result, :correlation_id, :before_values, :after_values)"
+                ),
+                base_event,
+            )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, correlation_id, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'disposition.created', 'disposition', "
+                    ":object_id, :result, :correlation_id, :before_values, :after_values)"
+                ),
+                base_event,
+            )
+
+        with engine.connect() as connection, pytest.raises(IntegrityError, match="append-only"):
+            connection.execute(
+                text("UPDATE audit_events SET result = 'DENIED' WHERE id = :id"),
+                {"id": event_id},
+            )
+
+        with pytest.raises(RuntimeError, match="disposition history exists"):
+            command.downgrade(config, "0013_audit_foundation")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0014_dispositions"
+            )
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_action_item_disposition_migration_preserves_guards_and_audits_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "action_item_dispositions.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id = str(uuid4())
+    event_id = str(uuid4())
+    event_values = {
+        "id": event_id,
+        "actor_id": actor_id,
+        "roles": '["SEKRETARIAT"]',
+        "object_id": str(uuid4()),
+        "result": "SUCCEEDED",
+        "correlation_id": str(uuid4()),
+        "before_values": None,
+        "after_values": (
+            f'{{"source_minutes_revision_id":"{uuid4()}","source_decision_id":"{uuid4()}"}}'
+        ),
+    }
+
+    try:
+        command.upgrade(config, "0014_dispositions")
+        command.upgrade(config, "head")
+
+        action_item_columns = {
+            column["name"] for column in inspect(engine).get_columns("action_items")
+        }
+        assert "disposition_id" in action_item_columns
+        action_item_foreign_keys = inspect(engine).get_foreign_keys("action_items")
+        assert any(
+            foreign_key["name"] == "fk_action_items_disposition_source"
+            and foreign_key["referred_table"] == "dispositions"
+            for foreign_key in action_item_foreign_keys
+        )
+        audit_checks = {
+            constraint["name"]
+            for constraint in inspect(engine).get_check_constraints("audit_events")
+        }
+        assert {
+            "ck_audit_events_action",
+            "ck_audit_events_object_type",
+            "ck_audit_events_action_object_pair",
+        } <= audit_checks
+        with engine.connect() as connection:
+            trigger_names = set(
+                connection.execute(
+                    text("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+                ).scalars()
+            )
+        assert {
+            "trg_action_items_insert_guard",
+            "trg_action_items_update_guard",
+            "trg_action_items_no_delete",
+            "trg_audit_events_no_update",
+            "trg_audit_events_no_delete",
+        } <= trigger_names
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, :email, :full_name, :password_hash, :is_active)"
+                ),
+                {
+                    "id": actor_id,
+                    "email": "action-item-audit-migration@example.test",
+                    "full_name": "Synthetic Action Item Actor",
+                    "password_hash": "synthetic-only-not-used",
+                    "is_active": True,
+                },
+            )
+        with pytest.raises(IntegrityError), engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, correlation_id, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'action_item.created', 'disposition', "
+                    ":object_id, :result, :correlation_id, :before_values, :after_values)"
+                ),
+                event_values,
+            )
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, correlation_id, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'action_item.created', 'action_item', "
+                    ":object_id, :result, :correlation_id, :before_values, :after_values)"
+                ),
+                event_values,
+            )
+        with engine.connect() as connection, pytest.raises(IntegrityError, match="append-only"):
+            connection.execute(
+                text("UPDATE audit_events SET result = 'DENIED' WHERE id = :id"),
+                {"id": event_id},
+            )
+        with pytest.raises(RuntimeError, match="Action Item audit history exists"):
+            command.downgrade(config, "0014_dispositions")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0015_action_item_dispositions"
+            )
+    finally:
+        engine.dispose()
         get_settings.cache_clear()
 
 
@@ -204,7 +1550,7 @@ def test_evidence_quarantine_migration_backfills_existing_files(
             ).scalar_one()
 
         assert scan_event == (1, "PENDING")
-        assert migration_head == "0011_evidence_scan_quarantine"
+        assert migration_head == "0027_brief_optional_priority"
     finally:
         engine.dispose()
         get_settings.cache_clear()
@@ -843,13 +2189,17 @@ def test_structured_minutes_migration_preserves_legacy_text_and_bound_review(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
 
-        assert migration_head == "0011_evidence_scan_quarantine"
+        assert migration_head == "0027_brief_optional_priority"
         assert (revision.format_version, revision.content) == (1, original_text)
         assert (review.minutes_revision_id, review.result) == (revision_id, "VALID")
         assert {
             "minutes_discussions",
             "minutes_decisions",
         } <= set(inspect(engine).get_table_names())
+        decision_columns = {
+            column["name"] for column in inspect(engine).get_columns("minutes_decisions")
+        }
+        assert "pic_suggestion" in decision_columns
         with engine.begin() as connection, pytest.raises(IntegrityError):
             connection.execute(
                 text(

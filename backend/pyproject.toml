@@ -17,6 +17,7 @@ dependencies = [
   "alembic>=1.14,<2.0",
   "python-multipart>=0.0.20,<1.0",
   "clamd>=1.0.2,<2.0",
+  "defusedxml>=0.7.1,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +28,7 @@ dev = [
   "ruff>=0.9,<1.0",
   "mypy>=1.14,<2.0",
   "pip-audit>=2.7,<3.0",
+  "types-defusedxml>=0.7.0.20260504,<1.0",
 ]
 
 [tool.setuptools.packages.find]

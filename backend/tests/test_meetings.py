@@ -1,14 +1,17 @@
 from collections.abc import Iterator
-from uuid import UUID
+from typing import NotRequired, TypedDict
+from uuid import UUID, uuid4
 
 import pytest
 from app.core.security import hash_password
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
+from app.models.audit import AuditEvent
 from app.models.auth import Role, User
 from app.models.meeting import (
     Agenda,
+    DecisionBriefApprovalEvent,
     Meeting,
     MeetingParticipant,
     MeetingStatus,
@@ -17,11 +20,47 @@ from app.models.meeting import (
     MinutesReview,
     MinutesRevision,
 )
+from app.schemas.audit import AuditEventCreate
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, text
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from pydantic import ValidationError
+from sqlalchemy import create_engine, event, select, text
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Mapper, Session
 from sqlalchemy.pool import StaticPool
+
+
+class MeetingResponse(TypedDict):
+    id: str
+    status: str
+    meeting_number: str
+    version: NotRequired[int]
+    notetaker_id: NotRequired[str | None]
+    agendas: list[object]
+    participants: list[object]
+
+
+class DecisionPayload(TypedDict):
+    decision_text: str
+    output_expected: str
+    target_date: str
+    is_action_item: bool
+    pic_suggestion: NotRequired[str]
+    proposed_pic_user_id: NotRequired[str]
+
+
+class DiscussionPayload(TypedDict):
+    agenda_id: str
+    subject: str
+    content: str
+    decisions: list[DecisionPayload]
+
+
+class StructuredMinutesPayload(TypedDict):
+    format_version: int
+    content: str | None
+    base_revision_id: str | None
+    discussions: list[DiscussionPayload]
 
 
 @pytest.fixture
@@ -42,6 +81,7 @@ def meeting_context() -> Iterator[tuple[Session, dict[str, User]]]:
     users: dict[str, User] = {}
     role_names = {
         "secretariat": ("SEKRETARIAT", "Sekretariat"),
+        "manager_legal": ("MANAGER_LEGAL", "Manager Legal"),
         "rector": ("REKTOR", "Rektor"),
         "other_rector": ("REKTOR", "Rektor"),
         "warek": ("WAREK", "Wakil Rektor"),
@@ -91,22 +131,52 @@ def create_meeting(
     chairperson_id: UUID | None = None,
     meeting_number: str = "RAPIM-2026-001",
     notetaker_id: UUID | None = None,
-) -> dict[str, object]:
+) -> MeetingResponse:
+    request_payload = {
+        "meeting_number": meeting_number,
+        "title": "Rapat koordinasi program",
+        "meeting_date": "2026-10-15",
+        "start_time": "09:00:00",
+        "end_time": "10:00:00",
+        "location": "Ruang rapat utama",
+    }
+    if notetaker_id is not None:
+        request_payload["notetaker_id"] = str(notetaker_id)
     response = client.post(
         "/api/v1/meetings",
-        json={
-            "meeting_number": meeting_number,
-            "title": "Rapat koordinasi program",
-            "meeting_date": "2026-10-15",
-            "start_time": "09:00:00",
-            "end_time": "10:00:00",
-            "location": "Ruang rapat utama",
-            "chairperson_id": str(chairperson_id) if chairperson_id else None,
-            "notetaker_id": str(notetaker_id) if notetaker_id else None,
-        },
+        json=request_payload,
     )
     assert response.status_code == 201
-    return response.json()
+    payload: object = response.json()
+    if not isinstance(payload, dict):
+        pytest.fail("Meeting response must be an object", pytrace=False)
+    identifier = payload.get("id")
+    status = payload.get("status")
+    returned_number = payload.get("meeting_number")
+    agendas = payload.get("agendas")
+    participants = payload.get("participants")
+    if (
+        not isinstance(identifier, str)
+        or not isinstance(status, str)
+        or not isinstance(returned_number, str)
+        or not isinstance(agendas, list)
+        or not isinstance(participants, list)
+    ):
+        pytest.fail("Meeting response has an invalid shape", pytrace=False)
+    result: MeetingResponse = {
+        "id": identifier,
+        "status": status,
+        "meeting_number": returned_number,
+        "agendas": agendas,
+        "participants": participants,
+    }
+    version = payload.get("version")
+    if isinstance(version, int):
+        result["version"] = version
+    notetaker_id = payload.get("notetaker_id")
+    if notetaker_id is None or isinstance(notetaker_id, str):
+        result["notetaker_id"] = notetaker_id
+    return result
 
 
 def create_minutes_revision(
@@ -117,7 +187,82 @@ def create_minutes_revision(
         json={"content": content, "base_revision_id": None},
     )
     assert response.status_code == 201
-    return response.json()
+    payload: object = response.json()
+    if not isinstance(payload, dict) or any(not isinstance(key, str) for key in payload):
+        pytest.fail("Minutes revision response must be an object", pytrace=False)
+    return {key: value for key, value in payload.items() if isinstance(key, str)}
+
+
+def test_meeting_creation_records_selected_notetaker(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(
+            client,
+            meeting_number="RAPIM-NOTETAKER-001",
+            notetaker_id=users["warek"].id,
+        )
+
+    meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert meeting is not None
+    assert meeting.notetaker_id == users["warek"].id
+    assert meeting_data["notetaker_id"] == str(users["warek"].id)
+
+
+@pytest.mark.parametrize("user_key", ["pic", "super_admin"])
+def test_meeting_creation_rejects_restricted_notetaker(
+    meeting_context: tuple[Session, dict[str, User]], user_key: str
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        response = client.post(
+            "/api/v1/meetings",
+            json={
+                "meeting_number": "RAPIM-RESTRICTED-NOTETAKER",
+                "title": "Rapat koordinasi program",
+                "meeting_date": "2026-10-15",
+                "notetaker_id": str(users[user_key].id),
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Selected notetaker must be an active core user"
+    assert (
+        session.scalar(
+            select(Meeting).where(Meeting.meeting_number == "RAPIM-RESTRICTED-NOTETAKER")
+        )
+        is None
+    )
+
+
+def test_meeting_creation_rejects_inactive_notetaker(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    users["warek"].is_active = False
+    session.commit()
+
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        response = client.post(
+            "/api/v1/meetings",
+            json={
+                "meeting_number": "RAPIM-INACTIVE-NOTETAKER",
+                "title": "Rapat koordinasi program",
+                "meeting_date": "2026-10-15",
+                "notetaker_id": str(users["warek"].id),
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Selected notetaker must be an active core user"
+    assert (
+        session.scalar(select(Meeting).where(Meeting.meeting_number == "RAPIM-INACTIVE-NOTETAKER"))
+        is None
+    )
 
 
 def test_meeting_metadata_mutations_require_csrf_and_do_not_write(
@@ -139,7 +284,7 @@ def test_meeting_metadata_mutations_require_csrf_and_do_not_write(
         )
         unauthorized_agenda = client.post(
             f"/api/v1/meetings/{meeting_data['id']}/agendas",
-            json={"agenda_number": 1, "title": "Agenda tanpa token CSRF"},
+            json={"title": "Agenda tanpa token CSRF"},
         )
         unauthorized_participant = client.post(
             f"/api/v1/meetings/{meeting_data['id']}/participants",
@@ -170,7 +315,6 @@ def test_secretariat_can_create_and_read_meeting_agenda_and_participants(
         agenda_response = client.post(
             f"/api/v1/meetings/{meeting_data['id']}/agendas",
             json={
-                "agenda_number": 1,
                 "title": "Evaluasi program prioritas",
                 "agenda_description": "Tinjau tindak lanjut periode berjalan",
                 "duration_minutes": 30,
@@ -178,18 +322,19 @@ def test_secretariat_can_create_and_read_meeting_agenda_and_participants(
         )
         assert agenda_response.status_code == 201
         assert agenda_response.json()["agenda_number"] == 1
-        duplicate_agenda = client.post(
+        next_agenda = client.post(
             f"/api/v1/meetings/{meeting_data['id']}/agendas",
-            json={"agenda_number": 1, "title": "Nomor agenda duplikat"},
+            json={"title": "Agenda berikutnya"},
         )
-        assert duplicate_agenda.status_code == 409
+        assert next_agenda.status_code == 201
+        assert next_agenda.json()["agenda_number"] == 2
 
         participant_response = client.post(
             f"/api/v1/meetings/{meeting_data['id']}/participants",
-            json={"user_id": str(users["warek"].id), "participant_title": "Wakil Rektor"},
+            json={"user_id": str(users["warek"].id)},
         )
         assert participant_response.status_code == 201
-        assert participant_response.json()["attendance_status"] == "INVITED"
+        assert participant_response.json()["participant_name"] == users["warek"].full_name
         duplicate_participant = client.post(
             f"/api/v1/meetings/{meeting_data['id']}/participants",
             json={"user_id": str(users["warek"].id)},
@@ -204,7 +349,135 @@ def test_secretariat_can_create_and_read_meeting_agenda_and_participants(
         assert session.query(MeetingParticipant).count() == 1
 
 
-def test_meeting_scope_allows_related_leaders_and_hides_unrelated_records(
+def test_authorized_meeting_metadata_update_is_versioned_and_audited(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client, users["rector"].id)
+        response = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={
+                "expected_version": 1,
+                "title": "Judul rapat diperbarui",
+                "location": "Ruang rapat baru",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["version"] == 2
+    assert response.json()["title"] == "Judul rapat diperbarui"
+    assert response.json()["location"] == "Ruang rapat baru"
+    assert response.headers["x-correlation-id"]
+    audit_event = session.query(AuditEvent).filter_by(action="meeting.metadata_updated").one()
+    assert audit_event.actor_user_id == users["secretariat"].id
+    assert audit_event.actor_roles == ["SEKRETARIAT"]
+    assert str(audit_event.correlation_id) == response.headers["x-correlation-id"]
+    assert audit_event.before_values == {
+        "title": "Rapat koordinasi program",
+        "location": "Ruang rapat utama",
+    }
+    assert audit_event.after_values == {
+        "title": "Judul rapat diperbarui",
+        "location": "Ruang rapat baru",
+    }
+
+
+def test_live_agenda_and_participant_changes_are_scoped_versioned_and_audited(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as secretary_client:
+        login(secretary_client, users["secretariat"])
+        meeting_data = create_meeting(secretary_client, users["rector"].id)
+        live = secretary_client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/transition",
+            json={"to_status": "LIVE"},
+        )
+        agenda = secretary_client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/agendas",
+            json={"title": "Agenda LIVE"},
+        )
+        participant = secretary_client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/participants",
+            json={"user_id": str(users["warek"].id)},
+        )
+        assert live.status_code == 200
+        assert agenda.status_code == 201
+        assert participant.status_code == 201
+        version = live.json()["version"] + 2
+
+        updated_agenda = secretary_client.put(
+            f"/api/v1/meetings/{meeting_data['id']}/agendas/{agenda.json()['id']}",
+            json={
+                "expected_version": version,
+                "title": "Agenda LIVE diperbarui",
+                "agenda_description": None,
+                "pic_suggestion": None,
+                "supporting_pic_suggestion": None,
+                "duration_minutes": None,
+            },
+        )
+        assert updated_agenda.status_code == 200
+        assert updated_agenda.json()["title"] == "Agenda LIVE diperbarui"
+        version += 1
+
+        removed_participant = secretary_client.delete(
+            f"/api/v1/meetings/{meeting_data['id']}/participants/{users['warek'].id}",
+            params={"expected_version": version},
+        )
+        assert removed_participant.status_code == 204
+        version += 1
+
+        removed_agenda = secretary_client.delete(
+            f"/api/v1/meetings/{meeting_data['id']}/agendas/{agenda.json()['id']}",
+            params={"expected_version": version},
+        )
+
+    assert removed_agenda.status_code == 204
+    assert session.query(MeetingParticipant).count() == 0
+    assert session.query(Agenda).count() == 0
+    change_events = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.action.in_(("meeting.agenda_changed", "meeting.participant_changed")))
+        .all()
+    )
+    assert len(change_events) == 5
+
+
+def test_notetaker_attribution_has_no_handover_endpoint(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as secretary_client:
+        login(secretary_client, users["secretariat"])
+        meeting_data = create_meeting(
+            secretary_client,
+            chairperson_id=users["rector"].id,
+            notetaker_id=users["secretariat"].id,
+        )
+        secretary_client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/transition",
+            json={"to_status": "LIVE"},
+        )
+        handover = secretary_client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/notetaker-handovers",
+            json={"new_notetaker_id": str(users["other_rector"].id)},
+        )
+    assert handover.status_code == 404
+    updated_meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert updated_meeting is not None
+    assert updated_meeting.notetaker_id == users["secretariat"].id
+    actions = set(
+        session.scalars(
+            select(AuditEvent.action).where(AuditEvent.action.like("meeting.notetaker_handover_%"))
+        )
+    )
+    assert actions == set()
+
+
+def test_meeting_reads_are_global_but_lifecycle_changes_remain_restricted(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     _, users = meeting_context
@@ -225,16 +498,18 @@ def test_meeting_scope_allows_related_leaders_and_hides_unrelated_records(
 
     with TestClient(app) as unrelated_rector_client:
         login(unrelated_rector_client, users["other_rector"])
-        assert unrelated_rector_client.get("/api/v1/meetings").json() == []
+        assert [item["id"] for item in unrelated_rector_client.get("/api/v1/meetings").json()] == [
+            meeting_data["id"]
+        ]
         assert (
-            unrelated_rector_client.get(f"/api/v1/meetings/{meeting_data['id']}").status_code == 404
+            unrelated_rector_client.get(f"/api/v1/meetings/{meeting_data['id']}").status_code == 200
         )
         assert (
             unrelated_rector_client.post(
                 f"/api/v1/meetings/{meeting_data['id']}/transition",
                 json={"to_status": "LIVE"},
             ).status_code
-            == 404
+            == 403
         )
 
     with TestClient(app) as warek_client:
@@ -245,9 +520,214 @@ def test_meeting_scope_allows_related_leaders_and_hides_unrelated_records(
         login(rector_client, users["rector"])
         agenda_response = rector_client.post(
             f"/api/v1/meetings/{meeting_data['id']}/agendas",
-            json={"agenda_number": 1, "title": "Tidak dibuat oleh pemilik"},
+            json={"title": "Tidak dibuat oleh pemilik"},
         )
         assert agenda_response.status_code == 403
+
+
+def test_meeting_mutation_rolls_back_when_audit_writer_fails(
+    meeting_context: tuple[Session, dict[str, User]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client, users["rector"].id)
+
+        def fail_audit(*args: object, **kwargs: object) -> None:
+            raise SQLAlchemyError("synthetic audit write failure")
+
+        monkeypatch.setattr("app.services.meetings.append_meeting_change_event", fail_audit)
+        response = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={"expected_version": 1, "title": "Tidak boleh tersimpan"},
+        )
+
+    session.expire_all()
+    persisted = session.get(Meeting, UUID(meeting_data["id"]))
+    assert response.status_code == 500
+    assert persisted is not None
+    assert persisted.title == "Rapat koordinasi program"
+    assert persisted.version == 1
+    assert session.query(AuditEvent).filter_by(action="meeting.metadata_updated").count() == 0
+
+
+def test_meeting_metadata_rejects_stale_version_and_allows_number_changes(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    _, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client, users["rector"].id)
+        first_update = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={"expected_version": 1, "title": "Judul baru"},
+        )
+        stale_update = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={"expected_version": 1, "location": "Lokasi baru"},
+        )
+        number_update = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={"expected_version": 2, "meeting_number": "RAPIM-RENUMBERED"},
+        )
+
+    assert first_update.status_code == 200
+    assert stale_update.status_code == 409
+    assert number_update.status_code == 200
+    assert number_update.json()["meeting_number"] == "RAPIM-RENUMBERED"
+
+
+def test_archived_meeting_rejects_all_metadata_changes_and_keeps_audit_unchanged(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client)
+        meeting = session.get(Meeting, UUID(meeting_data["id"]))
+        assert meeting is not None
+        meeting.started_at = meeting.created_at
+        meeting.finalized_at = meeting.created_at
+        meeting.finalized_by_id = users["secretariat"].id
+        meeting.status = MeetingStatus.ARCHIVED
+        session.commit()
+
+        number_update = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={"expected_version": meeting.version, "meeting_number": "RAPIM-RENAMED"},
+        )
+        title_update = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={"expected_version": meeting.version, "title": "Judul yang tidak boleh berubah"},
+        )
+
+    session.expire_all()
+    persisted = session.get(Meeting, UUID(meeting_data["id"]))
+    assert number_update.status_code == 409
+    assert title_update.status_code == 409
+    assert persisted is not None
+    assert persisted.meeting_number == "RAPIM-2026-001"
+    assert persisted.title == "Rapat koordinasi program"
+    assert session.query(AuditEvent).filter_by(action="meeting.metadata_updated").count() == 0
+
+
+def test_archived_meeting_rejects_new_decision_brief_snapshots(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client)
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        agenda = client.post(f"{meeting_url}/agendas", json={"title": "Agenda sintetis"})
+        assert agenda.status_code == 201
+        started = client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
+        assert started.status_code == 200
+        minutes_payload = _structured_minutes_payload(agenda.json()["id"])
+        saved_minutes = client.post(f"{meeting_url}/minutes-revisions", json=minutes_payload)
+        assert saved_minutes.status_code == 201
+        revision = saved_minutes.json()
+        decision_id = revision["discussions"][0]["decisions"][0]["id"]
+        meeting = session.get(Meeting, UUID(meeting_data["id"]))
+        assert meeting is not None
+        meeting.started_at = meeting.created_at
+        meeting.finalized_at = meeting.created_at
+        meeting.finalized_by_id = users["secretariat"].id
+        meeting.status = MeetingStatus.ARCHIVED
+        session.commit()
+
+        response = client.post(
+            f"{meeting_url}/decision-briefs",
+            json={
+                "source_minutes_revision_id": revision["id"],
+                "summary": "Ringkasan sintetis yang tidak boleh disimpan",
+                "decisions": [{"decision_id": decision_id, "priority": "Utama"}],
+            },
+        )
+        history = client.get(f"{meeting_url}/decision-briefs")
+
+    assert response.status_code == 409
+    assert history.status_code == 200
+    assert history.json() == []
+    assert session.query(AuditEvent).filter_by(action="decision_brief.saved").count() == 0
+
+
+def test_live_notetaker_cannot_be_changed_without_handover(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client, notetaker_id=users["secretariat"].id)
+        live = client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/transition",
+            json={"to_status": "LIVE"},
+        )
+        response = client.patch(
+            f"/api/v1/meetings/{meeting_data['id']}",
+            json={
+                "expected_version": live.json()["version"],
+                "notetaker_id": str(users["warek"].id),
+            },
+        )
+
+    session.expire_all()
+    meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert response.status_code == 422
+    assert meeting is not None
+    assert meeting.notetaker_id == users["secretariat"].id
+
+
+def test_agenda_referenced_by_minutes_cannot_be_removed(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client, notetaker_id=users["secretariat"].id)
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        agenda = client.post(
+            f"{meeting_url}/agendas",
+            json={"title": "Agenda sumber"},
+        )
+        live = client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
+        revision = client.post(
+            f"{meeting_url}/minutes-revisions",
+            json=_structured_minutes_payload(agenda.json()["id"]),
+        )
+        response = client.delete(
+            f"{meeting_url}/agendas/{agenda.json()['id']}",
+            params={"expected_version": live.json()["version"]},
+        )
+
+    assert revision.status_code == 201
+    assert response.status_code == 409
+    assert session.get(Agenda, UUID(agenda.json()["id"])) is not None
+
+
+def test_mixed_pic_and_secretariat_role_does_not_grant_meeting_mutation(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as secretary_client:
+        login(secretary_client, users["secretariat"])
+        meeting_data = create_meeting(secretary_client)
+
+    pic_role = session.query(Role).filter_by(role_code="PIC").one()
+    for role_code in ("SEKRETARIAT", "MANAGER_LEGAL"):
+        operational_role = session.query(Role).filter_by(role_code=role_code).one()
+        users["pic"].roles = [pic_role, operational_role]
+        session.commit()
+
+        with TestClient(app) as pic_client:
+            login(pic_client, users["pic"])
+            response = pic_client.patch(
+                f"/api/v1/meetings/{meeting_data['id']}",
+                json={"expected_version": 1, "title": "Tidak berizin"},
+            )
+
+        assert response.status_code == 404
 
 
 @pytest.mark.parametrize("user_key", ["pic", "super_admin"])
@@ -385,7 +865,7 @@ def test_unauthenticated_user_cannot_transition_meeting(
     assert response.status_code == 401
 
 
-def test_only_secretariat_can_transition_a_meeting_and_csrf_is_required(
+def test_only_secretariat_or_manager_legal_can_transition_a_meeting_and_csrf_is_required(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     session, users = meeting_context
@@ -414,6 +894,31 @@ def test_only_secretariat_can_transition_a_meeting_and_csrf_is_required(
     assert meeting is not None
     assert meeting.status is MeetingStatus.DRAFT
     assert session.query(MeetingStatusEvent).count() == 0
+
+
+def test_manager_legal_can_start_review_and_finalize_a_meeting(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["manager_legal"])
+        meeting_data = create_meeting(client)
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        started = client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
+        revision = create_minutes_revision(client, meeting_url)
+        review = client.post(
+            f"{meeting_url}/minutes-reviews",
+            json={"minutes_revision_id": revision["id"], "result": "VALID"},
+        )
+        finalized = client.post(f"{meeting_url}/transition", json={"to_status": "FINAL"})
+
+    assert started.status_code == 200, started.text
+    assert review.status_code == 201, review.text
+    assert review.json()["reviewer_user_id"] == str(users["manager_legal"].id)
+    assert finalized.status_code == 200, finalized.text
+    meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert meeting is not None
+    assert meeting.status is MeetingStatus.FINAL
 
 
 def test_finalization_requires_verifiable_minutes_review_and_illegal_transitions_are_rejected(
@@ -566,7 +1071,7 @@ def test_minutes_review_cannot_unlock_a_different_meeting(
     assert session.query(MeetingStatusEvent).count() == 2
 
 
-def test_minutes_review_requires_authentication_csrf_and_secretariat_authority(
+def test_minutes_review_requires_authentication_csrf_and_operational_authority(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     session, users = meeting_context
@@ -622,7 +1127,7 @@ def test_minutes_review_requires_authentication_csrf_and_secretariat_authority(
     assert session.query(MinutesReview).count() == 0
 
 
-def test_minutes_review_hides_inaccessible_meeting_and_rejects_non_live_meeting(
+def test_manager_legal_minutes_review_requires_live_meeting_and_valid_result(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     session, users = meeting_context
@@ -636,15 +1141,15 @@ def test_minutes_review_hides_inaccessible_meeting_and_rejects_non_live_meeting(
             f"/api/v1/meetings/{meeting_data['id']}/minutes-reviews",
             json={"minutes_revision_id": str(UUID(int=0)), "result": "VALID"},
         )
-        assert inaccessible.status_code == 404
+        assert inaccessible.status_code == 403
 
-    with TestClient(app) as secretariat_client:
-        login(secretariat_client, users["secretariat"])
-        not_live = secretariat_client.post(
+    with TestClient(app) as manager_client:
+        login(manager_client, users["manager_legal"])
+        not_live = manager_client.post(
             f"/api/v1/meetings/{meeting_data['id']}/minutes-reviews",
             json={"minutes_revision_id": str(UUID(int=0)), "result": "VALID"},
         )
-        invalid_result = secretariat_client.post(
+        invalid_result = manager_client.post(
             f"/api/v1/meetings/{meeting_data['id']}/minutes-reviews",
             json={"minutes_revision_id": str(UUID(int=0)), "result": "PENDING"},
         )
@@ -654,18 +1159,20 @@ def test_minutes_review_hides_inaccessible_meeting_and_rejects_non_live_meeting(
     assert session.query(MinutesReview).count() == 0
 
 
-def test_secretariat_can_archive_final_meeting_and_event_is_atomic(
+@pytest.mark.parametrize("operator_name", ["secretariat", "manager_legal"])
+def test_operational_manager_can_archive_final_meeting_and_event_is_atomic(
     meeting_context: tuple[Session, dict[str, User]],
+    operator_name: str,
 ) -> None:
     session, users = meeting_context
     with TestClient(app) as client:
-        login(client, users["secretariat"])
+        login(client, users[operator_name])
         meeting_data = create_meeting(client)
         meeting = session.get(Meeting, UUID(meeting_data["id"]))
         assert meeting is not None
         meeting.status = MeetingStatus.FINAL
         meeting.finalized_at = meeting.created_at
-        meeting.finalized_by_id = users["secretariat"].id
+        meeting.finalized_by_id = users[operator_name].id
         session.commit()
 
         response = client.post(
@@ -725,7 +1232,7 @@ def test_all_other_status_transitions_are_rejected(
     assert session.query(MeetingStatusEvent).count() == 0
 
 
-def test_designated_notetaker_appends_revision_and_stale_base_is_rejected(
+def test_core_user_appends_revision_and_stale_base_is_rejected(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     _, users = meeting_context
@@ -851,7 +1358,7 @@ def test_revision_change_makes_review_stale_until_latest_revision_is_reviewed(
     assert session.query(MeetingStatusEvent).count() == 2
 
 
-def test_minutes_revision_access_is_limited_and_input_is_validated(
+def test_minutes_revision_access_excludes_restricted_roles_and_validates_input(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     session, users = meeting_context
@@ -915,9 +1422,12 @@ def test_minutes_revision_access_is_limited_and_input_is_validated(
         )
 
         login(other_client, users["other_rector"])
-        other_notetaker = other_client.post(
+        other_core_editor = other_client.post(
             revision_url,
-            json={"content": "Tidak berwenang", "base_revision_id": None},
+            json={
+                "content": "Revisi pengguna inti lain",
+                "base_revision_id": created.json()["id"],
+            },
         )
         login(pic_client, users["pic"])
         pic_read = pic_client.get(revision_url)
@@ -928,7 +1438,7 @@ def test_minutes_revision_access_is_limited_and_input_is_validated(
     assert blank.status_code == 422
     assert missing_base.status_code == 422
     assert missing_csrf.status_code == 403
-    assert other_notetaker.status_code == 403
+    assert other_core_editor.status_code == 201
     assert pic_read.status_code == 404
     assert admin_read.status_code == 404
     assert anonymous_read.status_code == 401
@@ -937,7 +1447,7 @@ def test_minutes_revision_access_is_limited_and_input_is_validated(
 
 def _structured_minutes_payload(
     agenda_id: str, base_revision_id: str | None = None, text_value: str = "Pembahasan sintetis"
-) -> dict[str, object]:
+) -> StructuredMinutesPayload:
     return {
         "format_version": 2,
         "content": None,
@@ -970,7 +1480,7 @@ def test_structured_minutes_revision_round_trips_agenda_discussion_and_decision(
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
         agenda_response = client.post(
             f"{meeting_url}/agendas",
-            json={"agenda_number": 1, "title": "Evaluasi program"},
+            json={"title": "Evaluasi program"},
         )
         assert agenda_response.status_code == 201
         agenda_id = agenda_response.json()["id"]
@@ -978,10 +1488,11 @@ def test_structured_minutes_revision_round_trips_agenda_discussion_and_decision(
             client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"}).status_code == 200
         )
 
-        saved = client.post(
-            f"{meeting_url}/minutes-revisions",
-            json=_structured_minutes_payload(agenda_id),
+        structured_payload = _structured_minutes_payload(agenda_id)
+        structured_payload["discussions"][0]["decisions"][0]["pic_suggestion"] = (
+            "Warek bidang akademik"
         )
+        saved = client.post(f"{meeting_url}/minutes-revisions", json=structured_payload)
         history = client.get(f"{meeting_url}/minutes-revisions")
 
     assert saved.status_code == 201
@@ -993,10 +1504,61 @@ def test_structured_minutes_revision_round_trips_agenda_discussion_and_decision(
     decision = revision["discussions"][0]["decisions"][0]
     assert decision["discussion_id"] == revision["discussions"][0]["id"]
     assert decision["decision_text"] == "Perbaiki pelaporan triwulan"
+    assert decision["pic_suggestion"] == "Warek bidang akademik"
     assert decision["target_date"] == "2026-11-30"
     assert decision["is_action_item"] is True
     assert history.status_code == 200
     assert history.json() == [revision]
+
+
+def test_minutes_and_decision_brief_saves_write_content_free_database_audit_events(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client)
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        agenda_response = client.post(f"{meeting_url}/agendas", json={"title": "Agenda audit"})
+        assert agenda_response.status_code == 201
+        agenda = agenda_response.json()
+        client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
+        saved_minutes = client.post(
+            f"{meeting_url}/minutes-revisions",
+            json=_structured_minutes_payload(agenda["id"]),
+        )
+        revision = saved_minutes.json()
+        decision = revision["discussions"][0]["decisions"][0]
+        saved_brief = client.post(
+            f"{meeting_url}/decision-briefs",
+            json={
+                "source_minutes_revision_id": revision["id"],
+                "summary": "Ringkasan sintetis untuk uji audit.",
+                "decisions": [{"decision_id": decision["id"], "priority": "Utama"}],
+            },
+        )
+
+    assert saved_minutes.status_code == 201
+    assert saved_brief.status_code == 201
+    minutes_event = session.query(AuditEvent).filter_by(action="minutes.revised").one()
+    brief_event = session.query(AuditEvent).filter_by(action="decision_brief.saved").one()
+    assert minutes_event.object_id == UUID(str(meeting_data["id"]))
+    assert minutes_event.after_values == {
+        "revision_id": revision["id"],
+        "revision_number": "1",
+        "format_version": "2",
+        "decision_count": "1",
+    }
+    assert brief_event.object_id == UUID(saved_brief.json()["id"])
+    assert brief_event.after_values == {
+        "meeting_id": meeting_data["id"],
+        "source_minutes_revision_id": revision["id"],
+        "version_number": "1",
+        "decision_count": "1",
+    }
+    audit_payload = str(minutes_event.after_values) + str(brief_event.after_values)
+    assert "Perbaiki pelaporan triwulan" not in audit_payload
+    assert "Laporan revisi" not in audit_payload
 
 
 def test_structured_minutes_rejects_agenda_from_another_meeting_without_partial_rows(
@@ -1014,7 +1576,7 @@ def test_structured_minutes_rejects_agenda_from_another_meeting_without_partial_
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
         other_agenda = client.post(
             f"/api/v1/meetings/{other_meeting['id']}/agendas",
-            json={"agenda_number": 1, "title": "Agenda rapat lain"},
+            json={"title": "Agenda rapat lain"},
         ).json()
         client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
 
@@ -1066,13 +1628,10 @@ def test_structured_minutes_does_not_accept_pic_assignment_fields(
         login(client, users["secretariat"])
         meeting_data = create_meeting(client, notetaker_id=users["secretariat"].id)
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
-        agenda = client.post(
-            f"{meeting_url}/agendas", json={"agenda_number": 1, "title": "Agenda"}
-        ).json()
+        agenda = client.post(f"{meeting_url}/agendas", json={"title": "Agenda"}).json()
         client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
         payload = _structured_minutes_payload(agenda["id"])
         decisions = payload["discussions"][0]["decisions"]
-        assert isinstance(decisions, list)
         decisions[0]["proposed_pic_user_id"] = str(users["rector"].id)
 
         response = client.post(f"{meeting_url}/minutes-revisions", json=payload)
@@ -1092,9 +1651,7 @@ def test_database_rejects_decision_link_to_discussion_from_another_revision(
         login(client, users["secretariat"])
         meeting_data = create_meeting(client, notetaker_id=users["secretariat"].id)
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
-        agenda = client.post(
-            f"{meeting_url}/agendas", json={"agenda_number": 1, "title": "Agenda"}
-        ).json()
+        agenda = client.post(f"{meeting_url}/agendas", json={"title": "Agenda"}).json()
         client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
         first = client.post(
             f"{meeting_url}/minutes-revisions",
@@ -1131,9 +1688,7 @@ def test_stale_structured_revision_rolls_back_root_and_all_children(
         login(client, users["secretariat"])
         meeting_data = create_meeting(client, notetaker_id=users["secretariat"].id)
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
-        agenda = client.post(
-            f"{meeting_url}/agendas", json={"agenda_number": 1, "title": "Agenda"}
-        ).json()
+        agenda = client.post(f"{meeting_url}/agendas", json={"title": "Agenda"}).json()
         client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
         first = client.post(
             f"{meeting_url}/minutes-revisions",
@@ -1154,7 +1709,7 @@ def test_stale_structured_revision_rolls_back_root_and_all_children(
     assert session.execute(text("SELECT count(*) FROM minutes_decisions")).scalar_one() == 1
 
 
-def test_structured_minutes_keep_csrf_notetaker_and_live_authorization(
+def test_structured_minutes_keep_csrf_and_live_core_role_authorization(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     _, users = meeting_context
@@ -1166,9 +1721,7 @@ def test_structured_minutes_keep_csrf_notetaker_and_live_authorization(
             notetaker_id=users["secretariat"].id,
         )
         live_url = f"/api/v1/meetings/{live_meeting['id']}"
-        agenda = client.post(
-            f"{live_url}/agendas", json={"agenda_number": 1, "title": "Agenda"}
-        ).json()
+        agenda = client.post(f"{live_url}/agendas", json={"title": "Agenda"}).json()
         client.post(f"{live_url}/transition", json={"to_status": "LIVE"})
         client.headers.pop("X-CSRF-Token")
         missing_csrf = client.post(
@@ -1177,8 +1730,8 @@ def test_structured_minutes_keep_csrf_notetaker_and_live_authorization(
         )
 
     with TestClient(app) as rector_client:
-        login(rector_client, users["rector"])
-        notetaker_denied = rector_client.post(
+        login(rector_client, users["other_rector"])
+        other_core_editor = rector_client.post(
             f"{live_url}/minutes-revisions",
             json=_structured_minutes_payload(agenda["id"]),
         )
@@ -1191,16 +1744,14 @@ def test_structured_minutes_keep_csrf_notetaker_and_live_authorization(
             meeting_number="RAPIM-2026-002",
         )
         draft_url = f"/api/v1/meetings/{draft_meeting['id']}"
-        draft_agenda = draft_client.post(
-            f"{draft_url}/agendas", json={"agenda_number": 1, "title": "Agenda"}
-        ).json()
+        draft_agenda = draft_client.post(f"{draft_url}/agendas", json={"title": "Agenda"}).json()
         not_live = draft_client.post(
             f"{draft_url}/minutes-revisions",
             json=_structured_minutes_payload(draft_agenda["id"]),
         )
 
     assert missing_csrf.status_code == 403
-    assert notetaker_denied.status_code == 403
+    assert other_core_editor.status_code == 201
     assert not_live.status_code == 409
 
 
@@ -1212,9 +1763,7 @@ def test_structured_review_and_finalization_remain_bound_to_the_active_revision(
         login(client, users["secretariat"])
         meeting_data = create_meeting(client, notetaker_id=users["rector"].id)
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
-        agenda = client.post(
-            f"{meeting_url}/agendas", json={"agenda_number": 1, "title": "Agenda"}
-        ).json()
+        agenda = client.post(f"{meeting_url}/agendas", json={"title": "Agenda"}).json()
         client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
         login(notetaker_client, users["rector"])
         first = notetaker_client.post(
@@ -1238,20 +1787,20 @@ def test_structured_review_and_finalization_remain_bound_to_the_active_revision(
 
     assert second.status_code == 201
     assert finalization.status_code == 409
-    assert session.get(Meeting, UUID(meeting_data["id"])).status is MeetingStatus.LIVE
+    meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert meeting is not None
+    assert meeting.status is MeetingStatus.LIVE
 
 
 def test_decision_brief_versions_keep_editorial_data_and_traceable_source(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     _, users = meeting_context
-    with TestClient(app) as client:
+    with TestClient(app, raise_server_exceptions=False) as client:
         login(client, users["secretariat"])
         meeting_data = create_meeting(client, notetaker_id=users["secretariat"].id)
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
-        agenda = client.post(
-            f"{meeting_url}/agendas", json={"agenda_number": 1, "title": "Agenda sumber"}
-        ).json()
+        agenda = client.post(f"{meeting_url}/agendas", json={"title": "Agenda sumber"}).json()
         client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
         first_revision = client.post(
             f"{meeting_url}/minutes-revisions",
@@ -1265,8 +1814,9 @@ def test_decision_brief_versions_keep_editorial_data_and_traceable_source(
             "decisions": [
                 {
                     "decision_id": first_decision["id"],
-                    "priority": "Prioritas utama",
-                    "editorial_note": "Perlu koordinasi lintas unit.",
+                    "brief_text": "Prioritaskan pelaporan triwulan.",
+                    "priority": "",
+                    "editorial_note": None,
                 }
             ],
         }
@@ -1283,7 +1833,7 @@ def test_decision_brief_versions_keep_editorial_data_and_traceable_source(
         stale_create = client.post(f"{meeting_url}/decision-briefs", json=brief_request)
         history_after = client.get(f"{meeting_url}/decision-briefs")
 
-    assert created.status_code == 201
+    assert created.status_code == 201, created.text
     brief = created.json()
     assert brief["version_number"] == 1
     assert brief["source_minutes_revision_id"] == first_revision["id"]
@@ -1292,8 +1842,9 @@ def test_decision_brief_versions_keep_editorial_data_and_traceable_source(
     assert brief["notes"] == brief_request["notes"]
     assert brief["decisions"][0]["decision_id"] == first_decision["id"]
     assert brief["decisions"][0]["source_decision_text"] == first_decision["decision_text"]
-    assert brief["decisions"][0]["priority"] == "Prioritas utama"
-    assert brief["decisions"][0]["editorial_note"] == "Perlu koordinasi lintas unit."
+    assert brief["decisions"][0]["brief_text"] == "Prioritaskan pelaporan triwulan."
+    assert brief["decisions"][0]["priority"] == ""
+    assert brief["decisions"][0]["editorial_note"] is None
     assert history_before.status_code == 200
     assert history_before.json() == [brief]
     assert history_after.status_code == 200
@@ -1318,12 +1869,8 @@ def test_decision_brief_rejects_source_decisions_from_other_meetings_or_revision
         )
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
         other_url = f"/api/v1/meetings/{other_meeting['id']}"
-        agenda = client.post(
-            f"{meeting_url}/agendas", json={"agenda_number": 1, "title": "Agenda utama"}
-        ).json()
-        other_agenda = client.post(
-            f"{other_url}/agendas", json={"agenda_number": 1, "title": "Agenda lain"}
-        ).json()
+        agenda = client.post(f"{meeting_url}/agendas", json={"title": "Agenda utama"}).json()
+        other_agenda = client.post(f"{other_url}/agendas", json={"title": "Agenda lain"}).json()
         client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
         client.post(f"{other_url}/transition", json={"to_status": "LIVE"})
         first = client.post(
@@ -1365,7 +1912,7 @@ def test_decision_brief_rejects_source_decisions_from_other_meetings_or_revision
     assert session.execute(text("SELECT count(*) FROM decision_brief_decisions")).scalar_one() == 0
 
 
-def test_decision_brief_requires_csrf_and_limits_creation_to_secretariat(
+def test_decision_brief_requires_csrf_and_denies_rektor_creation(
     meeting_context: tuple[Session, dict[str, User]],
 ) -> None:
     _, users = meeting_context
@@ -1378,7 +1925,7 @@ def test_decision_brief_requires_csrf_and_limits_creation_to_secretariat(
         )
         meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
         agenda = secretariat_client.post(
-            f"{meeting_url}/agendas", json={"agenda_number": 1, "title": "Agenda uji"}
+            f"{meeting_url}/agendas", json={"title": "Agenda uji"}
         ).json()
         secretariat_client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
         revision = secretariat_client.post(
@@ -1420,7 +1967,538 @@ def test_decision_brief_requires_csrf_and_limits_creation_to_secretariat(
 
     assert missing_csrf.status_code == 403
     assert read_history.status_code == 200
-    assert leadership_create.status_code == 201
+    assert leadership_create.status_code == 403
     assert hidden_history.status_code == 404
-    assert out_of_scope_history.status_code == 404
+    assert out_of_scope_history.status_code == 200
     assert hidden_admin_create.status_code == 404
+
+
+def test_decision_brief_approval_requires_final_valid_and_records_one_approver(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as secretariat_client:
+        login(secretariat_client, users["secretariat"])
+        meeting_data = create_meeting(
+            secretariat_client,
+            chairperson_id=users["rector"].id,
+            notetaker_id=users["secretariat"].id,
+        )
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        agenda = secretariat_client.post(
+            f"{meeting_url}/agendas",
+            json={"title": "Agenda approval sintetis"},
+        ).json()
+        assert (
+            secretariat_client.post(
+                f"{meeting_url}/transition", json={"to_status": "LIVE"}
+            ).status_code
+            == 200
+        )
+        revision = secretariat_client.post(
+            f"{meeting_url}/minutes-revisions",
+            json=_structured_minutes_payload(agenda["id"]),
+        ).json()
+        decision = revision["discussions"][0]["decisions"][0]
+        brief = secretariat_client.post(
+            f"{meeting_url}/decision-briefs",
+            json={
+                "source_minutes_revision_id": revision["id"],
+                "summary": "Ringkasan approval sintetis.",
+                "decisions": [{"decision_id": decision["id"], "priority": "Utama"}],
+            },
+        ).json()
+        brief_url = f"{meeting_url}/decision-briefs/{brief['id']}"
+        before_final = secretariat_client.post(f"{brief_url}/submit")
+        invalid_review = secretariat_client.post(
+            f"{meeting_url}/minutes-reviews",
+            json={"minutes_revision_id": revision["id"], "result": "INVALID"},
+        )
+        invalid_review_submit = secretariat_client.post(f"{brief_url}/submit")
+        valid_review = secretariat_client.post(
+            f"{meeting_url}/minutes-reviews",
+            json={"minutes_revision_id": revision["id"], "result": "VALID"},
+        )
+        finalized = secretariat_client.post(
+            f"{meeting_url}/transition", json={"to_status": "FINAL"}
+        )
+
+    with TestClient(app) as rector_submitter_client:
+        login(rector_submitter_client, users["rector"])
+        submitted = rector_submitter_client.post(f"{brief_url}/submit")
+
+    with TestClient(app) as secretariat_client:
+        login(secretariat_client, users["secretariat"])
+        self_approval = secretariat_client.post(f"{brief_url}/approve")
+        self_rejection = secretariat_client.post(
+            f"{brief_url}/reject",
+            json={"reason": "Pengaju tidak dapat meninjau versinya sendiri."},
+        )
+
+    with TestClient(app) as pic_client:
+        login(pic_client, users["pic"])
+        unauthorized_submit = pic_client.post(f"{brief_url}/submit")
+
+    with TestClient(app) as rector_client:
+        login(rector_client, users["rector"])
+        blank_rejection = rector_client.post(f"{brief_url}/reject", json={"reason": "  "})
+        rejected = rector_client.post(
+            f"{brief_url}/reject", json={"reason": "Perlu perbaikan data sumber."}
+        )
+
+    with TestClient(app) as secretariat_client:
+        login(secretariat_client, users["secretariat"])
+        second_brief_response = secretariat_client.post(
+            f"{meeting_url}/decision-briefs",
+            json={
+                "source_minutes_revision_id": revision["id"],
+                "summary": "Ringkasan approval sintetis versi baru.",
+                "decisions": [{"decision_id": decision["id"], "priority": "Utama"}],
+            },
+        )
+        second_brief = second_brief_response.json()
+        second_brief_url = f"{meeting_url}/decision-briefs/{second_brief['id']}"
+        second_submit = secretariat_client.post(f"{second_brief_url}/submit")
+        withdrawn = secretariat_client.post(f"{second_brief_url}/withdraw")
+        resubmitted = secretariat_client.post(f"{second_brief_url}/submit")
+
+    with TestClient(app) as rector_client:
+        login(rector_client, users["rector"])
+        approved = rector_client.post(f"{second_brief_url}/approve")
+        history = rector_client.get(f"{meeting_url}/decision-briefs")
+
+    assert before_final.status_code == 409
+    assert invalid_review.status_code == 201
+    assert invalid_review_submit.status_code == 409
+    assert valid_review.status_code == 201
+    assert finalized.status_code == 200
+    assert submitted.status_code == 200
+    assert self_approval.status_code == 403
+    assert self_rejection.status_code == 403
+    assert unauthorized_submit.status_code == 404
+    assert blank_rejection.status_code == 422
+    assert rejected.status_code == 200
+    assert second_brief_response.status_code == 201
+    assert second_submit.status_code == 200
+    assert withdrawn.status_code == 200
+    assert resubmitted.status_code == 200
+    assert approved.status_code == 200
+    rejected_brief, approved_brief = history.json()
+    assert rejected_brief["id"] == brief["id"]
+    assert rejected_brief["approval_state"] == "REJECTED"
+    assert [event["event_type"] for event in rejected_brief["approval_events"]] == [
+        "SUBMITTED",
+        "REJECTED",
+    ]
+    assert rejected_brief["approval_events"][0]["actor_user_id"] == str(users["rector"].id)
+    assert rejected_brief["approval_events"][0]["actor_roles"] == ["REKTOR"]
+    assert rejected_brief["approval_events"][-1]["reason"] == "Perlu perbaikan data sumber."
+    assert approved_brief["id"] == second_brief["id"]
+    assert approved_brief["version_number"] == 2
+    assert approved_brief["approval_state"] == "APPROVED"
+    assert [event["event_type"] for event in approved_brief["approval_events"]] == [
+        "SUBMITTED",
+        "WITHDRAWN",
+        "SUBMITTED",
+        "APPROVED",
+    ]
+    assert approved_brief["approval_events"][-1]["actor_user_id"] == str(users["rector"].id)
+    assert approved_brief["approval_events"][-1]["actor_roles"] == ["REKTOR"]
+    rejected_audits = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.object_id == UUID(brief["id"]))
+        .order_by(AuditEvent.occurred_at)
+        .all()
+    )
+    approved_audits = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.object_id == UUID(second_brief["id"]))
+        .order_by(AuditEvent.occurred_at)
+        .all()
+    )
+    assert [
+        event.action for event in rejected_audits if event.action != "decision_brief.saved"
+    ] == [
+        "decision_brief.submitted",
+        "decision_brief.rejected",
+    ]
+    assert [
+        event.action for event in approved_audits if event.action != "decision_brief.saved"
+    ] == [
+        "decision_brief.submitted",
+        "decision_brief.withdrawn",
+        "decision_brief.submitted",
+        "decision_brief.approved",
+    ]
+    assert all(
+        sum(event.action == "decision_brief.saved" for event in events) == 1
+        for events in (rejected_audits, approved_audits)
+    )
+    assert all(
+        "Ringkasan approval sintetis" not in str(event.after_values)
+        for event in rejected_audits + approved_audits
+    )
+
+
+def test_manager_legal_can_approve_pending_decision_brief(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as secretariat_client:
+        login(secretariat_client, users["secretariat"])
+        meeting_data = create_meeting(
+            secretariat_client,
+            notetaker_id=users["secretariat"].id,
+        )
+        meeting = session.get(Meeting, UUID(meeting_data["id"]))
+        assert meeting is not None
+        meeting.chairperson_id = users["manager_legal"].id
+        session.commit()
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        agenda = secretariat_client.post(
+            f"{meeting_url}/agendas",
+            json={"title": "Agenda persetujuan Manager Legal sintetis"},
+        ).json()
+        assert (
+            secretariat_client.post(
+                f"{meeting_url}/transition", json={"to_status": "LIVE"}
+            ).status_code
+            == 200
+        )
+        revision = secretariat_client.post(
+            f"{meeting_url}/minutes-revisions",
+            json=_structured_minutes_payload(agenda["id"]),
+        ).json()
+        decision = revision["discussions"][0]["decisions"][0]
+        assert (
+            secretariat_client.post(
+                f"{meeting_url}/minutes-reviews",
+                json={"minutes_revision_id": revision["id"], "result": "VALID"},
+            ).status_code
+            == 201
+        )
+        assert (
+            secretariat_client.post(
+                f"{meeting_url}/transition", json={"to_status": "FINAL"}
+            ).status_code
+            == 200
+        )
+        brief = secretariat_client.post(
+            f"{meeting_url}/decision-briefs",
+            json={
+                "source_minutes_revision_id": revision["id"],
+                "summary": "Ringkasan untuk persetujuan Manager Legal.",
+                "decisions": [{"decision_id": decision["id"], "priority": "Utama"}],
+            },
+        ).json()
+        brief_url = f"{meeting_url}/decision-briefs/{brief['id']}"
+        submitted = secretariat_client.post(f"{brief_url}/submit")
+
+    with TestClient(app) as manager_legal_client:
+        login(manager_legal_client, users["manager_legal"])
+        manager_legal_notifications = manager_legal_client.get("/api/v1/notifications").json()
+        approved = manager_legal_client.post(f"{brief_url}/approve")
+        history = manager_legal_client.get(f"{meeting_url}/decision-briefs")
+
+    assert submitted.status_code == 200
+    assert approved.status_code == 200
+    assert manager_legal_notifications["unread_count"] == 1
+    assert (
+        manager_legal_notifications["items"][0]["notification_type"]
+        == "DECISION_BRIEF_REVIEW_NEEDED"
+    )
+    approved_brief = history.json()[0]
+    assert approved_brief["approval_state"] == "APPROVED"
+    approval_event = approved_brief["approval_events"][-1]
+    assert approval_event["event_type"] == "APPROVED"
+    assert approval_event["actor_user_id"] == str(users["manager_legal"].id)
+    assert approval_event["actor_roles"] == ["MANAGER_LEGAL"]
+
+
+def test_decision_brief_workflow_notifies_direct_reviewer_and_author_only(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as secretariat_client:
+        login(secretariat_client, users["secretariat"])
+        meeting_data = create_meeting(
+            secretariat_client,
+        )
+        meeting = session.get(Meeting, UUID(meeting_data["id"]))
+        assert meeting is not None
+        meeting.chairperson_id = users["rector"].id
+        meeting.notetaker_id = users["secretariat"].id
+        session.commit()
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        agenda_response = secretariat_client.post(
+            f"{meeting_url}/agendas",
+            json={"title": "Agenda notification sintetis"},
+        )
+        assert agenda_response.status_code == 201, agenda_response.text
+        agenda = agenda_response.json()
+        assert (
+            secretariat_client.post(
+                f"{meeting_url}/transition", json={"to_status": "LIVE"}
+            ).status_code
+            == 200
+        )
+        revision = secretariat_client.post(
+            f"{meeting_url}/minutes-revisions",
+            json=_structured_minutes_payload(agenda["id"]),
+        ).json()
+        decision = revision["discussions"][0]["decisions"][0]
+        assert (
+            secretariat_client.post(
+                f"{meeting_url}/minutes-reviews",
+                json={"minutes_revision_id": revision["id"], "result": "VALID"},
+            ).status_code
+            == 201
+        )
+        assert (
+            secretariat_client.post(
+                f"{meeting_url}/transition", json={"to_status": "FINAL"}
+            ).status_code
+            == 200
+        )
+        brief = secretariat_client.post(
+            f"{meeting_url}/decision-briefs",
+            json={
+                "source_minutes_revision_id": revision["id"],
+                "summary": "Confidential brief body stays out of notification.",
+                "decisions": [{"decision_id": decision["id"], "priority": "Utama"}],
+            },
+        ).json()
+        brief_url = f"{meeting_url}/decision-briefs/{brief['id']}"
+        submitted = secretariat_client.post(f"{brief_url}/submit")
+
+    with TestClient(app) as reviewer_client:
+        login(reviewer_client, users["rector"])
+        reviewer_page = reviewer_client.get("/api/v1/notifications").json()
+        approved = reviewer_client.post(f"{brief_url}/approve")
+
+    with TestClient(app) as author_client:
+        login(author_client, users["secretariat"])
+        author_page = author_client.get("/api/v1/notifications").json()
+
+    assert submitted.status_code == 200
+    assert approved.status_code == 200
+    assert len(reviewer_page["items"]) == 1
+    reviewer_notification = reviewer_page["items"][0]
+    assert reviewer_notification["notification_type"] == "DECISION_BRIEF_REVIEW_NEEDED"
+    assert reviewer_notification["target_type"] == "MEETING"
+    assert reviewer_notification["target_id"] == meeting_data["id"]
+    assert "Confidential brief body" not in reviewer_notification["message"]
+    assert meeting_data["meeting_number"] not in reviewer_notification["message"]
+    assert len(author_page["items"]) == 1
+    assert author_page["items"][0]["notification_type"] == "DECISION_BRIEF_REVIEW_COMPLETED"
+
+
+def test_decision_brief_audit_failure_rolls_back_workflow_event(
+    meeting_context: tuple[Session, dict[str, User]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(
+            client,
+            chairperson_id=users["rector"].id,
+            notetaker_id=users["secretariat"].id,
+        )
+        meeting_url = f"/api/v1/meetings/{meeting_data['id']}"
+        agenda = client.post(
+            f"{meeting_url}/agendas",
+            json={"title": "Agenda rollback sintetis"},
+        ).json()
+        client.post(f"{meeting_url}/transition", json={"to_status": "LIVE"})
+        revision = client.post(
+            f"{meeting_url}/minutes-revisions",
+            json=_structured_minutes_payload(agenda["id"]),
+        ).json()
+        decision = revision["discussions"][0]["decisions"][0]
+        brief = client.post(
+            f"{meeting_url}/decision-briefs",
+            json={
+                "source_minutes_revision_id": revision["id"],
+                "summary": "Ringkasan rollback sintetis.",
+                "decisions": [{"decision_id": decision["id"], "priority": "Utama"}],
+            },
+        ).json()
+        client.post(
+            f"{meeting_url}/minutes-reviews",
+            json={"minutes_revision_id": revision["id"], "result": "VALID"},
+        )
+        client.post(f"{meeting_url}/transition", json={"to_status": "FINAL"})
+
+    original_commit = Session.commit
+
+    def fail_after_flush(target_session: Session) -> None:
+        if any(
+            isinstance(item, DecisionBriefApprovalEvent)
+            for item in target_session.identity_map.values()
+        ):
+            target_session.flush()
+            raise SQLAlchemyError("Synthetic approval transaction failure")
+        original_commit(target_session)
+
+    monkeypatch.setattr(Session, "commit", fail_after_flush)
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        response = client.post(f"{meeting_url}/decision-briefs/{brief['id']}/submit")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Decision Brief workflow could not be recorded"
+    assert response.headers["X-Correlation-ID"]
+    assert session.query(DecisionBriefApprovalEvent).count() == 0
+    assert (
+        session.query(AuditEvent)
+        .filter_by(action="decision_brief.submitted", object_id=UUID(brief["id"]))
+        .count()
+        == 0
+    )
+
+
+def test_meeting_transition_writes_redacted_audit_event_with_server_role_snapshot(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client, users["rector"].id)
+        response = client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/transition",
+            json={"to_status": "LIVE"},
+            headers={"X-Correlation-ID": "caller-controlled-value"},
+        )
+
+    assert response.status_code == 200
+    correlation_id = response.headers["X-Correlation-ID"]
+    assert UUID(correlation_id)
+    assert correlation_id != "caller-controlled-value"
+    audit_event = session.query(AuditEvent).one()
+    assert audit_event.actor_user_id == users["secretariat"].id
+    assert audit_event.actor_roles == ["SEKRETARIAT"]
+    assert audit_event.action == "meeting.status_changed"
+    assert audit_event.object_type == "meeting"
+    assert audit_event.object_id == UUID(meeting_data["id"])
+    assert audit_event.result == "SUCCEEDED"
+    assert audit_event.correlation_id == UUID(correlation_id)
+    assert audit_event.before_values == {"status": "DRAFT"}
+    assert audit_event.after_values == {"status": "LIVE"}
+    assert audit_event.occurred_at is not None
+    assert session.query(MeetingStatusEvent).count() == 1
+
+
+def test_unauthorized_meeting_transition_is_audited_without_business_change(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+    with TestClient(app) as secretariat_client:
+        login(secretariat_client, users["secretariat"])
+        meeting_data = create_meeting(secretariat_client, users["rector"].id)
+
+    with TestClient(app) as rector_client:
+        login(rector_client, users["rector"])
+        response = rector_client.post(
+            f"/api/v1/meetings/{meeting_data['id']}/transition",
+            json={"to_status": "LIVE"},
+        )
+
+    assert response.status_code == 403
+    audit_event = session.query(AuditEvent).one()
+    assert audit_event.actor_user_id == users["rector"].id
+    assert audit_event.actor_roles == ["REKTOR"]
+    assert audit_event.action == "meeting.status_changed"
+    assert audit_event.result == "DENIED"
+    assert audit_event.before_values is None
+    assert audit_event.after_values is None
+    assert audit_event.correlation_id == UUID(response.headers["X-Correlation-ID"])
+    assert session.query(MeetingStatusEvent).count() == 0
+    meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert meeting is not None
+    assert meeting.status is MeetingStatus.DRAFT
+
+
+def test_audit_insert_failure_rolls_back_meeting_transition(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    session, users = meeting_context
+
+    def fail_audit_insert(
+        _mapper: Mapper[AuditEvent], _connection: Connection, _target: AuditEvent
+    ) -> None:
+        raise SQLAlchemyError("synthetic audit storage failure")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        login(client, users["secretariat"])
+        meeting_data = create_meeting(client)
+        event.listen(AuditEvent, "before_insert", fail_audit_insert)
+        try:
+            response = client.post(
+                f"/api/v1/meetings/{meeting_data['id']}/transition",
+                json={"to_status": "LIVE"},
+            )
+        finally:
+            event.remove(AuditEvent, "before_insert", fail_audit_insert)
+
+    assert response.status_code == 500
+    assert UUID(response.headers["X-Correlation-ID"])
+    session.rollback()
+    meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert meeting is not None
+    assert meeting.status is MeetingStatus.DRAFT
+    assert session.query(MeetingStatusEvent).count() == 0
+    assert session.query(AuditEvent).count() == 0
+
+
+def test_audit_event_payload_rejects_fields_outside_status_allowlist(
+    meeting_context: tuple[Session, dict[str, User]],
+) -> None:
+    _, users = meeting_context
+    with pytest.raises(ValidationError):
+        AuditEventCreate.model_validate(
+            {
+                "actor_user_id": users["secretariat"].id,
+                "actor_roles": ["SEKRETARIAT"],
+                "action": "meeting.status_changed",
+                "object_type": "meeting",
+                "object_id": uuid4(),
+                "result": "SUCCEEDED",
+                "before_values": {"status": "DRAFT", "title": "Sensitive meeting title"},
+            }
+        )
+
+
+def test_denial_audit_failure_preserves_forbidden_response_and_alerts(
+    meeting_context: tuple[Session, dict[str, User]], caplog: pytest.LogCaptureFixture
+) -> None:
+    session, users = meeting_context
+
+    def fail_audit_insert(
+        _mapper: Mapper[AuditEvent], _connection: Connection, _target: AuditEvent
+    ) -> None:
+        raise SQLAlchemyError("synthetic audit storage failure")
+
+    with TestClient(app) as secretariat_client:
+        login(secretariat_client, users["secretariat"])
+        meeting_data = create_meeting(secretariat_client, users["rector"].id)
+
+    with TestClient(app) as rector_client:
+        login(rector_client, users["rector"])
+        event.listen(AuditEvent, "before_insert", fail_audit_insert)
+        try:
+            response = rector_client.post(
+                f"/api/v1/meetings/{meeting_data['id']}/transition",
+                json={"to_status": "LIVE"},
+            )
+        finally:
+            event.remove(AuditEvent, "before_insert", fail_audit_insert)
+
+    assert response.status_code == 403
+    assert "Denied meeting transition could not be recorded" in caplog.text
+    session.rollback()
+    meeting = session.get(Meeting, UUID(meeting_data["id"]))
+    assert meeting is not None
+    assert meeting.status is MeetingStatus.DRAFT
+    assert session.query(MeetingStatusEvent).count() == 0
+    assert session.query(AuditEvent).count() == 0

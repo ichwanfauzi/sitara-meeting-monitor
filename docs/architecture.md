@@ -175,17 +175,17 @@ Untuk `is_action_item`, validasi konsistensinya dalam service/transaksi dan tamb
 - `MENUNGGU_ACC`
 - `SELESAI`
 
-Simpan perubahan dalam `status_histories` dengan `old_status`, `new_status`, `changed_by`, waktu, dan catatan. Hanya pengguna SEKRETARIAT yang berwenang boleh mengubah status resmi melalui API. Perubahan status, history, audit, dan informasi `completed_at` harus berada dalam transaksi yang sama. `SELESAI` mensyaratkan record verifikasi Sekretariat.
+Simpan perubahan dalam `status_histories` dengan `old_status`, `new_status`, `changed_by`, waktu, dan catatan. Hanya pengguna aktif Sekretariat atau Manager Legal yang berwenang boleh mengubah status resmi melalui API; PIC dan Super Admin ditolak, termasuk pada akun campuran. Perubahan status, history, audit, dan informasi `completed_at` harus berada dalam transaksi yang sama. `SELESAI` mensyaratkan record verifikasi Sekretariat atau Manager Legal.
 
 ### 6.2 Assignment dan delegasi
 
-Satu tugas memiliki satu PIC utama aktif dan dapat memiliki beberapa PIC pendukung. `assignments` menyimpan penerima, pemberi, peran assignment, dan opsional parent assignment untuk jejak delegasi. Service wajib memeriksa garis pelaporan/unit dan memastikan pengguna tidak membuat delegasi di luar kewenangannya. Tugas bisa mempunyai beberapa assignment, tetapi hal itu tidak berarti setiap assignment boleh mengubah status resmi.
+Satu tugas memiliki satu PIC utama aktif dan dapat memiliki beberapa PIC pendukung. `assignments` menyimpan penerima akun atau `assignee_display_name` untuk PIC yang tidak memiliki akun. Sekretariat dan Manager Legal aktif tanpa `SUPER_ADMIN` dapat membuat atau mengelola tindak lanjut dan menetapkan PIC dari roster inti tujuh pengguna yang memiliki keanggotaan unit aktif; Rektor/Warek dapat menjadi PIC tetapi tidak dapat membuat atau menetapkan tindak lanjut. PIC dan Super Admin tidak mewarisi kewenangan pengelola pada akun campuran. Tugas baru memerlukan unit penanggung jawab aktif; PIC akun memilih unit asal dari keanggotaan aktifnya, sedangkan PIC nama bebas tidak memiliki unit asal terverifikasi. Alasan penugasan opsional dan tidak dicatat dalam audit umum. Kolom provenance nullable dipertahankan untuk riwayat legacy. Migration `0019_assignment_audit` mencatat assignment, penggantian PIC utama, dan pengakhiran PIC pendukung sebagai event dalam transaksi yang sama. Sekretariat dan Manager Legal yang berwenang dapat mengubah status resmi tugas.
 
 ### 6.3 Fondasi organisasi aktif
 
-Migration `0008_organization_scope` menambahkan `organization_units`, `user_unit_memberships`, dan `reporting_lines`. Keanggotaan dan garis pelaporan memiliki waktu efektif UTC dengan rentang setengah terbuka `[valid_from, valid_until)`. Unit dapat memiliki parent, sementara satu pengguna dapat memiliki beberapa keanggotaan dan atasan aktif untuk mendukung struktur matriks. Migration tidak mengisi unit, pegawai, atau garis pelaporan; data tersebut menunggu bagan dan roster yang disetujui.
+Migration `0008_organization_scope` menambahkan `organization_units`, `user_unit_memberships`, dan `reporting_lines`. Keanggotaan dan garis pelaporan memiliki waktu efektif UTC dengan rentang setengah terbuka `[valid_from, valid_until)`. Unit dapat memiliki parent, sementara satu pengguna dapat memiliki beberapa keanggotaan dan atasan aktif untuk mendukung struktur matriks. Migration tidak mengisi unit, pegawai, atau garis pelaporan production; data tersebut menunggu bagan dan roster yang disetujui. Pengecualian terbatas untuk demo/test: seed opt-in dapat membuat tiga PIC sintetis, unit `SITARA-DEMO`, dan reporting line dari semua akun seed Rektor/Warek hanya pada database testing disposable yang terpisah. Seed ini tidak mengubah role, API, atau kebijakan authorization production.
 
-Helper `app.services.organization` mengecek akun aktif, role yang dibaca dari database, keanggotaan unit aktif, dan jalur pelaporan transitif saat ini. Sekretariat aktif tanpa `SUPER_ADMIN` memiliki cakupan tugas operasional dan dapat menunjuk PIC aktif yang memiliki keanggotaan unit. PIC dibatasi pada tugas yang memuat dirinya sebagai PIC utama/pendukung aktif. Rektor/Warek hanya dapat membaca tugas dan mengirim laporan progres, permintaan penyelesaian, atau bukti jika jalur pelaporan aktifnya mencapai PIC utama atau pendukung tugas tersebut; mereka tidak dapat mengubah status resmi. Helper menolak seluruh cakupan manager bila graph pelaporan yang dapat dicapai mengandung siklus. ID PIC harus berasal dari assignment aktif tersimpan yang dimuat backend.
+Helper `app.services.organization` mengecek akun aktif dan role yang dibaca dari database. Direktori PIC untuk tindak lanjut hanya mengembalikan pengguna inti aktif dengan keanggotaan unit aktif; hanya Sekretariat dan Manager Legal yang dapat melihat direktori dan menetapkan assignee. Setiap assignment tetap divalidasi di server. PIC berbentuk nama bebas disimpan dalam histori assignment tanpa user ID. PIC berakun dibatasi pada tugas yang memuat dirinya sebagai PIC utama/pendukung aktif. Rektor dan Warek dapat membaca serta memantau tugas dalam cakupannya, dan dapat menjadi assignee; mereka tidak dapat membuat atau menetapkan tugas. Kolom organisasi dan garis pelaporan tetap dipertahankan untuk data historis serta fitur organisasi lain; formulir tindak lanjut Rapim saat ini tidak meminta unit.
 
 Sebelum data organisasi diprovisikan, pemilik proses perlu memberikan bagan unit dan roster pegawai. Proses provisioning berikutnya harus memvalidasi periode tumpang tindih dan siklus hierarki serta mencatat perubahan secara audit. Migration menjaga data dengan FK `RESTRICT` dan menolak downgrade ketika ada baris organisasi.
 
@@ -212,14 +212,16 @@ Menyembunyikan tombol di frontend hanya membantu UX dan tidak dianggap security 
 
 ### 7.3 Aturan penting
 
-- PIC tidak mengakses notulen lengkap/Decision Brief terbatas melalui route, API, search, export, atau storage.
-- Notulis yang ditetapkan satu-satunya editor selama rapat `LIVE`.
-- Hanya pengguna aktif Sekretariat tanpa role `SUPER_ADMIN` yang dapat mencatat pemeriksaan notulensi; pemeriksa yang sama boleh melakukan finalisasi rapat.
+- Pengguna aktif Sekretariat, Manager Legal, Rektor, dan Warek dapat membaca semua Rapim, notulen lengkap, dan Decision Brief; PIC dan Super Admin tetap ditolak, termasuk pada akun campuran.
+- Sekretariat, Manager Legal, Rektor, dan Warek dapat menambahkan revisi notulen selama rapat `LIVE`; PIC dan Super Admin tetap ditolak. Notulis opsional dicatat saat rapat dibuat untuk atribusi, bukan sebagai gerbang edit. Konflik revisi usang tetap ditolak oleh kontrol `base_revision_id`.
+- Sekretariat, Manager Legal, dan Warek dapat membuat rapat. Nomor rapat dapat diubah oleh ketiga peran pada semua status; field metadata lain hanya pada `DRAFT`/`LIVE`. Status rapat dikelola Sekretariat atau Manager Legal.
+- Hanya Sekretariat dan Manager Legal dapat membuat/mengelola Action Item; Rektor membaca dan Warek tidak dapat membuat tindak lanjut. PIC dipilih sebagai user inti atau nama bebas.
+- Pengguna aktif Sekretariat atau Manager Legal tanpa role `SUPER_ADMIN` dapat mencatat pemeriksaan notulensi dan mengelola status rapat; pemeriksa yang sama boleh melakukan finalisasi.
 - Notulen disimpan sebagai snapshot append-only per revisi dengan urutan rapat. `format_version=1` menjaga teks lama tetap terbaca; `format_version=2` menyimpan pembahasan dan putusan terstruktur per agenda sebagai baris turunan immutable. Composite foreign key membatasi setiap pembahasan ke agenda dan revisi rapat yang sama serta setiap putusan ke pembahasan dalam revisi yang sama. Trigger migration menolak update/delete, dan PostgreSQL juga menolak `TRUNCATE`. Penulis mengirim `base_revision_id`; service mengunci rapat dan mengembalikan `409` jika base sudah usang.
 - Pemeriksaan menyimpan `minutes_revision_id`; composite foreign key memastikan revisi berasal dari rapat yang sama. Finalisasi `LIVE → FINAL` mengunci rapat dan mensyaratkan pemeriksaan terbaru `VALID` pada revisi aktif. Revisi baru otomatis membuat pemeriksaan lama tidak memenuhi syarat tanpa mengubah riwayatnya.
-- Endpoint isi/revisi dan Decision Brief hanya mengembalikan konten bagi Sekretariat atau pimpinan yang berwenang pada rapat. PIC dan Super Admin ditolak, termasuk ketika memiliki role lain. Editor memakai konteks agenda rapat dan menyimpan satu snapshot lengkap melalui endpoint revisi yang sama; teks lama tidak dipindah otomatis ke agenda. Decision Brief menggunakan API `POST/GET /meetings/{meeting_id}/decision-briefs`; keputusan sumber dibaca melalui endpoint revisi notulensi yang sudah ada. Sekretariat dan pimpinan dengan akses objek rapat dapat membuat draf, sedangkan perubahan disimpan sebagai versi append-only. Persetujuan dan finalisasi Decision Brief belum diimplementasikan karena kewenangannya belum ditetapkan. Belum ada kolaborasi real-time.
+- Endpoint isi/revisi dan Decision Brief mengembalikan konten untuk Sekretariat, Manager Legal, Rektor, dan Warek pada semua Rapim. PIC dan Super Admin ditolak, termasuk ketika memiliki role lain. Keempat peran inti dapat menyimpan satu snapshot lengkap melalui endpoint revisi yang sama selama `LIVE`. Decision Brief menggunakan API `POST/GET /meetings/{meeting_id}/decision-briefs`; seluruh pengguna inti dapat membaca histori, sedangkan pembuatan dan perubahan mengikuti hak tulis yang ditetapkan. Setiap putusan sumber wajib tercakup dalam Decision Brief yang terkait dengan revisi tersebut. Revisi berkonflik tetap mendapat `409`; belum ada kolaborasi real-time.
 - Super Admin tidak otomatis mendapatkan izin bisnis untuk mengubah status tugas.
-- Hanya Sekretariat yang berwenang mengubah status resmi.
+- Sekretariat dan Manager Legal aktif tanpa `SUPER_ADMIN` berwenang mengubah status resmi; PIC dan Super Admin ditolak, termasuk pada akun campuran.
 - Akses ekspor dan unduh file tunduk pada policy yang sama dengan detail data.
 - Akun/role/session changes dicatat; jangan menyimpan kredensial atau konten dokumen penuh dalam audit log.
 
@@ -255,7 +257,11 @@ Menyembunyikan tombol di frontend hanya membantu UX dan tidak dianggap security 
 
 ### Notifikasi
 
-Mulai dengan record notifikasi in-app di database. Untuk pekerjaan background/delivery yang dapat gagal, pertimbangkan outbox pattern: transaksi bisnis menyimpan event/outbox, lalu worker memproses dan retry tanpa menggandakan notifikasi. Kanal email/eksternal hanya ditambahkan setelah endpoint, pengaturan institusi, dan kebutuhan privasi disetujui.
+Notifikasi in-app disimpan di database. `GET /api/v1/notifications` hanya mengembalikan record milik pengguna aktif beserta jumlah yang belum dibaca; `POST /api/v1/notifications/{id}/read` hanya dapat mengubah record milik pengguna tersebut. Peristiwa perubahan status Action Item ditujukan kepada PIC aktif terkait. Peristiwa review Decision Brief ditujukan kepada penulis/reviewer yang berkaitan dan berwenang. Pesan bersifat generik: tidak memuat judul tugas/rapat, isi dokumen, atau alasan penolakan. Komponen top bar menampilkan jumlah belum dibaca, tautan menuju objek target, dan aksi tandai dibaca; otorisasi endpoint target tetap menjadi batas keamanan.
+
+Notifikasi dibuat dalam transaksi bisnis untuk perubahan status Action Item dan workflow review Decision Brief. Email opsional dikirim melalui worker SMTP terpisah dari antrean durable pada tabel notifikasi; pengiriman mati secara default dan hanya notifikasi baru yang masuk antrean ketika diaktifkan. Worker memakai TLS, retry dengan batas percobaan, dan menyimpan hanya status serta tipe error tanpa detail SMTP. Isi email berasal dari teks generik berdasarkan tipe notifikasi, bukan isi bebas atau metadata objek. Override penerima untuk percobaan hanya diizinkan pada development/testing. Kredensial SMTP hanya diberikan ke worker melalui environment; jangan menaruhnya di source atau mengirimkannya melalui chat.
+
+Untuk uji Gmail lokal, gunakan `smtp.gmail.com:587`, akun pengirim dan Google App Password melalui `.env` lokal, serta override penerima hanya pada development/testing. Jalankan worker Compose dengan profile `notification-email`. Jangan aktifkan override pada production. Pengingat tenggat otomatis belum diimplementasikan.
 
 ### OCR dan AI
 
@@ -335,10 +341,10 @@ Pull request menjalankan lint, format check, type checks, tests, build, secret s
 
 - Modular monolith.
 - React + TypeScript + Vite; FastAPI; PostgreSQL; SQLAlchemy; Alembic.
-- Penomoran notulen manual.
-- Satu notulis editor saat live.
+- Nomor rapat dapat diedit oleh pengelola pada semua status; nomor agenda dibuat otomatis.
+- Sekretariat, Manager Legal, Rektor, dan Warek dapat mengedit notulensi saat live; PIC dan Super Admin tetap tidak dapat membaca isinya.
 - PIC utama dan satu atau lebih PIC pendukung.
-- Sekretariat memverifikasi dan mengubah status resmi.
+- Sekretariat dan Manager Legal memverifikasi penyelesaian serta mengubah status resmi.
 - Storage dokumen privat dan akses server-side.
 - TDD dan CI security gates.
 

@@ -1,4 +1,41 @@
 services:
+  api:
+    networks:
+      - api-db
+      - dev-api-publish
+
   postgres:
+    networks:
+      - dev-postgres-proxy
+
+  postgres-port-proxy:
+    image: haproxy:3.2.26-alpine3.24
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - type: bind
+        source: ./docker/postgres-proxy.cfg
+        target: /usr/local/etc/haproxy/haproxy.cfg
+        read_only: true
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - dev-postgres-proxy
+      - dev-postgres-publish
+
+networks:
+  dev-api-publish:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+
+  dev-postgres-proxy:
+    internal: true
+  dev-postgres-publish:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

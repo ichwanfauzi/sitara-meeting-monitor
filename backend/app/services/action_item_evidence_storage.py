@@ -7,12 +7,14 @@ import re
 import stat
 import unicodedata
 import uuid
-import xml.etree.ElementTree as ElementTree
 import zipfile
 import zlib
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from zlib import error as ZlibError
+
+from defusedxml import ElementTree
+from defusedxml.common import DefusedXmlException
 
 MAX_EVIDENCE_FILE_BYTES = 10 * 1024 * 1024
 _MAX_OOXML_ENTRIES = 1_000
@@ -151,6 +153,7 @@ def _validate_ooxml(extension: str, content: bytes) -> bool:
         zipfile.BadZipFile,
         KeyError,
         ElementTree.ParseError,
+        DefusedXmlException,
         ZeroDivisionError,
     ):
         return False

@@ -20,8 +20,8 @@ Before editing code, read:
 5. Do not test destructively against production. Use versioned Alembic migrations and isolated test databases.
 6. Enforce authorization server-side for every endpoint, object, search result, export, and file download.
 7. PIC must not access full restricted minutes/Decision Brief or mutate official status, including by direct API request.
-8. During a live meeting, only the designated notetaker can edit. Other authorized users are read-only.
-9. Only authorized Secretariat users can change official task status. Super Admin does not automatically gain this business permission.
+8. During a live meeting, active Rektor, Warek, and Secretariat users may edit minutes. The per-meeting notetaker identity is recorded but is not an exclusive edit gate; use revision concurrency controls. PIC and Super Admin remain unable to read full minutes.
+9. Authorized Secretariat and Manager Legal users have the same operational authority, including official task status changes. PIC and Super Admin do not inherit this business permission.
 10. A decision may generate zero or multiple action items. Each task has one active main PIC and may have supporting PICs.
 11. AI/OCR output remains a draft until a permitted human reviews it; never submit confidential data to an external service without approval.
 12. Keep changes small and layered. Do not add dependencies or design patterns without a concrete need.

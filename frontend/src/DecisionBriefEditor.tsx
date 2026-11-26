@@ -1,17 +1,24 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   ApiError,
+  approveDecisionBriefVersion,
   canCreateDecisionBrief,
+  canReviewDecisionBrief,
   createDecisionBriefVersion,
   getDecisionBriefHistory,
   getMeetings,
   getMinutesRevisions,
+  rejectDecisionBriefVersion,
+  submitDecisionBriefVersion,
+  withdrawDecisionBriefVersion,
   type AuthenticatedUser,
+  type DecisionBriefApprovalState,
   type DecisionBriefVersion,
   type MeetingSummary,
   type MinutesDecision,
   type MinutesRevision,
 } from './api';
+import MeetingDocumentSelection from './MeetingDocumentSelection';
 
 interface DecisionSource {
   decision: MinutesDecision;
@@ -21,21 +28,37 @@ interface DecisionSource {
 
 interface DecisionBriefEditorProps {
   authenticatedUser: AuthenticatedUser;
+  targetMeetingId?: string;
 }
 
-interface PreservedBriefDraft {
-  sourceRevisionId: string;
-  sourceRevisionNumber: number;
+interface PreservedBriefChanges {
   summary: string;
-  notes: string;
   decisions: Array<{
     sourceText: string;
     agendaTitle: string;
     discussionSubject: string | null;
-    priority: string;
-    editorialNote: string;
+    briefText: string;
   }>;
 }
+
+interface DecisionBriefTableRow {
+  id: string;
+  agendaTitle: string;
+  discussionSubject: string | null;
+  briefText: string;
+  picSuggestion: string | null;
+  outputExpected: string | null;
+  targetDate: string | null;
+  targetText: string | null;
+}
+
+const approvalStateLabels: Record<DecisionBriefApprovalState, string> = {
+  DRAFT: 'Belum diajukan',
+  PENDING_APPROVAL: 'Menunggu persetujuan',
+  APPROVED: 'Disetujui',
+  REJECTED: 'Ditolak',
+  WITHDRAWN: 'Ditarik',
+};
 
 function activeRevisionOf(revisions: MinutesRevision[]): MinutesRevision | null {
   return revisions.reduce<MinutesRevision | null>(
@@ -45,7 +68,170 @@ function activeRevisionOf(revisions: MinutesRevision[]): MinutesRevision | null 
   );
 }
 
-function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
+function latestBriefForRevision(
+  history: DecisionBriefVersion[],
+  revisionId: string | null,
+): DecisionBriefVersion | null {
+  if (!revisionId) return null;
+  return history
+    .filter((brief) => brief.source_minutes_revision_id === revisionId)
+    .reduce<DecisionBriefVersion | null>(
+      (latest, brief) =>
+        latest === null || brief.version_number > latest.version_number ? brief : latest,
+      null,
+    );
+}
+
+function briefTextsForSource(
+  revision: MinutesRevision | null,
+  brief: DecisionBriefVersion | null,
+): Record<string, string> {
+  const savedTexts = new Map(
+    (brief?.decisions ?? []).map((decision) => [decision.decision_id, decision.brief_text ?? '']),
+  );
+  const decisionIds =
+    revision?.format_version === 2
+      ? revision.discussions.flatMap((discussion) =>
+          discussion.decisions.map((decision) => decision.id),
+        )
+      : [];
+  return Object.fromEntries(decisionIds.map((id) => [id, savedTexts.get(id) ?? '']));
+}
+
+function briefPrefillKey(
+  revision: MinutesRevision | null,
+  brief: DecisionBriefVersion | null,
+  meetingId: string,
+): string {
+  return brief?.id ?? `minutes:${revision?.id ?? meetingId}`;
+}
+
+function readableDate(value: string | null | undefined): string {
+  if (!value) return 'Belum ditentukan';
+  const date = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat('id-ID', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(date);
+}
+
+function rowsForBrief(
+  version: DecisionBriefVersion,
+  revisions: MinutesRevision[],
+): DecisionBriefTableRow[] {
+  const sourceRevision = revisions.find(
+    (revision) => revision.id === version.source_minutes_revision_id,
+  );
+  const sourceDecisions = new Map(
+    sourceRevision?.format_version === 2
+      ? sourceRevision.discussions.flatMap((discussion) =>
+          discussion.decisions.map((decision) => [decision.id, decision] as const),
+        )
+      : [],
+  );
+
+  return [...version.decisions]
+    .sort((left, right) => left.position - right.position)
+    .map((briefDecision) => {
+      const sourceDecision = sourceDecisions.get(briefDecision.decision_id);
+      return {
+        id: briefDecision.decision_id,
+        agendaTitle: briefDecision.source_agenda_title,
+        discussionSubject: briefDecision.source_discussion_subject,
+        briefText: briefDecision.brief_text ?? '',
+        picSuggestion: sourceDecision?.pic_suggestion ?? null,
+        outputExpected: sourceDecision?.output_expected ?? null,
+        targetDate: sourceDecision?.target_date ?? null,
+        targetText: sourceDecision?.target_text ?? null,
+      };
+    });
+}
+
+function DecisionBriefTable({
+  accessibleName,
+  rows,
+  editable = false,
+  onBriefTextChange,
+}: {
+  accessibleName: string;
+  rows: DecisionBriefTableRow[];
+  editable?: boolean;
+  onBriefTextChange?: (decisionId: string, value: string) => void;
+}) {
+  return (
+    <div
+      className="decision-brief-table-scroll"
+      role="region"
+      aria-label={`Gulir ${accessibleName}`}
+      tabIndex={0}
+    >
+      <table className="decision-brief-table" aria-label={accessibleName}>
+        <colgroup>
+          <col className="decision-brief-column-number" />
+          <col className="decision-brief-column-topic" />
+          <col className="decision-brief-column-decision" />
+          <col className="decision-brief-column-pic" />
+          <col className="decision-brief-column-output" />
+          <col className="decision-brief-column-target" />
+        </colgroup>
+        <thead>
+          <tr>
+            <th scope="col">No.</th>
+            <th scope="col">Bahasan</th>
+            <th scope="col">Putusan/Tindak Lanjut</th>
+            <th scope="col">PIC</th>
+            <th scope="col">Output</th>
+            <th scope="col">Target Penyelesaian</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, index) => {
+            const topic = row.discussionSubject?.trim() || row.agendaTitle;
+            const showAgenda = Boolean(
+              row.discussionSubject?.trim() && row.agendaTitle !== row.discussionSubject.trim(),
+            );
+            return (
+              <tr key={row.id}>
+                <td>{index + 1}</td>
+                <td>
+                  <strong>{topic}</strong>
+                  {showAgenda && <small>{row.agendaTitle}</small>}
+                </td>
+                <td>
+                  {editable ? (
+                    <textarea
+                      className="decision-brief-table-input"
+                      aria-label={`Putusan atau tindak lanjut untuk ${topic}`}
+                      maxLength={20_000}
+                      required
+                      rows={decisionBriefTextareaRows(row.briefText)}
+                      value={row.briefText}
+                      onChange={(event) => onBriefTextChange?.(row.id, event.target.value)}
+                    />
+                  ) : (
+                    row.briefText || '—'
+                  )}
+                </td>
+                <td>{row.picSuggestion || '—'}</td>
+                <td>{row.outputExpected || '—'}</td>
+                <td>{row.targetDate ? readableDate(row.targetDate) : row.targetText || '—'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function decisionBriefTextareaRows(value: string): number {
+  return Math.max(2, Math.min(6, Math.ceil(value.trim().length / 50)));
+}
+
+function DecisionBriefEditor({ authenticatedUser, targetMeetingId }: DecisionBriefEditorProps) {
   const [meetings, setMeetings] = useState<MeetingSummary[]>([]);
   const [selectedMeetingId, setSelectedMeetingId] = useState('');
   const [revisions, setRevisions] = useState<MinutesRevision[]>([]);
@@ -53,18 +239,27 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
   const [meetingsLoading, setMeetingsLoading] = useState(true);
   const [dataLoading, setDataLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [workflowActionId, setWorkflowActionId] = useState<string | null>(null);
+  const [printingBriefId, setPrintingBriefId] = useState<string | null>(null);
+  const [rejectionReasons, setRejectionReasons] = useState<Record<string, string>>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [summary, setSummary] = useState('');
-  const [notes, setNotes] = useState('');
-  const [selectedDecisionIds, setSelectedDecisionIds] = useState<Set<string>>(new Set());
-  const [priorities, setPriorities] = useState<Record<string, string>>({});
-  const [editorialNotes, setEditorialNotes] = useState<Record<string, string>>({});
-  const [preservedDraft, setPreservedDraft] = useState<PreservedBriefDraft | null>(null);
+  const [briefTexts, setBriefTexts] = useState<Record<string, string>>({});
+  const [preservedChanges, setPreservedChanges] = useState<PreservedBriefChanges | null>(null);
+  const lastPrefilledSource = useRef<string | null>(null);
 
-  const canCreate = canCreateDecisionBrief(authenticatedUser);
   const selectedMeeting = meetings.find((meeting) => meeting.id === selectedMeetingId) ?? null;
+  const canCreate = Boolean(canCreateDecisionBrief(authenticatedUser) && selectedMeeting);
+  const canEdit = Boolean(canCreate && selectedMeeting?.status !== 'ARCHIVED');
+  const canReview = Boolean(
+    canReviewDecisionBrief(authenticatedUser) && selectedMeeting?.status !== 'ARCHIVED',
+  );
   const activeRevision = useMemo(() => activeRevisionOf(revisions), [revisions]);
+  const activeSourceBrief = useMemo(
+    () => latestBriefForRevision(history, activeRevision?.id ?? null),
+    [activeRevision, history],
+  );
+  const prefillSourceKey = briefPrefillKey(activeRevision, activeSourceBrief, selectedMeetingId);
   const sourceDecisions = useMemo<DecisionSource[]>(() => {
     if (!selectedMeeting || activeRevision?.format_version !== 2) return [];
     return activeRevision.discussions.flatMap((discussion) => {
@@ -76,6 +271,26 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
       }));
     });
   }, [activeRevision, selectedMeeting]);
+  const selectedSources = sourceDecisions;
+  const draftRows = useMemo<DecisionBriefTableRow[]>(
+    () =>
+      selectedSources.map(({ decision, agendaTitle, discussionSubject }) => ({
+        id: decision.id,
+        agendaTitle,
+        discussionSubject,
+        briefText: briefTexts[decision.id] ?? '',
+        picSuggestion: decision.pic_suggestion ?? null,
+        outputExpected: decision.output_expected,
+        targetDate: decision.target_date,
+        targetText: decision.target_text,
+      })),
+    [briefTexts, selectedSources],
+  );
+  useEffect(() => {
+    if (lastPrefilledSource.current === prefillSourceKey) return;
+    lastPrefilledSource.current = prefillSourceKey;
+    setBriefTexts(briefTextsForSource(activeRevision, activeSourceBrief));
+  }, [activeRevision, activeSourceBrief, prefillSourceKey]);
 
   useEffect(() => {
     let current = true;
@@ -83,7 +298,10 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
       .then((items) => {
         if (!current) return;
         setMeetings(items);
-        setSelectedMeetingId(items[0]?.id ?? '');
+        const initialMeeting = targetMeetingId
+          ? items.find((meeting) => meeting.id === targetMeetingId)
+          : undefined;
+        setSelectedMeetingId(initialMeeting?.id ?? '');
       })
       .catch((error: unknown) => {
         if (current) setErrorMessage(errorMessageOf(error));
@@ -94,7 +312,7 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
     return () => {
       current = false;
     };
-  }, []);
+  }, [targetMeetingId]);
 
   useEffect(() => {
     if (!selectedMeetingId) {
@@ -112,6 +330,20 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
     ])
       .then(([nextRevisions, nextHistory]) => {
         if (!current) return;
+        const nextActiveRevision = activeRevisionOf(nextRevisions);
+        const nextActiveSourceBrief = latestBriefForRevision(
+          nextHistory,
+          nextActiveRevision?.id ?? null,
+        );
+        const nextPrefillKey = briefPrefillKey(
+          nextActiveRevision,
+          nextActiveSourceBrief,
+          selectedMeetingId,
+        );
+        if (lastPrefilledSource.current !== nextPrefillKey) {
+          lastPrefilledSource.current = nextPrefillKey;
+          setBriefTexts(briefTextsForSource(nextActiveRevision, nextActiveSourceBrief));
+        }
         setRevisions(nextRevisions);
         setHistory(nextHistory);
       })
@@ -126,13 +358,14 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
     };
   }, [selectedMeetingId]);
 
-  function resetDraft(): void {
-    setSummary('');
-    setNotes('');
-    setSelectedDecisionIds(new Set());
-    setPriorities({});
-    setEditorialNotes({});
-  }
+  useEffect(() => {
+    const resetPrintingBrief = () => {
+      document.body.classList.remove('sitara-print-mode');
+      setPrintingBriefId(null);
+    };
+    window.addEventListener('afterprint', resetPrintingBrief);
+    return () => window.removeEventListener('afterprint', resetPrintingBrief);
+  }, []);
 
   async function refreshSourceAndHistory(): Promise<void> {
     if (!selectedMeetingId) return;
@@ -144,65 +377,106 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
     setHistory(nextHistory);
   }
 
-  function toggleDecision(decisionId: string, checked: boolean): void {
-    setSelectedDecisionIds((previous) => {
-      const next = new Set(previous);
-      if (checked) next.add(decisionId);
-      else next.delete(decisionId);
-      return next;
-    });
+  async function handleWorkflowAction(
+    version: DecisionBriefVersion,
+    action: 'submit' | 'approve' | 'reject' | 'withdraw',
+    reason?: string,
+  ): Promise<void> {
+    if (!selectedMeetingId) return;
+    if (action === 'reject' && !reason?.trim()) {
+      setErrorMessage('Alasan penolakan wajib diisi.');
+      return;
+    }
+
+    setWorkflowActionId(version.id);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      const updated =
+        action === 'submit'
+          ? await submitDecisionBriefVersion(selectedMeetingId, version.id)
+          : action === 'approve'
+            ? await approveDecisionBriefVersion(selectedMeetingId, version.id)
+            : action === 'reject'
+              ? await rejectDecisionBriefVersion(selectedMeetingId, version.id, reason!.trim())
+              : await withdrawDecisionBriefVersion(selectedMeetingId, version.id);
+      setHistory((previous) => previous.map((item) => (item.id === updated.id ? updated : item)));
+      if (action === 'reject') {
+        setRejectionReasons((previous) => ({ ...previous, [version.id]: '' }));
+      }
+      const messages = {
+        submit: 'Decision Brief diajukan untuk persetujuan.',
+        approve: 'Decision Brief disetujui.',
+        reject: 'Decision Brief ditolak dan alasan dicatat.',
+        withdraw: 'Pengajuan Decision Brief ditarik.',
+      };
+      setSuccessMessage(messages[action]);
+    } catch (error: unknown) {
+      if (error instanceof ApiError && error.status === 409) {
+        try {
+          await refreshSourceAndHistory();
+        } catch (refreshError: unknown) {
+          setErrorMessage(`${errorMessageOf(error)} ${errorMessageOf(refreshError)}`);
+        }
+      } else {
+        setErrorMessage(errorMessageOf(error));
+      }
+    } finally {
+      setWorkflowActionId(null);
+    }
+  }
+
+  function printBrief(briefId: string): void {
+    document.body.classList.add('sitara-print-mode');
+    setPrintingBriefId(briefId);
+    window.setTimeout(() => window.print(), 0);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    if (!selectedMeetingId || !activeRevision || !canCreate) return;
-    const selectedSources = sourceDecisions.filter(({ decision }) =>
-      selectedDecisionIds.has(decision.id),
-    );
-    if (selectedSources.length === 0) {
-      setErrorMessage('Pilih sedikitnya satu keputusan dari notulensi aktif.');
+    if (!selectedMeetingId || !activeRevision || !canEdit) return;
+    if (selectedSources.length !== sourceDecisions.length || selectedSources.length === 0) {
+      setErrorMessage('Decision Brief harus memuat seluruh keputusan dari notulensi terbaru.');
       return;
     }
-    if (selectedSources.some(({ decision }) => !priorities[decision.id]?.trim())) {
-      setErrorMessage('Isi prioritas editorial untuk setiap keputusan yang dipilih.');
+    if (selectedSources.some(({ decision }) => !briefTexts[decision.id]?.trim())) {
+      setErrorMessage('Isi Putusan/Tindak Lanjut pada setiap baris sebelum menyimpan perubahan.');
       return;
     }
-
     setSaving(true);
     setErrorMessage(null);
     setSuccessMessage(null);
     try {
       const created = await createDecisionBriefVersion(selectedMeetingId, {
         source_minutes_revision_id: activeRevision.id,
-        summary: summary.trim(),
-        notes: notes.trim() || null,
+        summary: selectedMeeting
+          ? `${selectedMeeting.meeting_number} · ${selectedMeeting.title}`
+          : 'Decision Brief Rapat Pimpinan',
+        notes: null,
         decisions: selectedSources.map(({ decision }) => ({
           decision_id: decision.id,
-          priority: priorities[decision.id].trim(),
-          editorial_note: editorialNotes[decision.id]?.trim() || null,
+          brief_text: briefTexts[decision.id]?.trim() ?? '',
+          priority: '',
+          editorial_note: null,
         })),
       });
       setHistory((previous) => [...previous, created]);
-      resetDraft();
-      setPreservedDraft(null);
-      setSuccessMessage(`Decision Brief versi ${created.version_number} tersimpan sebagai draf.`);
+      setSuccessMessage('Perubahan Decision Brief tersimpan.');
     } catch (error: unknown) {
       if (error instanceof ApiError && error.status === 409) {
-        setPreservedDraft({
-          sourceRevisionId: activeRevision.id,
-          sourceRevisionNumber: activeRevision.revision_number,
-          summary,
-          notes,
+        setPreservedChanges({
+          summary: selectedMeeting
+            ? `${selectedMeeting.meeting_number} · ${selectedMeeting.title}`
+            : 'Decision Brief Rapat Pimpinan',
           decisions: selectedSources.map(({ decision, agendaTitle, discussionSubject }) => ({
             sourceText: decision.decision_text,
             agendaTitle,
             discussionSubject,
-            priority: priorities[decision.id] ?? '',
-            editorialNote: editorialNotes[decision.id] ?? '',
+            briefText: briefTexts[decision.id] ?? '',
           })),
         });
         setErrorMessage(
-          'Notulensi berubah sejak sumber dimuat. Sumber terbaru dan histori brief sudah dimuat ulang; periksa keputusan lalu buat versi baru.',
+          'Notulensi berubah sejak halaman dibuka. Sumber terbaru sudah dimuat ulang; periksa setiap putusan lalu simpan kembali.',
         );
         try {
           await refreshSourceAndHistory();
@@ -224,22 +498,57 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
       </p>
     );
   }
+  if (
+    targetMeetingId &&
+    !errorMessage &&
+    !meetings.some((meeting) => meeting.id === targetMeetingId)
+  ) {
+    return (
+      <p className="minutes-alert" role="alert">
+        Rapat tidak termasuk dalam cakupan akses Anda.
+      </p>
+    );
+  }
   if (meetings.length === 0) {
-    return <p className="decision-brief-state">Tidak ada rapat yang dapat diakses.</p>;
+    return (
+      <>
+        {errorMessage && (
+          <p className="minutes-alert" role="alert">
+            {errorMessage}
+          </p>
+        )}
+        <p className="decision-brief-state">Tidak ada rapat yang dapat diakses.</p>
+      </>
+    );
+  }
+
+  if (!targetMeetingId && !selectedMeeting) {
+    return (
+      <MeetingDocumentSelection
+        meetings={meetings}
+        documentName="Decision Brief"
+        routePrefix="#decision-briefs"
+      />
+    );
   }
 
   return (
     <section className="decision-brief-page" aria-labelledby="decision-brief-title">
       <header className="decision-brief-heading">
         <div>
-          <p className="eyebrow">SUMBER NOTULENSI TETAP UTUH</p>
           <h1 id="decision-brief-title">Decision Brief</h1>
-          <p>
-            Susun ringkasan editorial dari keputusan pada revisi notulensi aktif. Setiap penyimpanan
-            menambahkan versi draf baru.
-          </p>
+          {selectedMeeting && (
+            <p className="decision-brief-meeting-meta">
+              {selectedMeeting.meeting_number} · {selectedMeeting.title} ·{' '}
+              {readableDate(selectedMeeting.meeting_date)}
+            </p>
+          )}
         </div>
       </header>
+
+      <a className="repository-back-link" href="#decision-briefs">
+        Kembali ke daftar rapat
+      </a>
 
       {errorMessage && (
         <p className="minutes-alert" role="alert">
@@ -252,219 +561,219 @@ function DecisionBriefEditor({ authenticatedUser }: DecisionBriefEditorProps) {
         </p>
       )}
 
-      {preservedDraft && (
+      {preservedChanges && (
         <section className="minutes-alert" aria-labelledby="preserved-brief-title">
-          <h2 id="preserved-brief-title">Draf yang belum tersimpan</h2>
-          <p>
-            Draf ini merujuk revisi notulensi {preservedDraft.sourceRevisionNumber} (
-            <code>{preservedDraft.sourceRevisionId}</code>). Draf tidak dikirim ulang; periksa
-            sumber terbaru sebelum membuat versi baru.
-          </p>
-          <p>{preservedDraft.summary}</p>
-          {preservedDraft.notes && <p>{preservedDraft.notes}</p>}
+          <h2 id="preserved-brief-title">Perubahan yang belum tersimpan</h2>
+          <p>Periksa kembali sumber notulensi dan isi ringkasan sebelum menyimpan.</p>
+          <p>{preservedChanges.summary}</p>
           <ul>
-            {preservedDraft.decisions.map((decision, index) => (
+            {preservedChanges.decisions.map((decision, index) => (
               <li key={`${decision.sourceText}-${index}`}>
-                <strong>{decision.sourceText}</strong>
-                <span>
-                  {decision.agendaTitle}
-                  {decision.discussionSubject ? ` · ${decision.discussionSubject}` : ''}
-                </span>
-                <span>Prioritas: {decision.priority || 'belum diisi'}</span>
-                {decision.editorialNote && <span>{decision.editorialNote}</span>}
+                <strong>{decision.discussionSubject || decision.agendaTitle}</strong>
+                <span>Putusan pada notulensi: {decision.sourceText}</span>
+                <span>Isi Decision Brief: {decision.briefText || 'belum diisi'}</span>
               </li>
             ))}
           </ul>
           <button
             className="button button--secondary"
-            onClick={() => setPreservedDraft(null)}
+            onClick={() => setPreservedChanges(null)}
             type="button"
           >
-            Tutup draf tersimpan
+            Tutup ringkasan perubahan
           </button>
         </section>
       )}
 
-      <label className="minutes-field-label" htmlFor="decision-brief-meeting">
-        Pilih rapat
-      </label>
-      <select
-        className="minutes-select decision-brief-meeting"
-        id="decision-brief-meeting"
-        value={selectedMeetingId}
-        onChange={(event) => {
-          setSelectedMeetingId(event.target.value);
-          resetDraft();
-          setPreservedDraft(null);
-        }}
-      >
-        {meetings.map((meeting) => (
-          <option key={meeting.id} value={meeting.id}>
-            {meeting.meeting_number} · {meeting.title}
-          </option>
-        ))}
-      </select>
+      {selectedMeeting?.status === 'ARCHIVED' && (
+        <p className="minutes-readonly-note">Rapat arsip · hanya dapat dilihat dan dicetak.</p>
+      )}
 
       {dataLoading ? (
         <p className="decision-brief-state" role="status">
-          Memuat sumber keputusan dan histori...
+          Memuat sumber keputusan...
         </p>
       ) : (
         <div className="decision-brief-layout">
           <div className="surface-panel decision-brief-form-panel">
             <div className="decision-brief-source">
               <h2>Sumber keputusan</h2>
-              {activeRevision ? (
-                <p>
-                  Revisi notulensi {activeRevision.revision_number} ·{' '}
-                  <code>{activeRevision.id}</code>
-                </p>
-              ) : (
-                <p>Rapat ini belum memiliki revisi notulensi.</p>
-              )}
+              {!activeRevision && <p>Rapat ini belum memiliki notulensi.</p>}
             </div>
 
-            {!canCreate && (
-              <p className="minutes-readonly-note">
-                Akun ini hanya dapat membaca histori Decision Brief.
-              </p>
+            {!canEdit && !canReview && selectedMeeting?.status !== 'ARCHIVED' && (
+              <p className="minutes-readonly-note">Akun ini hanya dapat membaca Decision Brief.</p>
             )}
             {activeRevision?.format_version === 1 && (
               <p className="minutes-readonly-note">
-                Revisi teks lama tetap tersedia, tetapi belum memiliki keputusan terstruktur untuk
-                dipilih sebagai sumber.
+                Catatan lama tersedia, tetapi belum memiliki keputusan terstruktur untuk dipilih
+                sebagai sumber.
               </p>
             )}
             {activeRevision?.format_version === 2 && sourceDecisions.length === 0 && (
               <p className="minutes-readonly-note">
-                Revisi aktif belum mencatat keputusan terstruktur.
+                Notulensi belum mencatat keputusan terstruktur.
               </p>
             )}
 
-            {canCreate && activeRevision?.format_version === 2 && sourceDecisions.length > 0 && (
+            {canEdit && activeRevision?.format_version === 2 && sourceDecisions.length > 0 && (
               <form className="decision-brief-form" onSubmit={(event) => void handleSubmit(event)}>
-                <label className="minutes-field-label" htmlFor="decision-brief-summary">
-                  Ringkasan editorial
-                </label>
-                <textarea
-                  className="minutes-textarea"
-                  id="decision-brief-summary"
-                  maxLength={100_000}
-                  required
-                  rows={4}
-                  value={summary}
-                  onChange={(event) => setSummary(event.target.value)}
-                />
-                <label className="minutes-field-label" htmlFor="decision-brief-notes">
-                  Catatan brief (opsional)
-                </label>
-                <textarea
-                  className="minutes-textarea"
-                  id="decision-brief-notes"
-                  maxLength={20_000}
-                  rows={3}
-                  value={notes}
-                  onChange={(event) => setNotes(event.target.value)}
-                />
-
-                <fieldset className="decision-brief-sources">
-                  <legend>Pilih keputusan sumber dan isi prioritas editorial</legend>
-                  {sourceDecisions.map(({ decision, agendaTitle, discussionSubject }) => (
-                    <article className="decision-brief-source-card" key={decision.id}>
-                      <label className="decision-brief-checkbox">
-                        <input
-                          checked={selectedDecisionIds.has(decision.id)}
-                          onChange={(event) => toggleDecision(decision.id, event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span>{decision.decision_text}</span>
-                      </label>
-                      <p className="decision-brief-provenance">
-                        {agendaTitle}
-                        {discussionSubject ? ` · ${discussionSubject}` : ''}
-                      </p>
-                      {selectedDecisionIds.has(decision.id) && (
-                        <div className="decision-brief-editorial-fields">
-                          <label className="minutes-field-label">
-                            Prioritas editorial
-                            <input
-                              className="minutes-input"
-                              maxLength={100}
-                              required
-                              value={priorities[decision.id] ?? ''}
-                              onChange={(event) =>
-                                setPriorities((previous) => ({
-                                  ...previous,
-                                  [decision.id]: event.target.value,
-                                }))
-                              }
-                            />
-                          </label>
-                          <label className="minutes-field-label">
-                            Catatan editorial (opsional)
-                            <textarea
-                              className="minutes-textarea"
-                              maxLength={4_000}
-                              rows={2}
-                              value={editorialNotes[decision.id] ?? ''}
-                              onChange={(event) =>
-                                setEditorialNotes((previous) => ({
-                                  ...previous,
-                                  [decision.id]: event.target.value,
-                                }))
-                              }
-                            />
-                          </label>
-                        </div>
-                      )}
-                    </article>
-                  ))}
-                </fieldset>
+                <section className="decision-brief-sources" aria-label="Isi Decision Brief">
+                  <div className="decision-brief-document-heading">
+                    <h4>DECISION BRIEF RAPAT PIMPINAN</h4>
+                    <p>
+                      {selectedMeeting?.meeting_number} · {selectedMeeting?.title}
+                    </p>
+                    <p>Rapim {readableDate(selectedMeeting?.meeting_date)}</p>
+                  </div>
+                  <DecisionBriefTable
+                    accessibleName="Form tabel Decision Brief"
+                    rows={draftRows}
+                    editable
+                    onBriefTextChange={(decisionId, value) =>
+                      setBriefTexts((previous) => ({ ...previous, [decisionId]: value }))
+                    }
+                  />
+                </section>
                 <button className="button button--primary" disabled={saving} type="submit">
-                  {saving ? 'Menyimpan...' : 'Simpan versi draf'}
+                  {saving
+                    ? 'Menyimpan...'
+                    : activeSourceBrief
+                      ? 'Simpan perubahan'
+                      : 'Simpan Decision Brief'}
                 </button>
               </form>
             )}
-          </div>
 
-          <aside
-            className="surface-panel decision-brief-history"
-            aria-labelledby="brief-history-title"
-          >
-            <h2 id="brief-history-title">Histori versi</h2>
-            {history.length === 0 ? (
-              <p className="decision-brief-state">Belum ada versi Decision Brief.</p>
-            ) : (
-              <ol className="decision-brief-history-list">
-                {[...history].reverse().map((version) => (
-                  <li className="decision-brief-version" key={version.id}>
-                    <header>
-                      <h3>Versi {version.version_number}</h3>
-                      <span className={version.is_stale ? 'brief-stale' : 'brief-current'}>
-                        {version.is_stale ? 'Sumber usang' : 'Sumber aktif'}
-                      </span>
-                    </header>
-                    <p className="decision-brief-provenance">
-                      Revisi sumber <code>{version.source_minutes_revision_id}</code>
+            {!canEdit &&
+              activeRevision?.format_version === 2 &&
+              sourceDecisions.length > 0 &&
+              (activeSourceBrief ? (
+                <DecisionBriefTable
+                  accessibleName="Tabel Decision Brief"
+                  rows={rowsForBrief(activeSourceBrief, revisions)}
+                />
+              ) : (
+                <p className="decision-brief-state">
+                  Belum ada Decision Brief untuk notulensi ini.
+                </p>
+              ))}
+
+            {activeSourceBrief && (
+              <section className="decision-brief-approval" aria-label="Status pengesahan">
+                <h2>Status pengesahan</h2>
+                <p>
+                  <strong>
+                    {selectedMeeting?.status === 'ARCHIVED'
+                      ? 'Tersimpan'
+                      : approvalStateLabels[activeSourceBrief.approval_state]}
+                  </strong>
+                </p>
+                {activeSourceBrief.approval_state === 'REJECTED' &&
+                  activeSourceBrief.approval_events.at(-1)?.reason && (
+                    <p>Catatan penolakan: {activeSourceBrief.approval_events.at(-1)?.reason}</p>
+                  )}
+                <button
+                  className="button button--secondary"
+                  onClick={() => printBrief(activeSourceBrief.id)}
+                  type="button"
+                >
+                  Cetak Decision Brief
+                </button>
+                <article
+                  className={`decision-brief-printable decision-brief-print-only${printingBriefId === activeSourceBrief.id ? ' sitara-print-target' : ''}`}
+                  data-print-target={printingBriefId === activeSourceBrief.id ? 'true' : undefined}
+                >
+                  <header className="decision-brief-document-heading">
+                    <h4>DECISION BRIEF RAPAT PIMPINAN</h4>
+                    <p>
+                      {selectedMeeting?.meeting_number} · {selectedMeeting?.title}
                     </p>
-                    <p className="decision-brief-history-summary">{version.summary}</p>
-                    {version.notes && <p>{version.notes}</p>}
-                    <ul>
-                      {version.decisions.map((decision) => (
-                        <li key={decision.decision_id}>
-                          <strong>{decision.source_decision_text}</strong>
-                          <span>
-                            {decision.source_agenda_title} · Prioritas: {decision.priority}
-                          </span>
-                          {decision.editorial_note && <span>{decision.editorial_note}</span>}
-                        </li>
-                      ))}
-                    </ul>
-                  </li>
-                ))}
-              </ol>
+                    <p>Rapim {readableDate(selectedMeeting?.meeting_date)}</p>
+                  </header>
+                  <DecisionBriefTable
+                    accessibleName="Tabel cetak Decision Brief"
+                    rows={rowsForBrief(activeSourceBrief, revisions)}
+                  />
+                </article>
+                {(canEdit || canReview) &&
+                  selectedMeeting?.status === 'FINAL' &&
+                  ['DRAFT', 'WITHDRAWN'].includes(activeSourceBrief.approval_state) && (
+                    <button
+                      className="button button--primary"
+                      disabled={workflowActionId === activeSourceBrief.id}
+                      onClick={() => void handleWorkflowAction(activeSourceBrief, 'submit')}
+                      type="button"
+                    >
+                      {workflowActionId === activeSourceBrief.id
+                        ? 'Mengirim...'
+                        : 'Ajukan persetujuan'}
+                    </button>
+                  )}
+                {canEdit &&
+                  activeSourceBrief.created_by_id === authenticatedUser.id &&
+                  activeSourceBrief.approval_state === 'PENDING_APPROVAL' && (
+                    <button
+                      className="button button--secondary"
+                      disabled={workflowActionId === activeSourceBrief.id}
+                      onClick={() => void handleWorkflowAction(activeSourceBrief, 'withdraw')}
+                      type="button"
+                    >
+                      Tarik pengajuan
+                    </button>
+                  )}
+                {canReview &&
+                  activeSourceBrief.created_by_id !== authenticatedUser.id &&
+                  activeSourceBrief.approval_state === 'PENDING_APPROVAL' && (
+                    <div>
+                      <button
+                        className="button button--primary"
+                        disabled={workflowActionId === activeSourceBrief.id}
+                        onClick={() => void handleWorkflowAction(activeSourceBrief, 'approve')}
+                        type="button"
+                      >
+                        Setujui
+                      </button>
+                      <label
+                        className="minutes-field-label"
+                        htmlFor={`brief-rejection-reason-${activeSourceBrief.id}`}
+                      >
+                        Alasan penolakan
+                        <textarea
+                          className="minutes-textarea"
+                          id={`brief-rejection-reason-${activeSourceBrief.id}`}
+                          maxLength={4_000}
+                          value={rejectionReasons[activeSourceBrief.id] ?? ''}
+                          onChange={(event) =>
+                            setRejectionReasons((previous) => ({
+                              ...previous,
+                              [activeSourceBrief.id]: event.target.value,
+                            }))
+                          }
+                        />
+                      </label>
+                      <button
+                        className="button button--secondary"
+                        disabled={
+                          workflowActionId === activeSourceBrief.id ||
+                          !rejectionReasons[activeSourceBrief.id]?.trim()
+                        }
+                        onClick={() =>
+                          void handleWorkflowAction(
+                            activeSourceBrief,
+                            'reject',
+                            rejectionReasons[activeSourceBrief.id],
+                          )
+                        }
+                        type="button"
+                      >
+                        Tolak
+                      </button>
+                    </div>
+                  )}
+              </section>
             )}
-          </aside>
+          </div>
         </div>
       )}
     </section>

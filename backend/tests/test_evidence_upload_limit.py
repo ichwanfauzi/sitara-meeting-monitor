@@ -1,13 +1,10 @@
 import asyncio
-from collections.abc import Awaitable, Callable
-from typing import Any
 
 from app.middleware import EvidenceUploadSizeLimitMiddleware
+from starlette.types import Message, Receive, Scope, Send
 
-ASGIApp = Callable[[dict[str, Any], Callable[[], Awaitable[dict[str, Any]]], Any], Awaitable[None]]
 
-
-def _scope(*, path: str, headers: list[tuple[bytes, bytes]]) -> dict[str, Any]:
+def _scope(*, path: str, headers: list[tuple[bytes, bytes]]) -> Scope:
     return {
         "type": "http",
         "method": "POST",
@@ -18,16 +15,16 @@ def _scope(*, path: str, headers: list[tuple[bytes, bytes]]) -> dict[str, Any]:
 
 def test_rejects_oversized_content_length_before_calling_app() -> None:
     app_called = False
-    sent: list[dict[str, Any]] = []
+    sent: list[Message] = []
 
-    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
         nonlocal app_called
         app_called = True
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         return {"type": "http.request", "body": b"", "more_body": False}
 
-    async def send(message: dict[str, Any]) -> None:
+    async def send(message: Message) -> None:
         sent.append(message)
 
     middleware = EvidenceUploadSizeLimitMiddleware(app, max_request_bytes=5)
@@ -47,7 +44,7 @@ def test_rejects_oversized_content_length_before_calling_app() -> None:
 
 
 def test_rejects_chunked_body_over_limit_while_streaming() -> None:
-    sent: list[dict[str, Any]] = []
+    sent: list[Message] = []
     chunks = iter(
         [
             {"type": "http.request", "body": b"123", "more_body": True},
@@ -56,16 +53,16 @@ def test_rejects_chunked_body_over_limit_while_streaming() -> None:
     )
     app_consumed = False
 
-    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
         nonlocal app_consumed
         app_consumed = True
         while (await receive())["more_body"]:
             pass
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         return next(chunks)
 
-    async def send(message: dict[str, Any]) -> None:
+    async def send(message: Message) -> None:
         sent.append(message)
 
     middleware = EvidenceUploadSizeLimitMiddleware(app, max_request_bytes=5)
@@ -85,17 +82,17 @@ def test_rejects_chunked_body_over_limit_while_streaming() -> None:
 
 
 def test_does_not_limit_unrelated_requests() -> None:
-    sent: list[dict[str, Any]] = []
+    sent: list[Message] = []
 
-    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
         await receive()
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         return {"type": "http.request", "body": b"123456", "more_body": False}
 
-    async def send(message: dict[str, Any]) -> None:
+    async def send(message: Message) -> None:
         sent.append(message)
 
     middleware = EvidenceUploadSizeLimitMiddleware(app, max_request_bytes=5)

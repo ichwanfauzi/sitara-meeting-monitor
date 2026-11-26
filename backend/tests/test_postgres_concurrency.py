@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from threading import Barrier
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from app.core.config import get_settings
@@ -19,9 +19,12 @@ from app.models.action_item import (
     ActionItemStatus,
     ProgressUpdate,
 )
+from app.models.audit import AuditEvent
 from app.models.auth import Role, User
 from app.models.meeting import (
     Agenda,
+    DecisionBriefApprovalEvent,
+    DecisionBriefApprovalEventType,
     DecisionBriefDecision,
     DecisionBriefVersion,
     Meeting,
@@ -51,6 +54,7 @@ from app.services.action_items import (
     record_evidence_scan_result,
 )
 from app.services.meetings import (
+    DecisionBriefWorkflowConflict,
     InvalidMeetingTransition,
     MeetingNotLiveForMinutesReview,
     MeetingNotLiveForMinutesRevision,
@@ -59,6 +63,7 @@ from app.services.meetings import (
     create_decision_brief_version,
     create_minutes_revision,
     record_minutes_review,
+    transition_decision_brief_workflow,
     transition_meeting,
 )
 from app.services.rate_limiting import (
@@ -103,11 +108,16 @@ def postgres_sessions() -> Iterator[sessionmaker[Session]]:
         "action_item_evidence_scans",
         "completion_verifications",
         "status_histories",
+        "audit_events",
+        "dispositions",
+        "disposition_targets",
+        "meeting_notetaker_handovers",
+        "decision_brief_approval_events",
     } <= table_names
     with engine.connect() as connection:
         assert (
             connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-            == "0011_evidence_scan_quarantine"
+            == "0020_minutes_pic_suggestion"
         )
     yield sessionmaker(bind=engine, expire_on_commit=False)
     engine.dispose()
@@ -201,6 +211,8 @@ def _seed_postgres_action_item(
             description="Complete a synthetic task",
             priority="Penting",
             main_pic_user_id=pic.id,
+            main_pic_origin_unit_id=unit.id,
+            responsible_unit_id=unit.id,
         ),
     )
     return actor, pic, created
@@ -322,14 +334,14 @@ def test_postgres_row_lock_serializes_concurrent_meeting_transitions(
 
         assert sorted(outcomes) == ["changed", "stale"]
         with postgres_sessions() as session:
-            meeting = session.get(Meeting, meeting_id)
+            stored_meeting = session.get(Meeting, meeting_id)
             events = list(
                 session.scalars(
                     select(MeetingStatusEvent).where(MeetingStatusEvent.meeting_id == meeting_id)
                 )
             )
-            assert meeting is not None
-            assert meeting.status is MeetingStatus.LIVE
+            assert stored_meeting is not None
+            assert stored_meeting.status is MeetingStatus.LIVE
             assert len(events) == 1
     finally:
         with postgres_sessions() as session:
@@ -337,7 +349,7 @@ def test_postgres_row_lock_serializes_concurrent_meeting_transitions(
                 delete(MeetingStatusEvent).where(MeetingStatusEvent.meeting_id == meeting_id)
             )
             session.execute(delete(Meeting).where(Meeting.id == meeting_id))
-            session.execute(delete(User).where(User.id == actor_id))
+            # The successful transition's append-only audit event references this actor.
             session.commit()
 
 
@@ -421,7 +433,7 @@ def test_postgres_review_and_finalization_serialize_on_meeting_row(
     assert review_outcome == "recorded"
     assert finalization_outcome in {"finalized", "review-required"}
     with postgres_sessions() as session:
-        meeting = session.get(Meeting, meeting_id)
+        stored_meeting = session.get(Meeting, meeting_id)
         reviews = list(
             session.scalars(select(MinutesReview).where(MinutesReview.meeting_id == meeting_id))
         )
@@ -430,18 +442,18 @@ def test_postgres_review_and_finalization_serialize_on_meeting_row(
                 select(MeetingStatusEvent).where(MeetingStatusEvent.meeting_id == meeting_id)
             )
         )
-        assert meeting is not None
+        assert stored_meeting is not None
         assert len(reviews) == 1
         assert reviews[0].result is MinutesReviewResult.VALID
         assert reviews[0].minutes_revision_id == revision.id
         if finalization_outcome == "finalized":
-            assert meeting.status is MeetingStatus.FINAL
-            assert meeting.finalized_by_id == actor_id
+            assert stored_meeting.status is MeetingStatus.FINAL
+            assert stored_meeting.finalized_by_id == actor_id
             assert len(events) == 1
             assert events[0].to_status == "FINAL"
         else:
-            assert meeting.status is MeetingStatus.LIVE
-            assert meeting.finalized_at is None
+            assert stored_meeting.status is MeetingStatus.LIVE
+            assert stored_meeting.finalized_at is None
             assert events == []
 
 
@@ -684,7 +696,7 @@ def test_postgres_revision_change_racing_finalization_cannot_finalize_stale_revi
         outcomes = {revision_future.result(), finalization_future.result()}
 
     with postgres_sessions() as session:
-        meeting = session.get(Meeting, meeting_id)
+        stored_meeting = session.get(Meeting, meeting_id)
         revisions = list(
             session.scalars(
                 select(MinutesRevision)
@@ -700,16 +712,16 @@ def test_postgres_revision_change_racing_finalization_cannot_finalize_stale_revi
                 select(MeetingStatusEvent).where(MeetingStatusEvent.meeting_id == meeting_id)
             )
         )
-        assert meeting is not None
+        assert stored_meeting is not None
         assert len(reviews) == 1
-        if meeting.status is MeetingStatus.FINAL:
+        if stored_meeting.status is MeetingStatus.FINAL:
             assert outcomes == {"meeting-not-live", "finalized"}
             assert len(revisions) == 1
             assert reviews[0].minutes_revision_id == revisions[-1].id
             assert len(events) == 1
         else:
             assert outcomes == {"revision-created", "review-required"}
-            assert meeting.status is MeetingStatus.LIVE
+            assert stored_meeting.status is MeetingStatus.LIVE
             assert len(revisions) == 2
             assert reviews[0].minutes_revision_id != revisions[-1].id
             assert events == []
@@ -797,8 +809,8 @@ def test_postgres_revision_change_racing_review_never_reviews_the_wrong_active_r
         outcomes = {revision_future.result(), review_future.result()}
 
     with postgres_sessions() as session:
-        actor = session.get(User, actor_id)
-        assert actor is not None
+        current_actor = session.get(User, actor_id)
+        assert current_actor is not None
         latest_revision = session.scalar(
             select(MinutesRevision)
             .where(MinutesRevision.meeting_id == meeting_id)
@@ -815,14 +827,14 @@ def test_postgres_revision_change_racing_review_never_reviews_the_wrong_active_r
         assert latest_revision is not None and latest_revision.revision_number == 2
         assert all(review.minutes_revision_id == revision_id for review in reviews)
         with pytest.raises(MinutesReviewRequired):
-            transition_meeting(session, meeting_id, actor, MeetingStatus.FINAL)
-        meeting = session.get(Meeting, meeting_id)
+            transition_meeting(session, meeting_id, current_actor, MeetingStatus.FINAL)
+        stored_meeting = session.get(Meeting, meeting_id)
         events = list(
             session.scalars(
                 select(MeetingStatusEvent).where(MeetingStatusEvent.meeting_id == meeting_id)
             )
         )
-        assert meeting is not None and meeting.status is MeetingStatus.LIVE
+        assert stored_meeting is not None and stored_meeting.status is MeetingStatus.LIVE
         assert events == []
 
 
@@ -891,13 +903,13 @@ def test_postgres_two_concurrent_finalizations_write_only_one_event(
 
     assert sorted(outcomes) == ["finalized", "stale"]
     with postgres_sessions() as session:
-        meeting = session.get(Meeting, meeting_id)
+        stored_meeting = session.get(Meeting, meeting_id)
         events = list(
             session.scalars(
                 select(MeetingStatusEvent).where(MeetingStatusEvent.meeting_id == meeting_id)
             )
         )
-        assert meeting is not None and meeting.status is MeetingStatus.FINAL
+        assert stored_meeting is not None and stored_meeting.status is MeetingStatus.FINAL
         assert len(events) == 1
 
 
@@ -1047,9 +1059,9 @@ def test_postgres_revision_foreign_key_and_append_only_trigger(
             session.execute(delete(MinutesRevision).where(MinutesRevision.id == revision_id))
             session.commit()
         session.rollback()
-        revision = session.get(MinutesRevision, revision_id)
-        assert revision is not None
-        assert revision.content == "Synthetic immutable minutes"
+        stored_revision = session.get(MinutesRevision, revision_id)
+        assert stored_revision is not None
+        assert stored_revision.content == "Synthetic immutable minutes"
 
     with postgres_sessions() as session:
         with pytest.raises(DBAPIError, match="append-only"):
@@ -1066,9 +1078,9 @@ def test_postgres_revision_foreign_key_and_append_only_trigger(
             session.execute(delete(MinutesDiscussion).where(MinutesDiscussion.id == discussion_id))
             session.commit()
         session.rollback()
-        discussion = session.get(MinutesDiscussion, discussion_id)
-        assert discussion is not None
-        assert discussion.content == "Synthetic immutable discussion"
+        stored_discussion = session.get(MinutesDiscussion, discussion_id)
+        assert stored_discussion is not None
+        assert stored_discussion.content == "Synthetic immutable discussion"
 
     with postgres_sessions() as session:
         with pytest.raises(DBAPIError, match="append-only"):
@@ -1085,9 +1097,9 @@ def test_postgres_revision_foreign_key_and_append_only_trigger(
             session.execute(delete(MinutesDecision).where(MinutesDecision.id == decision_id))
             session.commit()
         session.rollback()
-        decision = session.get(MinutesDecision, decision_id)
-        assert decision is not None
-        assert decision.decision_text == "Synthetic immutable decision"
+        stored_decision = session.get(MinutesDecision, decision_id)
+        assert stored_decision is not None
+        assert stored_decision.decision_text == "Synthetic immutable decision"
 
     with postgres_sessions() as session:
         try:
@@ -1104,9 +1116,9 @@ def test_postgres_revision_foreign_key_and_append_only_trigger(
             session.execute(text("TRUNCATE TABLE minutes_revisions CASCADE"))
             session.commit()
         session.rollback()
-        revision = session.get(MinutesRevision, revision_id)
-        assert revision is not None
-        assert revision.content == "Synthetic immutable minutes"
+        stored_revision = session.get(MinutesRevision, revision_id)
+        assert stored_revision is not None
+        assert stored_revision.content == "Synthetic immutable minutes"
 
 
 def test_postgres_concurrent_decision_brief_writers_append_distinct_versions(
@@ -1231,10 +1243,162 @@ def test_postgres_concurrent_decision_brief_writers_append_distinct_versions(
     with postgres_sessions() as session:
         with pytest.raises(DBAPIError, match="append-only"):
             session.execute(
-                text("TRUNCATE TABLE decision_brief_decisions, decision_brief_versions")
+                text(
+                    "TRUNCATE TABLE decision_brief_approval_events, "
+                    "decision_brief_decisions, decision_brief_versions"
+                )
             )
             session.commit()
         session.rollback()
+
+
+def test_postgres_concurrent_decision_brief_approvals_write_one_terminal_event(
+    postgres_sessions: sessionmaker[Session],
+) -> None:
+    meeting_id = uuid4()
+    author_id = uuid4()
+    rector_id = uuid4()
+    warek_id = uuid4()
+    revision_id = uuid4()
+    brief_version_id = uuid4()
+    now = datetime.now(UTC)
+    with postgres_sessions() as session:
+        roles = {
+            role.role_code: role
+            for role in session.scalars(
+                select(Role).where(Role.role_code.in_(("SEKRETARIAT", "REKTOR", "WAREK")))
+            )
+        }
+        assert set(roles) == {"SEKRETARIAT", "REKTOR", "WAREK"}
+        author = User(
+            id=author_id,
+            email=f"brief-author-{uuid4()}@example.test",
+            full_name="Synthetic Brief Author",
+            password_hash="synthetic-only-not-used",
+            is_active=True,
+        )
+        author.roles.append(roles["SEKRETARIAT"])
+        rector = User(
+            id=rector_id,
+            email=f"brief-rector-{uuid4()}@example.test",
+            full_name="Synthetic Brief Rector",
+            password_hash="synthetic-only-not-used",
+            is_active=True,
+        )
+        rector.roles.append(roles["REKTOR"])
+        warek = User(
+            id=warek_id,
+            email=f"brief-warek-{uuid4()}@example.test",
+            full_name="Synthetic Brief Warek",
+            password_hash="synthetic-only-not-used",
+            is_active=True,
+        )
+        warek.roles.append(roles["WAREK"])
+        meeting = Meeting(
+            id=meeting_id,
+            meeting_number=f"BRIEF-APPROVAL-RACE-{uuid4()}",
+            title="Synthetic Decision Brief approval race",
+            meeting_date=date.today(),
+            created_by_id=author_id,
+            chairperson_id=rector_id,
+            notetaker_id=warek_id,
+            status=MeetingStatus.FINAL,
+            finalized_by_id=author_id,
+            finalized_at=now,
+        )
+        revision = MinutesRevision(
+            id=revision_id,
+            meeting_id=meeting_id,
+            revision_number=1,
+            content="Synthetic immutable minutes for approval",
+            created_by_id=author_id,
+            created_at=now,
+        )
+        review = MinutesReview(
+            meeting_id=meeting_id,
+            minutes_revision_id=revision_id,
+            reviewer_user_id=author_id,
+            review_number=1,
+            result=MinutesReviewResult.VALID,
+            reviewed_at=now,
+        )
+        brief_version = DecisionBriefVersion(
+            id=brief_version_id,
+            meeting_id=meeting_id,
+            source_minutes_revision_id=revision_id,
+            version_number=1,
+            summary="Synthetic approval race brief",
+            created_by_id=author_id,
+            created_at=now,
+        )
+        session.add_all([author, rector, warek, meeting, revision])
+        session.flush()
+        session.add_all([review, brief_version])
+        session.commit()
+        stored_author = session.get(User, author_id)
+        assert stored_author is not None
+        transition_decision_brief_workflow(
+            session,
+            meeting_id,
+            brief_version_id,
+            stored_author,
+            DecisionBriefApprovalEventType.SUBMITTED,
+            correlation_id=None,
+        )
+
+    barrier = Barrier(2)
+
+    def approve(actor_id: UUID) -> bool:
+        with postgres_sessions() as session:
+            actor = session.get(User, actor_id)
+            assert actor is not None
+            barrier.wait(timeout=10)
+            try:
+                transition_decision_brief_workflow(
+                    session,
+                    meeting_id,
+                    brief_version_id,
+                    actor,
+                    DecisionBriefApprovalEventType.APPROVED,
+                    correlation_id=None,
+                )
+            except DecisionBriefWorkflowConflict:
+                return False
+            return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(approve, (rector_id, warek_id)))
+
+    assert sum(results) == 1
+    with postgres_sessions() as session:
+        events = list(
+            session.scalars(
+                select(DecisionBriefApprovalEvent)
+                .where(DecisionBriefApprovalEvent.brief_version_id == brief_version_id)
+                .order_by(DecisionBriefApprovalEvent.event_number)
+            )
+        )
+        assert [event.event_type for event in events] == ["SUBMITTED", "APPROVED"]
+        approval_audits = list(
+            session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.object_id == brief_version_id,
+                    AuditEvent.action == "decision_brief.approved",
+                )
+            )
+        )
+    assert len(approval_audits) == 1
+
+
+def test_postgres_decision_brief_approval_events_reject_truncate(
+    postgres_sessions: sessionmaker[Session],
+) -> None:
+    with postgres_sessions() as session:
+        try:
+            with pytest.raises(DBAPIError, match="append-only"):
+                session.execute(text("TRUNCATE TABLE decision_brief_approval_events"))
+        finally:
+            session.rollback()
 
 
 def test_postgres_decision_brief_source_fk_rejects_cross_meeting_decision(
@@ -1568,3 +1732,14 @@ def test_postgres_concurrent_evidence_scan_results_append_only_one_terminal_even
     assert scans[0].scan_status == ActionItemEvidenceScanStatus.PENDING
     assert scans[1].scan_status == ActionItemEvidenceScanStatus.CLEAN
     assert scans[1].scanned_sha256 == digest
+
+
+def test_postgres_notetaker_handover_history_rejects_truncate(
+    postgres_sessions: sessionmaker[Session],
+) -> None:
+    with postgres_sessions() as session:
+        try:
+            with pytest.raises(DBAPIError, match="append-only"):
+                session.execute(text("TRUNCATE TABLE meeting_notetaker_handovers"))
+        finally:
+            session.rollback()

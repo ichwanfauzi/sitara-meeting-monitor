@@ -4,9 +4,12 @@ import hashlib
 import os
 import stat
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import func, select
+from pydantic import ValidationError
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -34,14 +37,21 @@ from app.models.action_item import (
     ProgressUpdate,
 )
 from app.models.auth import Role, User, user_roles
-from app.models.meeting import Meeting, MinutesDecision, MinutesRevision
+from app.models.disposition import Disposition
+from app.models.meeting import Meeting, MeetingParticipant, MinutesDecision, MinutesRevision
+from app.models.organization import OrganizationUnit, UserUnitMembership
 from app.schemas.action_items import (
     ActionItemAssignmentCreate,
     ActionItemAssignmentEnd,
     ActionItemCreate,
     ActionItemEvidenceLinkCreate,
     ActionItemStatusChange,
+    ActionItemUpdate,
+    AssignablePicDirectoryResponse,
+    AssignablePicDirectoryUser,
     CompletionReviewCreate,
+    OrganizationUnitDirectoryResponse,
+    OrganizationUnitReference,
     ProgressUpdateCreate,
 )
 from app.services.action_item_evidence_storage import (
@@ -53,11 +63,18 @@ from app.services.action_item_evidence_storage import (
     safe_display_filename,
     store_evidence_file,
 )
+from app.services.audit import (
+    append_action_item_assignment_changed_event,
+    append_action_item_created_event,
+    append_action_item_edit_event,
+)
+from app.services.notifications import notify_active_action_item_assignees
 from app.services.organization import (
+    assignable_pic_user_ids,
     can_access_task_scope,
     can_assign_pic,
     has_active_unit_membership,
-    is_active_secretariat,
+    is_active_action_manager,
 )
 
 
@@ -77,6 +94,10 @@ class ActionItemSourceNotActive(Exception):
     """Raised when a task is requested from a superseded minutes revision."""
 
 
+class ActionItemPersistenceError(Exception):
+    """Raised when a task and its required audit event cannot be saved."""
+
+
 class ActionItemAssignmentConflict(Exception):
     """Raised when an assignment would violate active PIC cardinality."""
 
@@ -85,8 +106,20 @@ class ActionItemAssigneeInvalid(Exception):
     """Raised when a target account is not eligible to be assigned as a PIC."""
 
 
+class ActionItemUnitInvalid(Exception):
+    """Raised when a selected unit is inactive or not valid for the PIC."""
+
+
+class ActionItemPicSearchInvalid(Exception):
+    """Raised when a PIC directory search is too short."""
+
+
 class ActionItemConcurrencyConflict(Exception):
     """Raised when a caller writes against an older task version."""
+
+
+class ActionItemEditConflict(Exception):
+    """Raised when a completed task cannot be edited or deleted."""
 
 
 class ActionItemStatusTransitionInvalid(Exception):
@@ -158,12 +191,28 @@ def _active_assignments(session: Session, action_item_id: UUID) -> list[ActionIt
     )
 
 
+def _assignment_audit_values(assignment: ActionItemAssignment) -> dict[str, str | None]:
+    values = {
+        "assignment_id": str(assignment.id),
+        "assignee_user_id": (
+            str(assignment.assignee_user_id) if assignment.assignee_user_id else None
+        ),
+        "assignment_role": AssignmentRole(assignment.assignment_role).value,
+        "pic_origin_unit_id": (
+            str(assignment.pic_origin_unit_id) if assignment.pic_origin_unit_id else None
+        ),
+    }
+    if assignment.assignee_display_name is not None:
+        values["assignee_display_name"] = assignment.assignee_display_name
+    return values
+
+
 def _can_read_item(
     session: Session,
     actor: User,
     assignments: list[ActionItemAssignment],
 ) -> bool:
-    if is_active_secretariat(session, actor):
+    if is_active_action_manager(session, actor):
         return True
     main = next(
         (
@@ -179,6 +228,7 @@ def _can_read_item(
         assignment.assignee_user_id
         for assignment in assignments
         if assignment.assignment_role == AssignmentRole.SUPPORTING
+        and assignment.assignee_user_id is not None
     }
     return can_access_task_scope(
         session,
@@ -190,8 +240,10 @@ def _can_read_item(
 
 def get_action_item_for_actor(session: Session, actor: User, action_item_id: UUID) -> ActionItem:
     action_item = session.get(ActionItem, action_item_id)
-    if action_item is None or not _can_read_item(
-        session, actor, _active_assignments(session, action_item_id)
+    if (
+        action_item is None
+        or action_item.deleted_at is not None
+        or not _can_read_item(session, actor, _active_assignments(session, action_item_id))
     ):
         raise ActionItemNotFound
     return action_item
@@ -205,6 +257,7 @@ def list_action_items(
     offset: int,
     meeting_id: UUID | None = None,
     official_status: ActionItemStatus | None = None,
+    include_deleted: bool = False,
 ) -> list[ActionItem]:
     if session.scalar(select(User.is_active).where(User.id == actor.id)) is not True:
         return []
@@ -213,12 +266,14 @@ def list_action_items(
         return []
 
     statement = select(ActionItem)
+    if not include_deleted:
+        statement = statement.where(ActionItem.deleted_at.is_(None))
     if meeting_id is not None:
         statement = statement.where(ActionItem.meeting_id == meeting_id)
     if official_status is not None:
         statement = statement.where(ActionItem.official_status == official_status.value)
 
-    if not is_active_secretariat(session, actor):
+    if not is_active_action_manager(session, actor):
         if not roles.intersection({PIC_ROLE, *MEETING_LEADER_ROLES}):
             return []
         assignment_filters: list[ColumnElement[bool]] = [ActionItemAssignment.ended_at.is_(None)]
@@ -294,8 +349,150 @@ def list_completion_verifications(
     )
 
 
-def create_action_item(session: Session, actor: User, data: ActionItemCreate) -> ActionItem:
-    if not is_active_secretariat(session, actor):
+def _has_action_item_management_role(session: Session, actor: User) -> bool:
+    return is_active_action_manager(session, actor)
+
+
+def can_manage_action_items(session: Session, actor: User, meeting: Meeting) -> bool:
+    return _has_action_item_management_role(session, actor)
+
+
+def can_access_action_item_pic_directory(session: Session, actor: User, meeting: Meeting) -> bool:
+    if _has_action_item_management_role(session, actor):
+        return True
+    roles = _role_codes(session, actor.id)
+    if (
+        session.scalar(select(User.is_active).where(User.id == actor.id)) is not True
+        or roles.intersection({SUPER_ADMIN_ROLE, PIC_ROLE})
+        or not roles.intersection(MEETING_LEADER_ROLES)
+    ):
+        return False
+    return (
+        actor.id in {meeting.created_by_id, meeting.chairperson_id, meeting.notetaker_id}
+        or session.scalar(
+            select(MeetingParticipant.meeting_id).where(
+                MeetingParticipant.meeting_id == meeting.id,
+                MeetingParticipant.user_id == actor.id,
+            )
+        )
+        is not None
+    )
+
+
+def can_manage_action_item_pic_directory(session: Session, actor: User) -> bool:
+    return _has_action_item_management_role(session, actor)
+
+
+def search_assignable_pics(
+    session: Session,
+    actor: User,
+    meeting_id: UUID,
+    *,
+    query: str,
+    limit: int,
+) -> AssignablePicDirectoryResponse:
+    meeting = session.get(Meeting, meeting_id)
+    if meeting is None:
+        raise ActionItemNotFound
+    if not can_manage_action_item_pic_directory(session, actor):
+        raise ActionItemPermissionDenied
+
+    normalized_query = query.strip()
+    if query and len(normalized_query) < 2:
+        raise ActionItemPicSearchInvalid
+    pattern = None
+    if normalized_query:
+        escaped_query = (
+            normalized_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped_query}%"
+    now = datetime.now(UTC)
+    assignable_ids = assignable_pic_user_ids(session, actor, at=now)
+    pic_filters: list[ColumnElement[bool]] = [User.id.in_(assignable_ids)]
+    if pattern is not None:
+        pic_filters.append(
+            or_(
+                User.full_name.ilike(pattern, escape="\\"),
+                User.job_title.ilike(pattern, escape="\\"),
+            )
+        )
+    pics = list(
+        session.scalars(
+            select(User).where(*pic_filters).order_by(User.full_name, User.id).limit(limit + 1)
+        ).all()
+    )
+    memberships = session.execute(
+        select(UserUnitMembership.user_id, OrganizationUnit)
+        .join(OrganizationUnit, OrganizationUnit.id == UserUnitMembership.unit_id)
+        .join(User, User.id == UserUnitMembership.user_id)
+        .where(
+            UserUnitMembership.user_id.in_(pic.id for pic in pics),
+            UserUnitMembership.valid_from <= now,
+            (UserUnitMembership.valid_until.is_(None)) | (UserUnitMembership.valid_until > now),
+            OrganizationUnit.is_active.is_(True),
+            User.is_active.is_(True),
+        )
+        .order_by(OrganizationUnit.unit_code, OrganizationUnit.name)
+    ).all()
+    memberships_by_user: dict[UUID, list[OrganizationUnitReference]] = {}
+    for user_id, unit in memberships:
+        memberships_by_user.setdefault(user_id, []).append(
+            OrganizationUnitReference(id=unit.id, unit_code=unit.unit_code, name=unit.name)
+        )
+    return AssignablePicDirectoryResponse(
+        query=normalized_query,
+        pics=[
+            AssignablePicDirectoryUser(
+                id=pic.id,
+                full_name=pic.full_name,
+                job_title=pic.job_title,
+                active_units=memberships_by_user.get(pic.id, []),
+            )
+            for pic in pics[:limit]
+        ],
+        units=[
+            OrganizationUnitReference(id=unit.id, unit_code=unit.unit_code, name=unit.name)
+            for unit in session.scalars(
+                select(OrganizationUnit)
+                .where(OrganizationUnit.is_active.is_(True))
+                .order_by(OrganizationUnit.unit_code, OrganizationUnit.name)
+            )
+        ],
+        more_pics=len(pics) > limit,
+    )
+
+
+def list_active_action_item_units(
+    session: Session,
+    actor: User,
+    meeting_id: UUID,
+) -> OrganizationUnitDirectoryResponse:
+    meeting = session.get(Meeting, meeting_id)
+    if meeting is None:
+        raise ActionItemNotFound
+    if not can_manage_action_item_pic_directory(session, actor):
+        raise ActionItemPermissionDenied
+    units = session.scalars(
+        select(OrganizationUnit)
+        .where(OrganizationUnit.is_active.is_(True))
+        .order_by(OrganizationUnit.unit_code, OrganizationUnit.name)
+    ).all()
+    return OrganizationUnitDirectoryResponse(
+        units=[
+            OrganizationUnitReference(id=unit.id, unit_code=unit.unit_code, name=unit.name)
+            for unit in units
+        ]
+    )
+
+
+def create_action_item(
+    session: Session,
+    actor: User,
+    data: ActionItemCreate,
+    *,
+    correlation_id: UUID | None = None,
+) -> ActionItem:
+    if not _has_action_item_management_role(session, actor):
         raise ActionItemPermissionDenied
     meeting = session.scalar(
         select(Meeting)
@@ -305,6 +502,9 @@ def create_action_item(session: Session, actor: User, data: ActionItemCreate) ->
     )
     if meeting is None:
         raise ActionItemSourceInvalid
+    if not can_manage_action_items(session, actor, meeting):
+        session.rollback()
+        raise ActionItemPermissionDenied
 
     source_revision = session.scalar(
         select(MinutesRevision).where(
@@ -323,6 +523,17 @@ def create_action_item(session: Session, actor: User, data: ActionItemCreate) ->
     if source_revision is None or decision is None or not decision.is_action_item:
         session.rollback()
         raise ActionItemSourceInvalid
+    disposition = (
+        session.get(Disposition, data.disposition_id) if data.disposition_id is not None else None
+    )
+    if data.disposition_id is not None and (
+        disposition is None
+        or disposition.meeting_id != data.meeting_id
+        or disposition.source_minutes_revision_id != data.source_minutes_revision_id
+        or disposition.source_decision_id != data.source_decision_id
+    ):
+        session.rollback()
+        raise ActionItemSourceInvalid
 
     active_revision_id = session.scalar(
         select(MinutesRevision.id)
@@ -333,13 +544,31 @@ def create_action_item(session: Session, actor: User, data: ActionItemCreate) ->
     if active_revision_id != source_revision.id:
         session.rollback()
         raise ActionItemSourceNotActive
-    if not can_assign_pic(session, actor, data.main_pic_user_id):
+    now = datetime.now(UTC)
+    responsible_unit_is_active = session.scalar(
+        select(OrganizationUnit.id).where(
+            OrganizationUnit.id == data.responsible_unit_id,
+            OrganizationUnit.is_active.is_(True),
+        )
+    )
+    if responsible_unit_is_active is None:
+        session.rollback()
+        raise ActionItemUnitInvalid
+    if data.main_pic_user_id is not None and not can_assign_pic(
+        session, actor, data.main_pic_user_id, at=now
+    ):
         session.rollback()
         raise ActionItemAssigneeInvalid
+    if data.main_pic_user_id is not None and not has_active_unit_membership(
+        session, data.main_pic_user_id, data.main_pic_origin_unit_id, at=now
+    ):
+        session.rollback()
+        raise ActionItemUnitInvalid
 
-    now = datetime.now(UTC)
     action_item = ActionItem(
         meeting_id=data.meeting_id,
+        disposition_id=data.disposition_id,
+        responsible_unit_id=data.responsible_unit_id,
         source_minutes_revision_id=source_revision.id,
         source_decision_id=decision.id,
         title=data.title,
@@ -356,10 +585,11 @@ def create_action_item(session: Session, actor: User, data: ActionItemCreate) ->
     assignment = ActionItemAssignment(
         action_item=action_item,
         assignee_user_id=data.main_pic_user_id,
+        assignee_display_name=data.main_pic_display_name,
         assigned_by_user_id=actor.id,
+        pic_origin_unit_id=data.main_pic_origin_unit_id,
         assignment_role=AssignmentRole.MAIN,
         started_at=now,
-        assignment_reason=data.main_assignment_reason,
     )
     initial_status = ActionItemStatusHistory(
         action_item=action_item,
@@ -372,10 +602,123 @@ def create_action_item(session: Session, actor: User, data: ActionItemCreate) ->
     )
     session.add_all([action_item, assignment, initial_status])
     try:
+        session.flush()
+        append_action_item_created_event(
+            session,
+            actor=actor,
+            action_item_id=action_item.id,
+            source_minutes_revision_id=source_revision.id,
+            source_decision_id=decision.id,
+            disposition_id=data.disposition_id,
+            correlation_id=correlation_id,
+        )
         session.commit()
-    except SQLAlchemyError:
+    except (SQLAlchemyError, ValidationError) as error:
         session.rollback()
-        raise
+        raise ActionItemPersistenceError from error
+    session.refresh(action_item)
+    return action_item
+
+
+def update_action_item(
+    session: Session,
+    actor: User,
+    action_item_id: UUID,
+    data: ActionItemUpdate,
+    *,
+    correlation_id: UUID | None = None,
+) -> ActionItem:
+    if not is_active_action_manager(session, actor):
+        raise ActionItemPermissionDenied
+    action_item = session.scalar(
+        select(ActionItem)
+        .where(ActionItem.id == action_item_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if action_item is None or action_item.deleted_at is not None:
+        raise ActionItemNotFound
+    if action_item.version != data.expected_version:
+        session.rollback()
+        raise ActionItemConcurrencyConflict
+    if action_item.official_status == ActionItemStatus.SELESAI:
+        session.rollback()
+        raise ActionItemEditConflict
+
+    changed_fields = [
+        field
+        for field in ("title", "description", "output_expected", "due_date", "priority")
+        if getattr(action_item, field) != getattr(data, field)
+    ]
+    if not changed_fields:
+        session.rollback()
+        return action_item
+
+    for field in changed_fields:
+        setattr(action_item, field, getattr(data, field))
+    now = datetime.now(UTC)
+    action_item.version += 1
+    action_item.updated_at = now
+    try:
+        append_action_item_edit_event(
+            session,
+            actor=actor,
+            action_item_id=action_item.id,
+            operation="UPDATED",
+            changed_fields=changed_fields,
+            correlation_id=correlation_id,
+        )
+        session.commit()
+    except (SQLAlchemyError, ValidationError) as error:
+        session.rollback()
+        raise ActionItemPersistenceError from error
+    session.refresh(action_item)
+    return action_item
+
+
+def delete_action_item(
+    session: Session,
+    actor: User,
+    action_item_id: UUID,
+    *,
+    expected_version: int,
+    correlation_id: UUID | None = None,
+) -> ActionItem:
+    if not is_active_action_manager(session, actor):
+        raise ActionItemPermissionDenied
+    action_item = session.scalar(
+        select(ActionItem)
+        .where(ActionItem.id == action_item_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if action_item is None or action_item.deleted_at is not None:
+        raise ActionItemNotFound
+    if action_item.version != expected_version:
+        session.rollback()
+        raise ActionItemConcurrencyConflict
+    if action_item.official_status == ActionItemStatus.SELESAI:
+        session.rollback()
+        raise ActionItemEditConflict
+
+    now = datetime.now(UTC)
+    action_item.deleted_at = now
+    action_item.deleted_by_id = actor.id
+    action_item.version += 1
+    action_item.updated_at = now
+    try:
+        append_action_item_edit_event(
+            session,
+            actor=actor,
+            action_item_id=action_item.id,
+            operation="DELETED",
+            changed_fields=["deleted_at"],
+            correlation_id=correlation_id,
+        )
+        session.commit()
+    except (SQLAlchemyError, ValidationError) as error:
+        session.rollback()
+        raise ActionItemPersistenceError from error
     session.refresh(action_item)
     return action_item
 
@@ -386,8 +729,10 @@ def create_assignment(
     action_item_id: UUID,
     data: ActionItemAssignmentCreate,
     expected_version: int,
+    *,
+    correlation_id: UUID | None = None,
 ) -> ActionItemAssignment:
-    if not is_active_secretariat(session, actor):
+    if not _has_action_item_management_role(session, actor):
         raise ActionItemPermissionDenied
     action_item = session.scalar(
         select(ActionItem)
@@ -397,19 +742,40 @@ def create_assignment(
     )
     if action_item is None:
         raise ActionItemNotFound
+    meeting = session.get(Meeting, action_item.meeting_id)
+    if meeting is None or not can_manage_action_items(session, actor, meeting):
+        session.rollback()
+        raise ActionItemPermissionDenied
     if action_item.version != expected_version:
         session.rollback()
         raise ActionItemConcurrencyConflict
-    if not can_assign_pic(session, actor, data.assignee_user_id):
+    now = datetime.now(UTC)
+    if data.assignee_user_id is not None and not can_assign_pic(
+        session, actor, data.assignee_user_id, at=now
+    ):
         session.rollback()
         raise ActionItemAssigneeInvalid
+    if data.assignee_user_id is not None and not has_active_unit_membership(
+        session, data.assignee_user_id, data.pic_origin_unit_id, at=now
+    ):
+        session.rollback()
+        raise ActionItemUnitInvalid
 
     current = _active_assignments(session, action_item_id)
     existing_for_user = next(
         (
             assignment
             for assignment in current
-            if assignment.assignee_user_id == data.assignee_user_id
+            if (
+                data.assignee_user_id is not None
+                and assignment.assignee_user_id == data.assignee_user_id
+            )
+            or (
+                data.assignee_display_name is not None
+                and assignment.assignee_display_name is not None
+                and assignment.assignee_display_name.casefold()
+                == data.assignee_display_name.casefold()
+            )
         ),
         None,
     )
@@ -417,7 +783,8 @@ def create_assignment(
         session.rollback()
         raise ActionItemAssignmentConflict
 
-    now = datetime.now(UTC)
+    before_values: dict[str, str | None] | None = None
+    operation: Literal["ASSIGNED", "REPLACED"] = "ASSIGNED"
     if data.assignment_role is AssignmentRole.MAIN:
         old_main = next(
             (
@@ -430,12 +797,11 @@ def create_assignment(
         if old_main is None:
             session.rollback()
             raise ActionItemAssignmentConflict
-        if data.reason is None:
-            session.rollback()
-            raise ActionItemAssignmentConflict
+        before_values = _assignment_audit_values(old_main)
+        operation = "REPLACED"
         old_main.ended_at = now
         old_main.ended_by_user_id = actor.id
-        old_main.end_reason = data.reason
+        old_main.end_reason = data.reason or "PIC utama diganti"
         # The partial unique index permits only one active MAIN row. Close the
         # previous row before inserting its replacement in this transaction.
         session.flush()
@@ -443,7 +809,9 @@ def create_assignment(
     assignment = ActionItemAssignment(
         action_item_id=action_item.id,
         assignee_user_id=data.assignee_user_id,
+        assignee_display_name=data.assignee_display_name,
         assigned_by_user_id=actor.id,
+        pic_origin_unit_id=data.pic_origin_unit_id,
         assignment_role=data.assignment_role,
         started_at=now,
         assignment_reason=data.reason,
@@ -452,13 +820,27 @@ def create_assignment(
     action_item.updated_at = now
     session.add(assignment)
     try:
-        session.commit()
+        session.flush()
     except IntegrityError as error:
         session.rollback()
         raise ActionItemAssignmentConflict from error
-    except SQLAlchemyError:
+    except SQLAlchemyError as error:
         session.rollback()
-        raise
+        raise ActionItemPersistenceError from error
+    try:
+        append_action_item_assignment_changed_event(
+            session,
+            actor=actor,
+            action_item_id=action_item.id,
+            operation=operation,
+            before_values=before_values,
+            after_values=_assignment_audit_values(assignment),
+            correlation_id=correlation_id,
+        )
+        session.commit()
+    except (SQLAlchemyError, ValidationError) as error:
+        session.rollback()
+        raise ActionItemPersistenceError from error
     session.refresh(assignment)
     return assignment
 
@@ -469,8 +851,10 @@ def end_assignment(
     action_item_id: UUID,
     assignment_id: UUID,
     data: ActionItemAssignmentEnd,
+    *,
+    correlation_id: UUID | None = None,
 ) -> ActionItemAssignment:
-    if not is_active_secretariat(session, actor):
+    if not _has_action_item_management_role(session, actor):
         raise ActionItemPermissionDenied
     action_item = session.scalar(
         select(ActionItem)
@@ -480,6 +864,10 @@ def end_assignment(
     )
     if action_item is None:
         raise ActionItemNotFound
+    meeting = session.get(Meeting, action_item.meeting_id)
+    if meeting is None or not can_manage_action_items(session, actor, meeting):
+        session.rollback()
+        raise ActionItemPermissionDenied
     if action_item.version != data.expected_version:
         session.rollback()
         raise ActionItemConcurrencyConflict
@@ -498,16 +886,30 @@ def end_assignment(
         raise ActionItemAssignmentConflict
 
     now = datetime.now(UTC)
+    before_values = _assignment_audit_values(assignment)
     assignment.ended_at = now
     assignment.ended_by_user_id = actor.id
-    assignment.end_reason = data.reason
+    assignment.end_reason = data.reason or "PIC pendukung diakhiri"
     action_item.version += 1
     action_item.updated_at = now
     try:
+        session.flush()
+        append_action_item_assignment_changed_event(
+            session,
+            actor=actor,
+            action_item_id=action_item.id,
+            operation="ENDED",
+            before_values=before_values,
+            after_values={
+                "assignment_id": str(assignment.id),
+                "ended_by_user_id": str(actor.id),
+            },
+            correlation_id=correlation_id,
+        )
         session.commit()
-    except SQLAlchemyError:
+    except (SQLAlchemyError, ValidationError) as error:
         session.rollback()
-        raise
+        raise ActionItemPersistenceError from error
     session.refresh(assignment)
     return assignment
 
@@ -764,6 +1166,40 @@ def create_link_evidence(
     return evidence
 
 
+def _read_integrity_checked_evidence(
+    evidence: ActionItemEvidence,
+    storage_root: Path,
+) -> bytes:
+    if evidence.storage_key is None or evidence.sha256 is None:
+        raise EvidenceStorageError("Evidence storage metadata is unavailable")
+    path = evidence_file_path(storage_root, evidence.storage_key)
+    try:
+        with path.open("rb") as evidence_file:
+            before = os.fstat(evidence_file.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_size != evidence.size_bytes
+                or before.st_size > MAX_EVIDENCE_FILE_BYTES
+            ):
+                raise EvidenceStorageError("Evidence file integrity check failed")
+            content = evidence_file.read(MAX_EVIDENCE_FILE_BYTES + 1)
+            after = os.fstat(evidence_file.fileno())
+    except OSError as error:
+        raise EvidenceStorageError("Evidence storage file is unavailable") from error
+
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or len(content) != evidence.size_bytes
+        or hashlib.sha256(content).hexdigest() != evidence.sha256
+    ):
+        raise EvidenceStorageError("Evidence file integrity check failed")
+    return content
+
+
 def get_evidence_file_for_actor(
     session: Session,
     actor: User,
@@ -798,26 +1234,7 @@ def get_evidence_file_for_actor(
         or scan.scanned_sha256 != evidence.sha256
     ):
         raise ActionItemEvidenceQuarantined
-    path = evidence_file_path(storage_root, evidence.storage_key)
-    try:
-        with path.open("rb") as evidence_file:
-            file_info = os.fstat(evidence_file.fileno())
-            if (
-                not stat.S_ISREG(file_info.st_mode)
-                or file_info.st_size != evidence.size_bytes
-                or file_info.st_size > MAX_EVIDENCE_FILE_BYTES
-            ):
-                raise EvidenceStorageError("Evidence file integrity check failed")
-            content = evidence_file.read(MAX_EVIDENCE_FILE_BYTES + 1)
-    except OSError as error:
-        raise EvidenceStorageError("Evidence storage file is unavailable") from error
-
-    if (
-        len(content) != evidence.size_bytes
-        or hashlib.sha256(content).hexdigest() != evidence.sha256
-    ):
-        raise EvidenceStorageError("Evidence file integrity check failed")
-    return evidence, content
+    return evidence, _read_integrity_checked_evidence(evidence, storage_root)
 
 
 def change_action_item_status(
@@ -826,7 +1243,7 @@ def change_action_item_status(
     action_item_id: UUID,
     data: ActionItemStatusChange,
 ) -> ActionItem:
-    if not is_active_secretariat(session, actor):
+    if not is_active_action_manager(session, actor):
         raise ActionItemPermissionDenied
     action_item = session.scalar(
         select(ActionItem)
@@ -856,17 +1273,16 @@ def change_action_item_status(
         )
         or 0
     ) + 1
-    session.add(
-        ActionItemStatusHistory(
-            action_item_id=action_item.id,
-            event_number=event_number,
-            old_status=old_status,
-            new_status=data.to_status,
-            changed_by_id=actor.id,
-            change_note=data.note,
-            changed_at=now,
-        )
+    status_event = ActionItemStatusHistory(
+        action_item_id=action_item.id,
+        event_number=event_number,
+        old_status=old_status,
+        new_status=data.to_status,
+        changed_by_id=actor.id,
+        change_note=data.note,
+        changed_at=now,
     )
+    session.add(status_event)
     # History must be written first so the database guard can validate that
     # every official status change has a matching immutable history event.
     session.flush()
@@ -874,6 +1290,12 @@ def change_action_item_status(
     action_item.completed_at = None
     action_item.version += 1
     action_item.updated_at = now
+    notify_active_action_item_assignees(
+        session,
+        action_item,
+        event_id=status_event.id,
+        actor_id=actor.id,
+    )
     try:
         session.commit()
     except SQLAlchemyError:
@@ -889,7 +1311,7 @@ def review_completion(
     action_item_id: UUID,
     data: CompletionReviewCreate,
 ) -> tuple[ActionItem, CompletionVerification]:
-    if not is_active_secretariat(session, actor):
+    if not is_active_action_manager(session, actor):
         raise ActionItemPermissionDenied
     action_item = session.scalar(
         select(ActionItem)
@@ -916,6 +1338,18 @@ def review_completion(
     if report is None:
         session.rollback()
         raise ActionItemVerificationInvalid
+    active_pic_assignment = session.scalar(
+        select(ActionItemAssignment.id)
+        .where(
+            ActionItemAssignment.action_item_id == action_item.id,
+            ActionItemAssignment.assignee_user_id == actor.id,
+            ActionItemAssignment.ended_at.is_(None),
+        )
+        .limit(1)
+    )
+    if report.actor_user_id == actor.id or active_pic_assignment is not None:
+        session.rollback()
+        raise ActionItemPermissionDenied
     prior_review = session.scalar(
         select(CompletionVerification.id).where(
             CompletionVerification.action_item_id == action_item.id,
@@ -925,6 +1359,38 @@ def review_completion(
     if prior_review is not None:
         session.rollback()
         raise ActionItemVerificationInvalid
+    if data.outcome is CompletionReviewOutcome.VERIFIED:
+        latest_scan_number = (
+            select(func.max(ActionItemEvidenceScan.event_number))
+            .where(ActionItemEvidenceScan.evidence_id == ActionItemEvidence.id)
+            .correlate(ActionItemEvidence)
+            .scalar_subquery()
+        )
+        clean_evidence = session.scalar(
+            select(ActionItemEvidence)
+            .join(
+                ActionItemEvidenceScan,
+                ActionItemEvidenceScan.evidence_id == ActionItemEvidence.id,
+            )
+            .where(
+                ActionItemEvidence.action_item_id == action_item.id,
+                ActionItemEvidence.evidence_kind == ActionItemEvidenceKind.FILE,
+                ActionItemEvidenceScan.event_number == latest_scan_number,
+                ActionItemEvidenceScan.scan_status == ActionItemEvidenceScanStatus.CLEAN,
+                ActionItemEvidence.sha256.is_not(None),
+                ActionItemEvidenceScan.scanned_sha256 == ActionItemEvidence.sha256,
+            )
+            .limit(1)
+        )
+        storage_root = get_settings().action_item_evidence_storage_path
+        if clean_evidence is None or storage_root is None:
+            session.rollback()
+            raise ActionItemVerificationInvalid
+        try:
+            _read_integrity_checked_evidence(clean_evidence, storage_root)
+        except EvidenceStorageError as error:
+            session.rollback()
+            raise ActionItemVerificationInvalid from error
 
     now = datetime.now(UTC)
     verification = CompletionVerification(

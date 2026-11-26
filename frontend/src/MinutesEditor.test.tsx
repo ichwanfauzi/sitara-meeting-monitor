@@ -59,14 +59,6 @@ const firstRevision = {
   created_at: '2026-10-15T08:30:00Z',
 };
 
-const latestRevision = {
-  ...firstRevision,
-  id: latestRevisionId,
-  revision_number: 2,
-  content: 'Catatan terbaru dari server',
-  created_by_id: otherUserId,
-  created_at: '2026-10-15T09:00:00Z',
-};
 const structuredRevision: MinutesRevision = {
   ...firstRevision,
   format_version: 2,
@@ -84,6 +76,7 @@ const structuredRevision: MinutesRevision = {
           discussion_id: '60000000-0000-4000-8000-000000000001',
           decision_number: 1,
           decision_text: 'Lengkapi laporan',
+          target_text: null,
           output_expected: 'Laporan revisi',
           target_date: '2026-11-30',
           is_action_item: true,
@@ -130,11 +123,13 @@ function jsonResponse(body: unknown, status = 200): Response {
 function setupEditor({
   currentUser = user,
   meetings = [meeting],
-  revisions = [firstRevision],
+  revisions = [structuredRevision],
+  targetMeetingId = meetingId,
 }: {
   currentUser?: typeof user;
   meetings?: (typeof meeting)[];
   revisions?: MinutesRevision[];
+  targetMeetingId?: string | null;
 } = {}) {
   const fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
@@ -143,7 +138,7 @@ function setupEditor({
     .mockResolvedValueOnce(jsonResponse(currentUser))
     .mockResolvedValueOnce(jsonResponse(meetings))
     .mockResolvedValueOnce(jsonResponse(revisions));
-  render(<MinutesEditor />);
+  render(<MinutesEditor targetMeetingId={targetMeetingId ?? undefined} />);
   return fetchMock;
 }
 
@@ -156,17 +151,79 @@ describe('MinutesEditor', () => {
     vi.unstubAllGlobals();
   });
 
+  it('shows the Rapim list first and opens the chosen meeting minutes form', async () => {
+    const fetchMock = setupEditor({
+      meetings: [meeting, secondMeeting],
+      targetMeetingId: null,
+    });
+
+    const firstMeetingLink = await screen.findByRole('link', {
+      name: /RAPIM-2026-001 · Rapat koordinasi sintetis/,
+    });
+    expect(screen.getByRole('heading', { name: 'Notulensi rapat' })).toBeInTheDocument();
+    expect(screen.queryByText('Pilih rapat untuk membuka notulensi rapat.')).toBeNull();
+    expect(screen.getByText('RAPIM · NOTULENSI')).toBeInTheDocument();
+    expect(screen.getByText('Buka salah satu rapat untuk melanjutkan.')).toBeInTheDocument();
+    expect(screen.getByText('2 rapat ditampilkan')).toBeInTheDocument();
+    expect(firstMeetingLink).toHaveAttribute('href', `#notulensi/${meeting.id}`);
+    expect(screen.queryByRole('table', { name: 'Tabel pengisian hasil rapat' })).toBeNull();
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).not.toContain(
+      `/api/v1/meetings/${meeting.id}/minutes-revisions`,
+    );
+  });
+
+  it('clears meeting search and restores the document-selection list', async () => {
+    const userActions = userEvent.setup();
+    setupEditor({
+      meetings: [meeting, secondMeeting],
+      targetMeetingId: null,
+    });
+
+    const search = await screen.findByRole('searchbox', { name: 'Cari rapat' });
+    await userActions.type(search, 'tidak ditemukan');
+    expect(await screen.findByText('Tidak ada rapat yang cocok.')).toBeVisible();
+    await userActions.click(screen.getByRole('button', { name: 'Hapus pencarian rapat' }));
+
+    expect(search).toHaveValue('');
+    expect(
+      await screen.findByRole('link', { name: /RAPIM-2026-001 · Rapat koordinasi sintetis/ }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('link', { name: /RAPIM-2026-002 · Rapat kedua sintetis/ }),
+    ).toBeVisible();
+  });
+
   it('loads only server meeting data and displays agenda and active revision metadata', async () => {
     const fetchMock = setupEditor();
 
-    expect(await screen.findByRole('heading', { name: 'Editor notulensi' })).toBeInTheDocument();
-    expect(screen.getByRole('option', { name: /RAPIM-2026-001/ })).toBeInTheDocument();
-    expect(screen.getByText('Evaluasi sintetis')).toBeInTheDocument();
-    expect(screen.getByLabelText('Isi notulensi')).toHaveValue('Catatan awal sintetis');
-    expect(screen.getByText('Revisi aktif: 1')).toBeInTheDocument();
     expect(
-      screen.getByText((_, element) => element?.textContent === `Pembuat (ID): ${userId}`),
+      await screen.findByRole('heading', { name: 'Notulensi rapat', level: 1 }),
     ).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Isi resmi' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Rapat terpilih' })).toBeInTheDocument();
+    expect(screen.queryByRole('searchbox', { name: 'Pilih rapat' })).toBeNull();
+    expect(screen.queryByText('RAPIM · NOTULENSI')).toBeNull();
+    expect(
+      screen.queryByText('Isi hasil rapat dalam tabel, lalu simpan setelah ditinjau.'),
+    ).toBeNull();
+    expect(screen.queryByText(/Satu baris mewakili satu pokok pembahasan/)).toBeNull();
+    expect(screen.queryByText(/PIC pada tabel ini adalah usulan/)).toBeNull();
+    expect(screen.queryByText('HASIL NOTULEN')).toBeNull();
+    expect(screen.queryByText('Pratinjau mengikuti notulensi yang sudah tersimpan.')).toBeNull();
+    expect(
+      screen.getByText(
+        (_, element) =>
+          element?.tagName === 'STRONG' && element.textContent?.includes('RAPIM-2026-001') === true,
+      ),
+    ).toBeInTheDocument();
+    const form = await screen.findByRole('region', { name: 'Form pengisian hasil rapat' });
+    expect(within(form).getByRole('heading', { name: 'Evaluasi sintetis' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Judul pembahasan 1 agenda 1')).toHaveValue('Evaluasi triwulan');
+    expect(screen.queryByText('Revisi aktif: 1')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Riwayat revisi/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText((_, element) => element?.textContent === `Pembuat (ID): ${userId}`),
+    ).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
       '/api/v1/auth/me',
       '/api/v1/meetings?limit=100&offset=0',
@@ -186,16 +243,161 @@ describe('MinutesEditor', () => {
     expect(screen.getByLabelText('Isi putusan 1 pembahasan 1')).toHaveValue('Lengkapi laporan');
   });
 
-  it('keeps legacy text readable when starting a structured revision without auto-assigning it', async () => {
-    const userActions = userEvent.setup();
+  it('keeps the selected minutes workspace focused on its form and actions', async () => {
     setupEditor();
-    await screen.findByLabelText('Isi notulensi');
 
-    await userActions.click(screen.getByRole('button', { name: 'Mulai notulensi terstruktur' }));
+    const form = await screen.findByRole('region', { name: 'Form pengisian hasil rapat' });
+    expect(form).toHaveAttribute('tabindex', '0');
+    expect(screen.queryByRole('searchbox', { name: 'Pilih rapat' })).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Notulensi rapat' })).toBeVisible();
+    expect(screen.getByText('Dapat menyunting')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Cetak hasil notulensi' })).toBeInTheDocument();
+    const saveButton = screen.getByRole('button', { name: 'Simpan notulensi' });
+    const previewHeading = screen.getByRole('heading', { name: 'Pratinjau tabel' });
+    expect(
+      saveButton.compareDocumentPosition(previewHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText(/Satu baris mewakili satu pokok pembahasan/)).toBeNull();
+    expect(screen.queryByText(/PIC pada tabel ini adalah usulan/)).toBeNull();
+    expect(screen.queryByText('Pratinjau mengikuti notulensi yang sudah tersimpan.')).toBeNull();
+  });
 
+  it('shows an agenda form with decision fields and a formal table preview', async () => {
+    const userActions = userEvent.setup();
+    setupEditor({ revisions: [structuredRevision] });
+
+    const entryForm = await screen.findByRole('region', { name: 'Form pengisian hasil rapat' });
+    expect(within(entryForm).getByRole('heading', { name: 'Pokok bahasan 1' })).toBeInTheDocument();
+    expect(within(entryForm).getByRole('heading', { name: 'Putusan 1' })).toBeInTheDocument();
+    expect(within(entryForm).getByLabelText('Isi putusan 1 pembahasan 1')).toBeInTheDocument();
+
+    const picSuggestion = within(entryForm).getByLabelText('PIC usulan');
+    await userActions.type(picSuggestion, 'Warek bidang akademik');
+    expect(picSuggestion).toHaveValue('Warek bidang akademik');
+
+    const printPreview = screen.getByRole('table', { name: 'Pratinjau hasil rapat' });
+    expect(within(printPreview).getByText('Lengkapi laporan')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cetak hasil notulensi' })).toBeDisabled();
+  });
+
+  it('groups agenda entry fields into a guided form while keeping the print preview table', async () => {
+    setupEditor({ revisions: [structuredRevision] });
+
+    const form = await screen.findByRole('region', { name: 'Form pengisian hasil rapat' });
+    expect(within(form).getByRole('heading', { name: 'Evaluasi sintetis' })).toBeVisible();
+    expect(within(form).getByLabelText('Isi pembahasan 1 agenda 1')).toBeVisible();
+    expect(within(form).getByLabelText('Isi putusan 1 pembahasan 1')).toBeVisible();
+    expect(within(form).getByLabelText('PIC usulan')).toBeVisible();
+    expect(within(form).getByLabelText('Output yang diharapkan')).toBeVisible();
+    expect(within(form).getByLabelText('Target penyelesaian berupa tanggal')).toBeVisible();
+    expect(screen.getByRole('table', { name: 'Pratinjau hasil rapat' })).toBeInTheDocument();
+    expect(screen.queryByRole('table', { name: 'Tabel pengisian hasil rapat' })).toBeNull();
+  });
+
+  it('shows follow-up fields only when a decision requires an action item', async () => {
+    const userActions = userEvent.setup();
+    const decisionOnlyRevision: MinutesRevision = {
+      ...structuredRevision,
+      discussions: structuredRevision.discussions.map((discussion) => ({
+        ...discussion,
+        decisions: discussion.decisions.map((decision) => ({
+          ...decision,
+          is_action_item: false,
+        })),
+      })),
+    };
+    setupEditor({ revisions: [decisionOnlyRevision] });
+
+    const form = await screen.findByRole('region', { name: 'Form pengisian hasil rapat' });
+    const followUpToggle = within(form).getByRole('checkbox', {
+      name: 'Memerlukan tindak lanjut',
+    });
+
+    expect(followUpToggle).not.toBeChecked();
+    expect(within(form).queryByLabelText('PIC usulan')).not.toBeInTheDocument();
+    expect(within(form).queryByLabelText('Output yang diharapkan')).not.toBeInTheDocument();
+    expect(
+      within(form).queryByLabelText('Target penyelesaian berupa tanggal'),
+    ).not.toBeInTheDocument();
+
+    await userActions.click(followUpToggle);
+
+    expect(within(form).getByLabelText('PIC usulan')).toBeVisible();
+    expect(within(form).getByLabelText('Output yang diharapkan')).toBeVisible();
+    expect(within(form).getByLabelText('Target penyelesaian berupa tanggal')).toBeVisible();
+  });
+
+  it('shows archived minutes as a read-only result table without the entry form', async () => {
+    const archivedMeeting = { ...meeting, status: 'ARCHIVED' };
+    setupEditor({ meetings: [archivedMeeting], revisions: [structuredRevision] });
+
+    const resultTable = await screen.findByRole('table', { name: 'Pratinjau hasil rapat' });
+    expect(resultTable).toHaveTextContent('Pembahasan awal berdasarkan data sintetis.');
+    expect(resultTable).toHaveTextContent('Lengkapi laporan');
+    expect(screen.queryByRole('region', { name: 'Form pengisian hasil rapat' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Simpan notulensi' })).toBeNull();
+    expect(screen.queryByLabelText('Isi pembahasan 1 agenda 1')).toBeNull();
+  });
+
+  it('opens the requested meeting from a meeting-specific route', async () => {
+    const userActions = userEvent.setup();
+    const fetchMock = setupEditor({
+      meetings: [meeting, secondMeeting],
+      revisions: [secondMeetingRevision],
+      targetMeetingId: secondMeeting.id,
+    });
+
+    expect(
+      await screen.findByRole('region', { name: 'Form pengisian hasil rapat' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('searchbox', { name: 'Pilih rapat' })).toBeNull();
+    expect(
+      screen.getByText(
+        (_, element) =>
+          element?.tagName === 'STRONG' &&
+          element.textContent?.includes(secondMeeting.meeting_number) === true,
+      ),
+    ).toBeInTheDocument();
+    await userActions.click(screen.getByText('Buka catatan notulensi terdahulu'));
+    expect(screen.getByText('Notulen rapat kedua')).toBeInTheDocument();
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain(
+      `/api/v1/meetings/${secondMeeting.id}/minutes-revisions`,
+    );
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).not.toContain(
+      `/api/v1/meetings/${meeting.id}/minutes-revisions`,
+    );
+  });
+
+  it('does not fall back to another meeting when the requested meeting is outside the accessible list', async () => {
+    const inaccessibleMeetingId = '30000000-0000-4000-8000-000000000099';
+    const fetchMock = setupEditor({
+      meetings: [meeting],
+      targetMeetingId: inaccessibleMeetingId,
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Rapat tidak termasuk dalam cakupan akses Anda.',
+    );
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).not.toContain(
+      `/api/v1/meetings/${meeting.id}/minutes-revisions`,
+    );
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).not.toContain(
+      `/api/v1/meetings/${inaccessibleMeetingId}/minutes-revisions`,
+    );
+  });
+
+  it('uses the guided editor for legacy revisions and keeps their text as a readable source', async () => {
+    const userActions = userEvent.setup();
+    setupEditor({ revisions: [firstRevision] });
+
+    const entryForm = await screen.findByRole('region', { name: 'Form pengisian hasil rapat' });
+    expect(screen.queryByLabelText('Isi notulensi')).not.toBeInTheDocument();
+    expect(
+      within(entryForm).getByText('Belum ada pokok bahasan untuk agenda ini.'),
+    ).toBeInTheDocument();
+    await userActions.click(screen.getByText('Buka catatan notulensi terdahulu'));
     expect(screen.getByText('Catatan awal sintetis')).toBeInTheDocument();
-    expect(screen.getByText('Belum ada pembahasan pada agenda ini.')).toBeInTheDocument();
-    expect(screen.getByText('Perubahan belum disimpan.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Simpan notulensi' })).toBeDisabled();
   });
 
   it('creates one complete structured snapshot from the agenda editor', async () => {
@@ -203,8 +405,10 @@ describe('MinutesEditor', () => {
     const fetchMock = setupEditor({ revisions: [] });
     fetchMock.mockResolvedValueOnce(jsonResponse(structuredRevision, 201));
 
-    await screen.findByText('Belum ada pembahasan pada agenda ini.');
-    await userActions.click(screen.getByRole('button', { name: 'Tambah pembahasan agenda 1' }));
+    await within(
+      await screen.findByRole('region', { name: 'Form pengisian hasil rapat' }),
+    ).findByText('Belum ada pokok bahasan untuk agenda ini.');
+    await userActions.click(screen.getByRole('button', { name: 'Isi pokok bahasan' }));
     await userActions.type(
       screen.getByLabelText('Judul pembahasan 1 agenda 1'),
       'Evaluasi triwulan',
@@ -213,11 +417,11 @@ describe('MinutesEditor', () => {
       screen.getByLabelText('Isi pembahasan 1 agenda 1'),
       'Pembahasan baru sintetis.',
     );
-    await userActions.click(screen.getByRole('button', { name: 'Tambah putusan pembahasan 1' }));
+    await userActions.click(screen.getByRole('button', { name: 'Tambah putusan' }));
     await userActions.type(screen.getByLabelText('Isi putusan 1 pembahasan 1'), 'Lengkapi laporan');
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
 
-    expect(await screen.findByText('Tersimpan sebagai revisi 1.')).toBeInTheDocument();
+    expect(await screen.findByText('Notulensi tersimpan.')).toBeInTheDocument();
     const writeCall = fetchMock.mock.calls.find(([, options]) => options?.method === 'POST');
     expect(JSON.parse(writeCall?.[1]?.body as string)).toEqual({
       format_version: 2,
@@ -231,8 +435,10 @@ describe('MinutesEditor', () => {
           decisions: [
             {
               decision_text: 'Lengkapi laporan',
+              pic_suggestion: null,
               output_expected: null,
               target_date: null,
+              target_text: null,
               is_action_item: false,
             },
           ],
@@ -253,9 +459,9 @@ describe('MinutesEditor', () => {
     const discussionInput = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
     await userActions.clear(discussionInput);
     await userActions.type(discussionInput, 'Draf terstruktur lokal yang dipertahankan');
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/revisi terbaru/i);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/notulensi terbaru/i);
     expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
       'Draf terstruktur lokal yang dipertahankan',
     );
@@ -273,8 +479,10 @@ describe('MinutesEditor', () => {
           decisions: [
             {
               decision_text: 'Lengkapi laporan',
+              pic_suggestion: null,
               output_expected: 'Laporan revisi',
               target_date: '2026-11-30',
+              target_text: null,
               is_action_item: true,
             },
           ],
@@ -282,7 +490,7 @@ describe('MinutesEditor', () => {
       ],
     });
 
-    await userActions.click(screen.getByRole('button', { name: 'Muat revisi terbaru' }));
+    await userActions.click(screen.getByRole('button', { name: 'Muat notulensi terbaru' }));
     expect(await screen.findByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
       'Revisi server terbaru.',
     );
@@ -292,30 +500,32 @@ describe('MinutesEditor', () => {
     );
   });
 
-  it('protects an unsaved structured draft when switching meetings', async () => {
+  it('keeps unsaved structured minutes and offers navigation back to the meeting list', async () => {
     const userActions = userEvent.setup();
-    const fetchMock = setupEditor({
+    setupEditor({
       meetings: [meeting, secondMeeting],
       revisions: [structuredRevision],
     });
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     const discussionInput = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
     await userActions.clear(discussionInput);
     await userActions.type(discussionInput, 'Draf agenda yang belum disimpan');
-    await userActions.selectOptions(
-      screen.getByRole('combobox', { name: 'Pilih rapat' }),
-      secondMeeting.id,
-    );
 
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(screen.getByRole('combobox', { name: 'Pilih rapat' })).toHaveValue(meeting.id);
+    expect(screen.getByRole('link', { name: 'Kembali ke daftar rapat' })).toHaveAttribute(
+      'href',
+      '#notulensi',
+    );
+    expect(screen.queryByRole('searchbox', { name: 'Pilih rapat' })).toBeNull();
+    expect(
+      screen.getByText(
+        (_, element) =>
+          element?.tagName === 'STRONG' &&
+          element.textContent?.includes(meeting.meeting_number) === true,
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
       'Draf agenda yang belum disimpan',
     );
-    expect(
-      fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/minutes-revisions')),
-    ).toHaveLength(1);
   });
 
   it('saves with the active base revision and uses the server response without duplicate submission', async () => {
@@ -328,10 +538,10 @@ describe('MinutesEditor', () => {
       }),
     );
 
-    const editor = await screen.findByLabelText('Isi notulensi');
+    const editor = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
     await userActions.clear(editor);
     await userActions.type(editor, 'Notulen diperbarui secara eksplisit');
-    const saveButton = screen.getByRole('button', { name: 'Simpan revisi' });
+    const saveButton = screen.getByRole('button', { name: 'Simpan notulensi' });
     await userActions.click(saveButton);
     expect(saveButton).toBeDisabled();
     await userActions.click(saveButton);
@@ -339,8 +549,26 @@ describe('MinutesEditor', () => {
     const saveCall = fetchMock.mock.calls.find(([, options]) => options?.method === 'POST');
     expect(saveCall?.[0]).toBe(`/api/v1/meetings/${meetingId}/minutes-revisions`);
     expect(JSON.parse(saveCall?.[1]?.body as string)).toEqual({
-      content: 'Notulen diperbarui secara eksplisit',
+      format_version: 2,
       base_revision_id: firstRevisionId,
+      content: null,
+      discussions: [
+        {
+          agenda_id: meeting.agendas[0].id,
+          subject: 'Evaluasi triwulan',
+          content: 'Notulen diperbarui secara eksplisit',
+          decisions: [
+            {
+              decision_text: 'Lengkapi laporan',
+              pic_suggestion: null,
+              output_expected: 'Laporan revisi',
+              target_date: '2026-11-30',
+              target_text: null,
+              is_action_item: true,
+            },
+          ],
+        },
+      ],
     });
     expect(new Headers(saveCall?.[1]?.headers as HeadersInit).get('X-CSRF-Token')).toBe(
       'csrf-test-token',
@@ -352,16 +580,19 @@ describe('MinutesEditor', () => {
     resolveSave(
       jsonResponse(
         {
-          ...firstRevision,
+          ...structuredRevision,
           id: latestRevisionId,
           revision_number: 2,
-          content: 'Notulen resmi dari response server',
+          discussions: structuredRevision.discussions.map((discussion) => ({
+            ...discussion,
+            content: 'Notulen resmi dari response server',
+          })),
         },
         201,
       ),
     );
-    expect(await screen.findByText('Tersimpan sebagai revisi 2.')).toBeInTheDocument();
-    expect(screen.getByLabelText('Isi notulensi')).toHaveValue(
+    expect(await screen.findByText('Notulensi tersimpan.')).toBeInTheDocument();
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
       'Notulen resmi dari response server',
     );
   });
@@ -373,78 +604,87 @@ describe('MinutesEditor', () => {
       .mockResolvedValueOnce(
         jsonResponse({ detail: 'Minutes changed since the supplied base revision' }, 409),
       )
-      .mockResolvedValueOnce(jsonResponse([firstRevision, latestRevision]));
+      .mockResolvedValueOnce(jsonResponse([structuredRevision, newerStructuredRevision]));
 
-    const editor = await screen.findByLabelText('Isi notulensi');
+    const editor = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
     await userActions.clear(editor);
     await userActions.type(editor, 'Draf lokal yang harus dipertahankan');
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/revisi terbaru/i);
-    expect(screen.getByLabelText('Isi notulensi')).toHaveValue(
+    expect(await screen.findByRole('alert')).toHaveTextContent(/notulensi terbaru/i);
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
       'Draf lokal yang harus dipertahankan',
     );
-    expect(screen.getByRole('button', { name: 'Simpan revisi' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Simpan notulensi' })).toBeDisabled();
     expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(
       1,
     );
 
-    await userActions.click(screen.getByRole('button', { name: 'Muat revisi terbaru' }));
-    expect(await screen.findByLabelText('Isi notulensi')).toHaveValue(
-      'Catatan terbaru dari server',
+    await userActions.click(screen.getByRole('button', { name: 'Muat notulensi terbaru' }));
+    expect(await screen.findByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
+      'Revisi server terbaru.',
     );
-    expect(screen.getByText('Draf lokal yang dipertahankan')).toBeInTheDocument();
-    expect(screen.getByText('Draf lokal yang harus dipertahankan')).toBeInTheDocument();
-    expect(screen.getByText('Revisi aktif: 2')).toBeInTheDocument();
+    expect(document.querySelector('.minutes-preserved-draft pre')).toHaveTextContent(
+      /Draf lokal yang harus dipertahankan/,
+    );
+    expect(screen.queryByText('Revisi aktif: 2')).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(
       1,
     );
 
-    await userActions.clear(screen.getByLabelText('Isi notulensi'));
+    await userActions.clear(screen.getByLabelText('Isi pembahasan 1 agenda 1'));
     await userActions.type(
-      screen.getByLabelText('Isi notulensi'),
+      screen.getByLabelText('Isi pembahasan 1 agenda 1'),
       'Perubahan berdasarkan revisi terbaru',
     );
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
     await waitFor(() =>
       expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(
         2,
       ),
     );
     const retryCall = fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')[1];
-    expect(JSON.parse(retryCall[1]?.body as string)).toEqual({
-      content: 'Perubahan berdasarkan revisi terbaru',
-      base_revision_id: latestRevisionId,
+    expect(JSON.parse(retryCall[1]?.body as string)).toMatchObject({
+      format_version: 2,
+      content: null,
+      base_revision_id: newerStructuredRevision.id,
+      discussions: [
+        {
+          agenda_id: meeting.agendas[0].id,
+          subject: 'Evaluasi triwulan',
+          content: 'Perubahan berdasarkan revisi terbaru',
+        },
+      ],
     });
   });
 
-  it('keeps a preserved conflict draft protected when switching meetings', async () => {
+  it('keeps a preserved conflict draft visible without a meeting picker', async () => {
     const userActions = userEvent.setup();
-    const fetchMock = setupEditor({ meetings: [meeting, secondMeeting] });
+    const fetchMock = setupEditor();
+
+    const editor = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
+    await userActions.clear(editor);
+    await userActions.type(editor, 'Draf yang masih harus disimpan');
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ detail: 'Minutes changed since the supplied base revision' }, 409),
       )
-      .mockResolvedValueOnce(jsonResponse([firstRevision, latestRevision]))
-      .mockResolvedValueOnce(jsonResponse([secondMeetingRevision]));
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
-
-    const editor = await screen.findByLabelText('Isi notulensi');
-    await userActions.clear(editor);
-    await userActions.type(editor, 'Draf yang masih harus disimpan');
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+      .mockResolvedValueOnce(jsonResponse([structuredRevision, newerStructuredRevision]));
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
     await screen.findByRole('alert');
-    await userActions.click(screen.getByRole('button', { name: 'Muat revisi terbaru' }));
-    await screen.findByText('Catatan terbaru dari server');
-
-    await userActions.selectOptions(
-      screen.getByRole('combobox', { name: 'Pilih rapat' }),
-      secondMeeting.id,
+    await userActions.click(screen.getByRole('button', { name: 'Muat notulensi terbaru' }));
+    expect(await screen.findByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
+      'Revisi server terbaru.',
     );
 
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(screen.getByRole('combobox', { name: 'Pilih rapat' })).toHaveValue(meeting.id);
-    expect(screen.getByText('Draf yang masih harus disimpan')).toBeInTheDocument();
+    expect(screen.queryByRole('searchbox', { name: 'Pilih rapat' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Kembali ke daftar rapat' })).toHaveAttribute(
+      'href',
+      '#notulensi',
+    );
+    expect(document.querySelector('.minutes-preserved-draft pre')).toHaveTextContent(
+      /Draf yang masih harus disimpan/,
+    );
   });
 
   it('distinguishes a 409 for a meeting that is no longer LIVE and refreshes its status', async () => {
@@ -456,19 +696,23 @@ describe('MinutesEditor', () => {
       )
       .mockResolvedValueOnce(jsonResponse({ ...meeting, status: 'FINAL' }));
 
-    const editor = await screen.findByLabelText('Isi notulensi');
+    const editor = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
     await userActions.clear(editor);
     await userActions.type(editor, 'Draf ketika rapat ditutup');
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/rapat.*tidak lagi LIVE/i);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/rapat tidak lagi berlangsung/i);
     expect(await screen.findByText('FINAL')).toBeInTheDocument();
-    expect(screen.getByLabelText('Isi notulensi')).toBeDisabled();
-    expect(screen.getByLabelText('Isi notulensi')).toHaveValue('Draf ketika rapat ditutup');
-    expect(screen.getByText('Draf lokal yang dipertahankan').nextElementSibling).toHaveTextContent(
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toBeDisabled();
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
       'Draf ketika rapat ditutup',
     );
-    expect(screen.queryByRole('button', { name: 'Muat revisi terbaru' })).not.toBeInTheDocument();
+    expect(document.querySelector('.minutes-preserved-draft pre')).toHaveTextContent(
+      /Draf ketika rapat ditutup/,
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Muat notulensi terbaru' }),
+    ).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.at(-1)?.[0]).toBe(`/api/v1/meetings/${meetingId}`);
     expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(
       1,
@@ -485,42 +729,46 @@ describe('MinutesEditor', () => {
       .mockRejectedValueOnce(new Error('Network unavailable'))
       .mockResolvedValueOnce(jsonResponse({ ...meeting, status: 'FINAL' }));
 
-    const editor = await screen.findByLabelText('Isi notulensi');
+    const editor = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
     await userActions.clear(editor);
     await userActions.type(editor, 'Draf tetap terlindungi');
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      /status rapat belum dapat diperbarui/i,
+    expect(await screen.findByRole('alert')).toHaveTextContent(/coba muat ulang status rapat/i);
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toBeDisabled();
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
+      'Draf tetap terlindungi',
     );
-    expect(screen.getByLabelText('Isi notulensi')).toBeDisabled();
-    expect(screen.getByLabelText('Isi notulensi')).toHaveValue('Draf tetap terlindungi');
     expect(screen.getByRole('button', { name: 'Muat ulang status rapat' })).toBeInTheDocument();
 
     await userActions.click(screen.getByRole('button', { name: 'Muat ulang status rapat' }));
     expect(await screen.findByText('FINAL')).toBeInTheDocument();
-    expect(screen.getByLabelText('Isi notulensi')).toBeDisabled();
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toBeDisabled();
     expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(
       1,
     );
   });
 
-  it('shows readable revisions but does not let a non-notetaker edit', async () => {
-    setupEditor({ currentUser: { ...user, id: otherUserId, roles: ['REKTOR'] } });
+  it('lets an in-scope Warek edit minutes while the meeting is live', async () => {
+    setupEditor({ currentUser: { ...user, id: otherUserId, roles: ['WAREK'] } });
 
-    expect(await screen.findByLabelText('Isi notulensi')).toHaveValue('Catatan awal sintetis');
-    expect(screen.getByLabelText('Isi notulensi')).toBeDisabled();
-    expect(screen.getByText(/Hanya notulis yang ditunjuk dapat menyunting/i)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Simpan revisi' })).not.toBeInTheDocument();
+    expect(await screen.findByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
+      'Pembahasan awal berdasarkan data sintetis.',
+    );
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toBeEnabled();
+    expect(screen.getByText('Dapat menyunting')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Simpan notulensi' })).toBeInTheDocument();
   });
 
   it('does not offer editing after a meeting is finalized', async () => {
     setupEditor({ meetings: [{ ...meeting, status: 'FINAL' }] });
 
-    expect(await screen.findByLabelText('Isi notulensi')).toHaveValue('Catatan awal sintetis');
-    expect(screen.getByLabelText('Isi notulensi')).toBeDisabled();
+    expect(await screen.findByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
+      'Pembahasan awal berdasarkan data sintetis.',
+    );
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toBeDisabled();
     expect(screen.getByText(/Rapat tidak sedang berlangsung/i)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Simpan revisi' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Simpan notulensi' })).not.toBeInTheDocument();
   });
 
   it('does not request meeting data for a Super Admin session', async () => {
@@ -545,32 +793,34 @@ describe('MinutesEditor', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('shows API validation errors without discarding the unsaved text', async () => {
+  it('shows API validation errors without discarding the structured draft', async () => {
     const userActions = userEvent.setup();
     const fetchMock = setupEditor();
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ detail: 'Minutes content must not be blank' }, 422),
     );
 
-    const editor = await screen.findByLabelText('Isi notulensi');
+    const editor = await screen.findByLabelText('Isi pembahasan 1 agenda 1');
     await userActions.clear(editor);
-    await userActions.type(editor, '   ');
-    await userActions.click(screen.getByRole('button', { name: 'Simpan revisi' }));
+    await userActions.type(editor, 'Pembahasan valid yang ditolak server');
+    await userActions.click(screen.getByRole('button', { name: 'Simpan notulensi' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Minutes content must not be blank');
-    expect(screen.getByLabelText('Isi notulensi')).toHaveValue('   ');
+    expect(screen.getByLabelText('Isi pembahasan 1 agenda 1')).toHaveValue(
+      'Pembahasan valid yang ditolak server',
+    );
   });
 
   it('shows an empty state when the meeting has no revision history', async () => {
     setupEditor({ revisions: [] });
 
-    expect(await screen.findByText('Belum ada revisi aktif')).toBeInTheDocument();
-    const history = screen.getByText(/Riwayat revisi/).closest('details');
-    expect(history).not.toBeNull();
+    expect(await screen.findByText('Belum ada notulensi tersimpan.')).toBeInTheDocument();
+    expect(screen.queryByText(/Riwayat revisi/)).not.toBeInTheDocument();
     expect(
-      await within(history as HTMLElement).findByText('Belum ada revisi notulensi.'),
+      within(screen.getByRole('region', { name: 'Form pengisian hasil rapat' })).getByText(
+        'Belum ada pokok bahasan untuk agenda ini.',
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText('Belum ada pembahasan pada agenda ini.')).toBeInTheDocument();
-    expect(screen.getByText('Belum ada revisi aktif')).toBeInTheDocument();
+    expect(screen.getByText('Belum ada notulensi tersimpan.')).toBeInTheDocument();
   });
 });
