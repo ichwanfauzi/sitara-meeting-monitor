@@ -69,19 +69,24 @@ def _set_audit_event_constraints(*, allow_brief_workflow: bool) -> None:
             )
 
     if dialect == "sqlite":
-        for operation in ("UPDATE", "DELETE"):
-            # Operation and trigger names are drawn only from this fixed tuple.
-            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
-            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
-            op.execute(
-                f"""
-                CREATE TRIGGER trg_audit_events_no_{operation.lower()}
-                BEFORE {operation} ON audit_events
-                BEGIN
-                    SELECT RAISE(ABORT, 'Audit event history is append-only');
-                END
-                """
-            )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_update
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_no_delete
+            BEFORE DELETE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Audit event history is append-only');
+            END
+            """
+        )
 
 
 def _create_approval_event_guards() -> None:
@@ -118,33 +123,45 @@ def _create_approval_event_guards() -> None:
             """
         )
     elif dialect == "sqlite":
-        for operation in ("UPDATE", "DELETE"):
-            # Operation and trigger names are drawn only from this fixed tuple.
-            # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
-            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # noqa: E501
-            op.execute(
-                f"""
-                CREATE TRIGGER trg_decision_brief_approval_events_no_{operation.lower()}
-                BEFORE {operation} ON decision_brief_approval_events
-                BEGIN
-                    SELECT RAISE(ABORT, 'Decision Brief approval event history is append-only');
-                END
-                """
-            )
+        op.execute(
+            """
+            CREATE TRIGGER trg_decision_brief_approval_events_no_update
+            BEFORE UPDATE ON decision_brief_approval_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Decision Brief approval event history is append-only');
+            END
+            """
+        )
+        op.execute(
+            """
+            CREATE TRIGGER trg_decision_brief_approval_events_no_delete
+            BEFORE DELETE ON decision_brief_approval_events
+            BEGIN
+                SELECT RAISE(ABORT, 'Decision Brief approval event history is append-only');
+            END
+            """
+        )
 
 
 def _drop_approval_event_guards() -> None:
     dialect = op.get_bind().dialect.name
     if dialect == "postgresql":
-        for operation in ("update", "delete", "truncate"):
-            op.execute(
-                f"DROP TRIGGER trg_decision_brief_approval_events_no_{operation} "
-                "ON decision_brief_approval_events"
-            )
+        op.execute(
+            "DROP TRIGGER trg_decision_brief_approval_events_no_update "
+            "ON decision_brief_approval_events"
+        )
+        op.execute(
+            "DROP TRIGGER trg_decision_brief_approval_events_no_delete "
+            "ON decision_brief_approval_events"
+        )
+        op.execute(
+            "DROP TRIGGER trg_decision_brief_approval_events_no_truncate "
+            "ON decision_brief_approval_events"
+        )
         op.execute("DROP FUNCTION reject_decision_brief_approval_event_mutation()")
     elif dialect == "sqlite":
-        for operation in ("update", "delete"):
-            op.execute(f"DROP TRIGGER trg_decision_brief_approval_events_no_{operation}")
+        op.execute("DROP TRIGGER trg_decision_brief_approval_events_no_update")
+        op.execute("DROP TRIGGER trg_decision_brief_approval_events_no_delete")
 
 
 def upgrade() -> None:

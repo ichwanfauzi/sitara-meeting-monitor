@@ -15,18 +15,23 @@ depends_on: str | Sequence[str] | None = None
 
 def _drop_sqlite_assignment_triggers() -> list[str]:
     connection = op.get_bind()
-    trigger_rows = connection.exec_driver_sql(
-        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND sql IS NOT NULL"
-    ).all()
-    affected_triggers = [
-        (name, sql)
-        for name, table_name, sql in trigger_rows
-        if table_name == "assignments" or "assignments" in sql
+    trigger_sql = [
+        connection.execute(
+            sa.text("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = :name"),
+            {"name": trigger_name},
+        ).scalar_one()
+        for trigger_name in (
+            "trg_assignments_update_guard",
+            "trg_assignments_no_delete",
+            "trg_assignments_pic_origin_immutable",
+            "trg_progress_updates_assignment",
+        )
     ]
-    for name, _ in affected_triggers:
-        quoted_name = '"' + name.replace('"', '""') + '"'
-        op.execute(f"DROP TRIGGER {quoted_name}")
-    return [sql for _, sql in affected_triggers]
+    op.execute("DROP TRIGGER trg_assignments_update_guard")
+    op.execute("DROP TRIGGER trg_assignments_no_delete")
+    op.execute("DROP TRIGGER trg_assignments_pic_origin_immutable")
+    op.execute("DROP TRIGGER trg_progress_updates_assignment")
+    return trigger_sql
 
 
 def _restore_sqlite_assignment_triggers(trigger_sql: list[str]) -> None:

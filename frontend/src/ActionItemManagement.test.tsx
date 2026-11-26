@@ -210,7 +210,9 @@ function actionFetch({
 }
 
 async function openTask(title = task.title): Promise<void> {
-  await userEvent.click(await screen.findByRole('button', { name: new RegExp(title) }));
+  await userEvent.click(
+    await screen.findByRole('button', { name: (accessibleName) => accessibleName.includes(title) }),
+  );
   await screen.findByRole('heading', { name: title });
 }
 
@@ -220,6 +222,18 @@ afterEach(() => {
 });
 
 describe('ActionItemManagement', () => {
+  it('treats task titles with regex punctuation literally', async () => {
+    const title = 'Siapkan laporan [sintetis]';
+    const specialTask = { ...task, title };
+    const specialDetail = { ...detail, title };
+    actionFetch({ items: [specialTask], itemDetail: specialDetail });
+    render(<ActionItemManagement authenticatedUser={secretary} />);
+
+    await openTask(title);
+
+    expect(screen.getByRole('heading', { name: title })).toBeVisible();
+  });
+
   it('shows the task list without details until a task is selected', async () => {
     const user = userEvent.setup();
     actionFetch();
