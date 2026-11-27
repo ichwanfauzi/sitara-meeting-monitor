@@ -29,11 +29,14 @@ class AuditEvent(Base):
             "'decision_brief.submitted', 'decision_brief.withdrawn', "
             "'decision_brief.approved', 'decision_brief.rejected', "
             "'disposition.created', 'action_item.created', 'action_item.assignment_changed', "
-            "'action_item.updated', 'action_item.deleted')",
+            "'action_item.status_changed', 'action_item.updated', 'action_item.deleted', "
+            "'user.created', 'user.updated', 'user.deactivated', 'user.reactivated', "
+            "'user.password_reset', 'user.password_changed', 'user.provisioned')",
             name="ck_audit_events_action",
         ),
         CheckConstraint(
-            "object_type IN ('meeting', 'decision_brief_version', 'disposition', 'action_item')",
+            "object_type IN ('meeting', 'decision_brief_version', 'disposition', 'action_item', "
+            "'user')",
             name="ck_audit_events_object_type",
         ),
         CheckConstraint(
@@ -48,9 +51,18 @@ class AuditEvent(Base):
             "AND object_type = 'decision_brief_version') OR "
             "(action = 'disposition.created' AND object_type = 'disposition') OR "
             "(action IN ('action_item.created', 'action_item.assignment_changed', "
+            "'action_item.status_changed', "
             "'action_item.updated', 'action_item.deleted') "
-            "AND object_type = 'action_item')",
+            "AND object_type = 'action_item') OR "
+            "(action IN ('user.created', 'user.updated', 'user.deactivated', "
+            "'user.reactivated', 'user.password_reset', 'user.password_changed', "
+            "'user.provisioned') AND object_type = 'user')",
             name="ck_audit_events_action_object_pair",
+        ),
+        CheckConstraint(
+            "(actor_type = 'USER' AND actor_user_id IS NOT NULL) OR "
+            "(actor_type = 'SYSTEM' AND actor_user_id IS NULL)",
+            name="ck_audit_events_actor_type",
         ),
         CheckConstraint(
             "result IN ('SUCCEEDED', 'DENIED')",
@@ -62,10 +74,13 @@ class AuditEvent(Base):
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
-    actor_user_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    actor_user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
     )
     actor_roles: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    actor_type: Mapped[str] = mapped_column(
+        String(20), default="USER", server_default="USER", nullable=False
+    )
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     object_type: Mapped[str] = mapped_column(String(50), nullable=False)
     object_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)

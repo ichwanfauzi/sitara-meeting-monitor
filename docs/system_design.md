@@ -246,9 +246,10 @@ di editor.
 - Halaman awal menu **Repository** memakai pola hero, pencarian, dan panel hasil yang sama dengan menu Rapat; daftar rapat tetap memiliki filter status dan bulan. Setelah rapat dipilih, halaman detail menampilkan agenda, notulensi, Decision Brief, dan tindak lanjut terkait dalam kelompok terpisah. PIC tetap memakai menu Tugas Saya dan tidak mendapat akses ke notulensi/Decision Brief; tindak lanjut yang tampil mengikuti cakupan akses API.
 - Halaman awal Rapat, Notulensi, Decision Brief, Tindak Lanjut, dan Repository memakai lebar konten yang konsisten serta pola hero/pencarian/hasil. Kartu daftar memakai dua kolom pada desktop dan beralih menjadi satu kolom pada layar sempit.
 - PIC melihat pengingat di dashboard untuk tugas sendiri yang sudah lewat tenggat atau jatuh tempo dalam tujuh hari. Pengingat ini hanya tampil dalam aplikasi; tidak mengirim email atau menghubungi layanan eksternal.
+- Ringkasan status Dashboard menyediakan kartu **Terlambat** yang menghitung dan memfilter Action Item aktif dengan tenggat sebelum tanggal hari ini; tugas selesai, terhapus, jatuh tempo hari ini, atau tanpa tenggat tidak dihitung.
 - Halaman awal menu Notulensi dan Decision Brief memakai daftar Rapim yang bisa dicari dan dipaginasi. Memilih Rapim langsung membuka fungsi pengisian yang sesuai.
 - Pemilih Rapim saat membuat Tindak Lanjut memakai pencarian teks dan hasil bertahap, bukan daftar panjang yang harus di-scroll.
-- Dashboard tidak menampilkan daftar Rapim terbaru. Kartu tindak lanjut ringkas menampilkan judul, status, dan PIC; klik kartu membuka detail dalam dialog yang sama seperti menu Tindak Lanjut. Tombol Lainnya menampilkan tugas berikutnya.
+- Dashboard tidak menampilkan daftar Rapim terbaru. Kartu tindak lanjut ringkas menampilkan judul, status, dan jabatan PIC tanpa menampilkan nama pribadi; klik kartu membuka detail dalam dialog yang sama seperti menu Tindak Lanjut. Tombol Lainnya menampilkan tugas berikutnya.
 
 ## 8. Komponen UI bersama
 

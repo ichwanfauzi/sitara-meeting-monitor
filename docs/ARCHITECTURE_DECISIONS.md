@@ -20,9 +20,18 @@
 
 ## ADR-004: Official status is controlled by Secretariat
 
-**Decision:** Only authorized Secretariat and Manager Legal users may change an action item's official status. PIC and other leaders submit progress updates; they do not directly change the official status.
+**Decision:** Only authorized Secretariat and Manager Legal users may change an
+action item's official status. PIC and other leaders submit progress updates;
+they do not directly change the official status. Every successful status
+change, including completion after verification, appends a content-free central
+audit event in the same transaction. The event records the prior and new
+status, actor roles verified from the database, and correlation ID where
+available; completion events also reference the verification record. Audit
+persistence failure rolls back the status, history, and notifications.
 
 **Reason:** Gives the two operational managers shared authority for official monitoring status. This must be enforced server-side and tested.
+
+**Impact:** Migration `0030_action_item_status_audit` adds the status event to the central audit allowlist. Downgrade refuses while these events exist.
 
 ## ADR-005: Meeting lifecycle and login attempt storage
 
@@ -137,23 +146,46 @@ retention, capacity, recovery, audit, and failure-domain properties remain
 unverified. Neither destination is asserted available or approved for
 production. The future VPS is the source and is not yet available.
 
-The proposed portable encryption method is recipient-based `age` with
-institution-controlled key custody; an approved managed-key service may be
-considered instead after a restore rehearsal. This is not a selected policy,
-installed dependency, or generated key. Encrypt before writing/transferring;
-hold the decryption identity separately under a formally appointed recovery
-key custodian; and verify plaintext sizes/digests after authorized decryption.
-Define recovery, rotation/revocation, and retained-backup compatibility before
-operation. The Director Sekretariat/Rektorat approves backup policy and
-production recovery; Super Admin is responsible for operations/monitoring; IT
-is responsible for infrastructure/storage; the formally appointed custodian
-controls key recovery. No operator self-approves production recovery or
-retention deletion.
+The repository implements an optional recipient-based `age` encryption path
+in the PostgreSQL backup/restore scripts. The scripts require an external
+`age` executable; their tests stub that executable, so real encryption,
+decryption, key custody, and destination integration have not been verified.
+`age` remains a proposed operational method, not an ITPLN-approved policy; an
+approved managed-key service may be considered instead after a restore
+rehearsal. Encrypt before writing/transferring; hold the decryption identity
+separately under a formally appointed recovery key custodian; and verify
+plaintext sizes/digests after authorized decryption. Define recovery,
+rotation/revocation, and retained-backup compatibility before operation.
+Proposed responsibility split, pending ITPLN confirmation: the Director
+Sekretariat/Rektorat approves backup policy and production recovery; Super
+Admin operates and monitors backups; IT provides infrastructure/storage; and
+the formally appointed custodian controls key recovery. No operator
+self-approves production recovery or retention deletion.
 
-Proposed retention is 14 daily, 8 weekly, and 12 monthly recovery points, with
-a monthly restore test. These are **PROPOSED** pending approval. Do not enable
-automatic pruning. Retention, capacity, campus recovery policy, access audit,
-RPO/RTO, and production restore require owner/IT decisions.
+Initial recovery-target recommendation, **DRAFT / NOT APPROVED**: RPO <=24
+hours and RTO <=2 business days, measured using ITPLN's official operating
+calendar. RPO requires a complete, consistent, encrypted PostgreSQL and
+private-evidence recovery point no older than 24 hours. Daily database backups
+and scheduled document/evidence backup or versioning must support a matching
+file state for each daily database point; a weekly full recovery point alone
+does not demonstrate the RPO. RTO starts when the responsible IT officer
+receives an incident report during official work hours; an after-hours report
+is handled starting the next workday, when the RTO clock begins. No unapproved
+daily work-hour assumption is implied. Recovery is complete when core service
+is usable and passes basic validation; root-cause investigation may continue
+afterward. A timed end-to-end rehearsal must demonstrate the target. For RPO
+<=1 hour, PostgreSQL WAL/PITR and coordinated private-evidence snapshots would
+be required.
+
+The current retention proposal, **DRAFT / NOT APPROVED**, is 14 daily database
+recovery points, 8 weekly full recovery points, and 12 monthly recovery points.
+The contents and alignment of monthly points with weekly full recovery points
+remain to be defined. Retention of operational source documents and evidence,
+separate from backup copies, follows a policy still to be approved.
+Automatic pruning is prohibited until retention, deletion authority, and
+legal-hold requirements are approved. Restore-test cadence, capacity, campus
+recovery policy, access audit, and production restore require owner/IT
+decisions.
 
 **Reason:** PostgreSQL metadata and private evidence files are separate
 storage systems. A database-only snapshot cannot prove evidence recovery;
@@ -162,10 +194,17 @@ reconciliation are needed to preserve PENDING quarantine, REJECTED denial,
 and CLEAN digest association.
 
 **Status and impact:** This ADR records a technical specification only.
-Backup scripts, encryption keys, destination integration, automated pruning,
-and restore automation are not implemented. Existing main database,
-Compose, schema, API contract, and volumes are unchanged. Stage 7.4.12 details
-and acceptance gates are in [`MIGRATION_PLAN.md`](./MIGRATION_PLAN.md).
+PostgreSQL backup and disposable-database restore scripts exist, but backup of
+private evidence files, approved destination/key integration, automated
+pruning, and end-to-end database/file restore are not implemented or verified.
+Existing main database, Compose, schema, API contract, and volumes are unchanged.
+Stage 7.4.12 details and acceptance gates are in
+[`MIGRATION_PLAN.md`](./MIGRATION_PLAN.md).
+
+**Amendment (2026-11-27):** This revised draft supersedes previous RTO and
+retention drafts. The targets and retention tiers above remain proposals and
+do not become institutional policy until approved by the authorized ITPLN
+owner.
 
 ## ADR-013: Version-bound Decision Brief approval workflow
 

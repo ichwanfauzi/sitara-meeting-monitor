@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   ApiError,
+  changePassword,
   getCurrentUser,
   login,
   logout,
@@ -89,6 +90,17 @@ export function useAuth() {
     }
   }, []);
 
+  const changeTemporaryPassword = useCallback(
+    async (currentPassword: string, newPassword: string) => {
+      await changePassword(currentPassword, newPassword);
+      const currentUser = await getCurrentUser();
+      setUser(currentUser);
+      setStatus('authenticated');
+      setMessage(null);
+    },
+    [],
+  );
+
   return {
     user,
     status,
@@ -96,5 +108,6 @@ export function useAuth() {
     checkSession,
     signIn,
     signOut,
+    changeTemporaryPassword,
   };
 }

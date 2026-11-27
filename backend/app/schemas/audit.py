@@ -10,8 +10,9 @@ from pydantic import BaseModel, ConfigDict, model_validator
 class AuditEventCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    actor_user_id: UUID
+    actor_user_id: UUID | None
     actor_roles: list[str]
+    actor_type: Literal["USER", "SYSTEM"] = "USER"
     action: Literal[
         "meeting.status_changed",
         "meeting.metadata_updated",
@@ -28,10 +29,18 @@ class AuditEventCreate(BaseModel):
         "disposition.created",
         "action_item.created",
         "action_item.assignment_changed",
+        "action_item.status_changed",
         "action_item.updated",
         "action_item.deleted",
+        "user.created",
+        "user.updated",
+        "user.deactivated",
+        "user.reactivated",
+        "user.password_reset",
+        "user.password_changed",
+        "user.provisioned",
     ]
-    object_type: Literal["meeting", "decision_brief_version", "disposition", "action_item"]
+    object_type: Literal["meeting", "decision_brief_version", "disposition", "action_item", "user"]
     object_id: UUID
     result: Literal["SUCCEEDED", "DENIED"]
     correlation_id: UUID | None = None
@@ -40,6 +49,65 @@ class AuditEventCreate(BaseModel):
 
     @model_validator(mode="after")
     def enforce_event_payload_allowlist(self) -> "AuditEventCreate":
+        if self.actor_type == "USER" and self.actor_user_id is None:
+            raise ValueError("User audit events require an actor")
+        if self.actor_type == "SYSTEM" and self.actor_user_id is not None:
+            raise ValueError("System audit events cannot reference a user actor")
+        if self.actor_type == "SYSTEM" and self.actor_roles:
+            raise ValueError("System audit events cannot claim user roles")
+
+        if self.action.startswith("user."):
+            if self.object_type != "user" or self.result != "SUCCEEDED":
+                raise ValueError("User account events must reference a successful user change")
+            if self.action in {"user.created", "user.provisioned"}:
+                if (
+                    self.before_values is not None
+                    or self.after_values is None
+                    or not {"email", "full_name", "role_code"} <= set(self.after_values)
+                    or set(self.after_values) - {"email", "full_name", "job_title", "role_code"}
+                ):
+                    raise ValueError("User creation event payload does not match the allowlist")
+                if self.action == "user.provisioned" and self.actor_type != "SYSTEM":
+                    raise ValueError("Initial user provisioning events must use the system actor")
+                if self.action == "user.created" and self.actor_type != "USER":
+                    raise ValueError("Admin-created user events require a user actor")
+                return self
+            if self.action == "user.updated":
+                allowed_fields = {"email", "full_name", "job_title", "role_code"}
+                if (
+                    self.before_values is None
+                    or self.after_values is None
+                    or not self.before_values
+                    or set(self.before_values) != set(self.after_values)
+                    or not set(self.before_values) <= allowed_fields
+                ):
+                    raise ValueError("User update event payload does not match the allowlist")
+                return self
+            if self.action in {"user.deactivated", "user.reactivated"}:
+                expected_values = (
+                    {"is_active": "true"}
+                    if self.action == "user.reactivated"
+                    else {"is_active": "false"}
+                )
+                expected_before = (
+                    {"is_active": "false"}
+                    if self.action == "user.reactivated"
+                    else {"is_active": "true"}
+                )
+                if self.before_values != expected_before or self.after_values != expected_values:
+                    raise ValueError("User activation event payload does not match the allowlist")
+                return self
+            expected_password_state = "false" if self.action == "user.password_changed" else "true"
+            if self.before_values is not None or self.after_values != {
+                "must_change_password": expected_password_state
+            }:
+                raise ValueError("User password event payload does not match the allowlist")
+            if self.action == "user.password_reset" and self.actor_type != "USER":
+                raise ValueError("Password reset events require a user actor")
+            if self.action == "user.password_changed" and self.actor_type != "USER":
+                raise ValueError("Password change events require a user actor")
+            return self
+
         if self.action == "meeting.status_changed":
             if self.object_type != "meeting":
                 raise ValueError("Meeting status events must reference meetings")
@@ -240,6 +308,19 @@ class AuditEventCreate(BaseModel):
                 "ended_by_user_id",
             }:
                 raise ValueError("Assignment end payload does not match the allowlist")
+            return self
+
+        if self.action == "action_item.status_changed":
+            if self.object_type != "action_item" or self.result != "SUCCEEDED":
+                raise ValueError("Action Item status events must record successful changes")
+            if (
+                self.before_values is None
+                or set(self.before_values) != {"official_status"}
+                or self.after_values is None
+                or not {"official_status"} <= set(self.after_values)
+                or not set(self.after_values) <= {"official_status", "verification_id"}
+            ):
+                raise ValueError("Action Item status payload does not match the allowlist")
             return self
 
         if self.action == "action_item.created":

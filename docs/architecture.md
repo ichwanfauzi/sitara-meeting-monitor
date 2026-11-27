@@ -324,7 +324,8 @@ Pull request menjalankan lint, format check, type checks, tests, build, secret s
 ## 13. Backup, recovery, dan rollback
 
 - Backup PostgreSQL dan file privat secara terpisah tetapi dengan prosedur koordinasi yang mencegah ketidaksesuaian.
-- Tentukan RPO/RTO bersama pemilik sistem sebelum production.
+- RPO/RTO dan retensi sudah memiliki rancangan usulan di bagian ini, tetapi
+  tetap memerlukan persetujuan resmi ITPLN sebelum production.
 - Enkripsi backup dan batasi akses; simpan salinan di luar akun/server production.
 - Uji restore ke environment terisolasi secara berkala.
 - Simpan nomor versi release dan riwayat migrasi.
@@ -332,8 +333,35 @@ Pull request menjalankan lint, format check, type checks, tests, build, secret s
 - Tidak ada pengujian restore, migrasi destruktif, atau scanner aktif yang membebani data production tanpa prosedur dan persetujuan.
 - Stage 7.4.12 menetapkan rancangan recovery point: custom-format PostgreSQL archive dan private-evidence archive harus ditangkap dalam satu periode quiesce, dienkripsi sebelum dipindahkan, diverifikasi dengan SHA-256, lalu direstore dan direkonsiliasi pada resource disposable. Rinciannya ada di [`MIGRATION_PLAN.md`](./MIGRATION_PLAN.md).
 - HDD eksternal adalah media offline prioritas yang direncanakan; OneDrive Microsoft 365 kampus adalah fallback/opsi terakhir. SharePoint Document Library khusus SITARA tidak tersedia dan belum ada aplikasi Entra ID untuk Graph, sehingga bila disetujui, petugas mengunggah ciphertext secara manual ke folder OneDrive dengan akses terbatas. Ketersediaan HDD, kapasitas, retensi, recovery kampus, dan persetujuan produksi tetap belum terverifikasi.
-- Super Admin/operator yang ditunjuk menjalankan dan memantau backup; Direktur menyetujui kebijakan dan pemulihan produksi; IT bertanggung jawab atas infrastruktur/storage; kustodian kunci yang ditunjuk resmi mengelola pemulihan kunci secara terpisah. Kandidat enkripsi recipient-based `age` tetap PROPOSED sampai disetujui dan diuji. Tanggung jawab ini tidak menambah hak bisnis Super Admin di SITARA.
-- Retensi 14 harian, 8 mingguan, 12 bulanan dan uji restore bulanan tetap PROPOSED; jangan aktifkan pruning otomatis. VPS belum tersedia dan backup tooling belum diimplementasikan. Jangan menyebut SITARA siap backup/restore produksi sampai salinan terenkripsi pada destination yang disetujui berhasil direstore dari salinan yang sama.
+- Model tanggung jawab yang diusulkan: Super Admin/operator yang ditunjuk menjalankan dan memantau backup; Direktur menyetujui kebijakan dan pemulihan produksi; IT bertanggung jawab atas infrastruktur/storage; kustodian kunci yang ditunjuk resmi mengelola pemulihan kunci secara terpisah. Konfirmasi formal ITPLN masih diperlukan. Skrip PostgreSQL memiliki jalur enkripsi/dekripsi recipient-based `age`, tetapi tes memakai stub untuk executable eksternal; penggunaan kriptografi nyata, kunci, dan destination belum diverifikasi atau disetujui. Tanggung jawab ini tidak menambah hak bisnis Super Admin di SITARA.
+- Target recovery **PROPOSED / NOT APPROVED**: RPO <=24 jam dan RTO <=2 hari
+  kerja menurut kalender operasional resmi ITPLN. RPO memerlukan recovery point
+  PostgreSQL dan file privat yang lengkap, konsisten, terenkripsi, dan dapat
+  dipulihkan dengan usia maksimal 24 jam; backup database dilakukan harian,
+  sementara dokumen dan bukti dilindungi melalui backup terjadwal atau
+  versioning dengan interval yang memungkinkan pemulihan file yang sesuai
+  untuk setiap titik database harian. Recovery point penuh mingguan saja tidak
+  membuktikan RPO tersebut. RTO dimulai saat laporan diterima petugas IT yang
+  bertanggung jawab pada jam kerja resmi (laporan di luar jam kerja mulai
+  ditangani pada hari kerja berikutnya, ketika perhitungan RTO dimulai),
+  menggunakan kalender
+  operasional resmi ITPLN dan tanpa asumsi jam kerja harian yang belum
+  disetujui. RTO berakhir setelah layanan inti dapat dipakai serta lolos
+  validasi dasar; investigasi akar masalah dapat dilanjutkan.
+  Target hanya dapat dinyatakan tercapai setelah latihan restore terukur.
+- Retensi **PROPOSED / NOT APPROVED**: 14 titik backup database harian, 8 titik
+  pemulihan penuh mingguan, dan 12 titik bulanan; isi dan penyelarasan titik
+  bulanan terhadap recovery point penuh mingguan masih perlu ditetapkan.
+  Retensi dokumen dan bukti operasional, terpisah dari salinan backup,
+  mengikuti kebijakan yang masih harus disetujui.
+  Jangan aktifkan pruning otomatis sebelum persetujuan retensi dan legal hold.
+- Bila dibutuhkan RPO <=1 jam, diperlukan WAL/PITR PostgreSQL dan snapshot file
+  privat yang terkoordinasi. Skrip backup PostgreSQL dan restore database
+  sandbox sudah tersedia, tetapi VPS belum tersedia dan backup file privat,
+  integrasi destination/key, pruning otomatis, serta pemulihan database+file
+  secara end-to-end belum diimplementasikan atau diverifikasi. Jangan menyebut
+  SITARA siap backup/restore produksi sampai salinan terenkripsi pada destination
+  yang disetujui berhasil direstore dari salinan yang sama.
 
 ## 14. Keputusan arsitektur yang sudah/masih terbuka
 

@@ -9,6 +9,8 @@ import MeetingManagement from './MeetingManagement';
 import MinutesEditor, { UNSAVED_MINUTES_NAVIGATION_WARNING } from './MinutesEditor';
 import NotificationCenter from './NotificationCenter';
 import { useAuth } from './useAuth';
+import PasswordChangePage from './PasswordChangePage';
+import AdminUserManagement from './AdminUserManagement';
 
 type IconName =
   | 'grid'
@@ -69,7 +71,15 @@ function displayRoles(user: AuthenticatedUser): string {
 
 function viewFromHash(
   hash: string,
-): 'dashboard' | 'meetings' | 'minutes' | 'decision-briefs' | 'action-items' | 'search' {
+):
+  | 'dashboard'
+  | 'meetings'
+  | 'minutes'
+  | 'decision-briefs'
+  | 'action-items'
+  | 'search'
+  | 'admin-users' {
+  if (hash === '#admin/users' || hash.startsWith('#admin/users/')) return 'admin-users';
   if (hash === '#search' || hash.startsWith('#search/')) return 'search';
   if (hash === '#action-items' || hash.startsWith('#action-items/')) return 'action-items';
   if (hash === '#notulensi' || hash.startsWith('#notulensi/')) return 'minutes';
@@ -121,6 +131,15 @@ function App() {
   }
 
   if (auth.status === 'authenticated' && auth.user) {
+    if (auth.user.must_change_password === true) {
+      return (
+        <PasswordChangePage
+          fullName={auth.user.full_name}
+          onChangePassword={auth.changeTemporaryPassword}
+          onLogout={auth.signOut}
+        />
+      );
+    }
     return <AuthenticatedApp authenticatedUser={auth.user} onLogout={auth.signOut} />;
   }
 
@@ -142,7 +161,13 @@ function AuthenticatedApp({
   onLogout: () => Promise<void>;
 }) {
   const [activeView, setActiveView] = useState<
-    'dashboard' | 'meetings' | 'minutes' | 'decision-briefs' | 'action-items' | 'search'
+    | 'dashboard'
+    | 'meetings'
+    | 'minutes'
+    | 'decision-briefs'
+    | 'action-items'
+    | 'search'
+    | 'admin-users'
   >(() => viewFromHash(window.location.hash));
   const [routeHash, setRouteHash] = useState(() => window.location.hash || '#dashboard');
   const [minutesHasPendingDraft, setMinutesHasPendingDraft] = useState(false);
@@ -156,6 +181,8 @@ function AuthenticatedApp({
   const targetActionItemId = actionItemIdFromHash(routeHash);
   const hasPicRole = authenticatedUser.roles.includes('PIC');
   const hasSuperAdminRole = authenticatedUser.roles.includes('SUPER_ADMIN');
+  const isStandaloneSuperAdmin =
+    authenticatedUser.roles.length === 1 && hasSuperAdminRole;
   const canReadMeetings =
     !hasPicRole &&
     !hasSuperAdminRole &&
@@ -266,6 +293,16 @@ function AuthenticatedApp({
               <span>Rapat</span>
             </a>
           )}
+          {isStandaloneSuperAdmin && (
+            <a
+              className={`nav-link${activeView === 'admin-users' ? ' is-active' : ''}`}
+              href="#admin/users"
+              aria-current={activeView === 'admin-users' ? 'page' : undefined}
+            >
+              <Icon name="users" />
+              <span>Pengguna</span>
+            </a>
+          )}
           {canOpenMinutes && (
             <a
               className={`nav-link${activeView === 'minutes' ? ' is-active' : ''}`}
@@ -358,6 +395,8 @@ function AuthenticatedApp({
                         ? 'Rapat'
                         : activeView === 'search'
                           ? 'Repository & Pencarian'
+                          : activeView === 'admin-users'
+                            ? 'Pengguna'
                           : 'Dashboard'}
               </strong>
             </div>
@@ -383,6 +422,9 @@ function AuthenticatedApp({
         )}
 
         {activeView === 'dashboard' && <Dashboard authenticatedUser={authenticatedUser} />}
+        {activeView === 'admin-users' && (
+          <AdminUserManagement authenticatedUser={authenticatedUser} />
+        )}
         {activeView === 'search' && <SearchPage authenticatedUser={authenticatedUser} />}
         {activeView === 'meetings' && <MeetingManagement authenticatedUser={authenticatedUser} />}
         {activeView === 'action-items' && (

@@ -67,6 +67,7 @@ from app.services.audit import (
     append_action_item_assignment_changed_event,
     append_action_item_created_event,
     append_action_item_edit_event,
+    append_action_item_status_changed_event,
 )
 from app.services.notifications import notify_active_action_item_assignees
 from app.services.organization import (
@@ -1243,6 +1244,8 @@ def change_action_item_status(
     actor: User,
     action_item_id: UUID,
     data: ActionItemStatusChange,
+    *,
+    correlation_id: UUID | None = None,
 ) -> ActionItem:
     if not is_active_action_manager(session, actor):
         raise ActionItemPermissionDenied
@@ -1291,17 +1294,25 @@ def change_action_item_status(
     action_item.completed_at = None
     action_item.version += 1
     action_item.updated_at = now
-    notify_active_action_item_assignees(
-        session,
-        action_item,
-        event_id=status_event.id,
-        actor_id=actor.id,
-    )
     try:
+        notify_active_action_item_assignees(
+            session,
+            action_item,
+            event_id=status_event.id,
+            actor_id=actor.id,
+        )
+        append_action_item_status_changed_event(
+            session,
+            actor=actor,
+            action_item_id=action_item.id,
+            before_status=old_status.value,
+            after_status=ActionItemStatus(action_item.official_status).value,
+            correlation_id=correlation_id,
+        )
         session.commit()
-    except SQLAlchemyError:
+    except (SQLAlchemyError, ValidationError) as error:
         session.rollback()
-        raise
+        raise ActionItemPersistenceError from error
     session.refresh(action_item)
     return action_item
 
@@ -1311,6 +1322,8 @@ def review_completion(
     actor: User,
     action_item_id: UUID,
     data: CompletionReviewCreate,
+    *,
+    correlation_id: UUID | None = None,
 ) -> tuple[ActionItem, CompletionVerification]:
     if not is_active_action_manager(session, actor):
         raise ActionItemPermissionDenied
@@ -1406,6 +1419,7 @@ def review_completion(
     try:
         session.flush()
         if data.outcome is CompletionReviewOutcome.VERIFIED:
+            old_status = ActionItemStatus(action_item.official_status)
             event_number = (
                 session.scalar(
                     select(func.coalesce(func.max(ActionItemStatusHistory.event_number), 0)).where(
@@ -1429,15 +1443,29 @@ def review_completion(
             session.flush()
             action_item.official_status = ActionItemStatus.SELESAI
             action_item.completed_at = now
+            append_action_item_status_changed_event(
+                session,
+                actor=actor,
+                action_item_id=action_item.id,
+                before_status=old_status.value,
+                after_status=ActionItemStatus.SELESAI.value,
+                correlation_id=correlation_id,
+                verification_id=verification.id,
+            )
+            try:
+                session.flush()
+            except (SQLAlchemyError, ValidationError) as error:
+                session.rollback()
+                raise ActionItemPersistenceError from error
         action_item.version += 1
         action_item.updated_at = now
         session.commit()
     except IntegrityError as error:
         session.rollback()
         raise ActionItemVerificationInvalid from error
-    except SQLAlchemyError:
+    except (SQLAlchemyError, ValidationError) as error:
         session.rollback()
-        raise
+        raise ActionItemPersistenceError from error
     session.refresh(action_item)
     session.refresh(verification)
     return action_item, verification

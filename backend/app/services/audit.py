@@ -271,6 +271,71 @@ def append_action_item_edit_event(
     return event
 
 
+def append_action_item_status_changed_event(
+    session: Session,
+    *,
+    actor: User,
+    action_item_id: UUID,
+    before_status: str,
+    after_status: str,
+    correlation_id: UUID | None,
+    verification_id: UUID | None = None,
+) -> AuditEvent:
+    after_values = {"official_status": after_status}
+    if verification_id is not None:
+        after_values["verification_id"] = str(verification_id)
+    data = AuditEventCreate(
+        actor_user_id=actor.id,
+        actor_roles=_verified_actor_roles(session, actor.id),
+        action="action_item.status_changed",
+        object_type="action_item",
+        object_id=action_item_id,
+        result="SUCCEEDED",
+        correlation_id=correlation_id,
+        before_values={"official_status": before_status},
+        after_values=after_values,
+    )
+    event = AuditEvent(**data.model_dump())
+    session.add(event)
+    return event
+
+
+def append_user_account_event(
+    session: Session,
+    *,
+    actor: User | None,
+    action: Literal[
+        "user.created",
+        "user.updated",
+        "user.deactivated",
+        "user.reactivated",
+        "user.password_reset",
+        "user.password_changed",
+        "user.provisioned",
+    ],
+    user_id: UUID,
+    before_values: dict[str, str | None] | None = None,
+    after_values: dict[str, str | None] | None = None,
+    correlation_id: UUID | None = None,
+) -> AuditEvent:
+    system_actor = actor is None
+    data = AuditEventCreate(
+        actor_user_id=actor.id if actor is not None else None,
+        actor_roles=_verified_actor_roles(session, actor.id) if actor is not None else [],
+        actor_type="SYSTEM" if system_actor else "USER",
+        action=action,
+        object_type="user",
+        object_id=user_id,
+        result="SUCCEEDED",
+        correlation_id=correlation_id,
+        before_values=before_values,
+        after_values=after_values,
+    )
+    event = AuditEvent(**data.model_dump())
+    session.add(event)
+    return event
+
+
 def append_decision_brief_workflow_event(
     session: Session,
     *,

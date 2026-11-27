@@ -1312,7 +1312,7 @@ def test_user_job_title_migration_preserves_rows_and_blocks_data_loss(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
         assert user == ("Synthetic Existing User", None)
-        assert migration_head == "0029_minutes_supporting_pic"
+        assert migration_head == "0030_action_item_status_audit"
 
         with engine.begin() as connection:
             connection.execute(
@@ -1388,7 +1388,7 @@ def test_audit_event_migration_is_append_only_and_refuses_data_loss(
         with engine.connect() as connection:
             assert (
                 connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-                == "0029_minutes_supporting_pic"
+                == "0030_action_item_status_audit"
             )
             connection.execute(
                 text(
@@ -1567,6 +1567,108 @@ def test_disposition_migration_extends_audit_constraints_and_guards_downgrade(
         get_settings.cache_clear()
 
 
+def test_action_item_status_audit_migration_allows_events_and_refuses_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    database_path = tmp_path / "action-item-status-audit.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config.set_main_option("sqlalchemy.url", database_url)
+    get_settings.cache_clear()
+    engine = create_engine(database_url)
+    actor_id = str(uuid4())
+    event_id = str(uuid4())
+    legacy_events = [
+        ("minutes.revised", "meeting", str(uuid4())),
+        ("decision_brief.saved", "decision_brief_version", str(uuid4())),
+    ]
+
+    try:
+        command.upgrade(config, "0029_minutes_supporting_pic")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (id, email, full_name, password_hash, is_active) "
+                    "VALUES (:id, :email, :full_name, :password_hash, :is_active)"
+                ),
+                {
+                    "id": actor_id,
+                    "email": "status-audit-migration@example.test",
+                    "full_name": "Synthetic Status Auditor",
+                    "password_hash": "synthetic-only-not-used",
+                    "is_active": True,
+                },
+            )
+            for action, object_type, object_id in legacy_events:
+                connection.execute(
+                    text(
+                        "INSERT INTO audit_events "
+                        "(id, actor_user_id, actor_roles, action, object_type, object_id, result) "
+                        "VALUES (:id, :actor_id, :roles, :action, :object_type, :object_id, "
+                        "'SUCCEEDED')"
+                    ),
+                    {
+                        "id": str(uuid4()),
+                        "actor_id": actor_id,
+                        "roles": '["SEKRETARIAT"]',
+                        "action": action,
+                        "object_type": object_type,
+                        "object_id": object_id,
+                    },
+                )
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            preserved_events = connection.execute(
+                text(
+                    "SELECT action, object_type, object_id FROM audit_events "
+                    "WHERE action IN ('minutes.revised', 'decision_brief.saved') "
+                    "ORDER BY action"
+                )
+            ).all()
+        assert [(row.action, row.object_type) for row in preserved_events] == [
+            (action, object_type) for action, object_type, _ in sorted(legacy_events)
+        ]
+        command.downgrade(config, "0029_minutes_supporting_pic")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0029_minutes_supporting_pic"
+            )
+        command.upgrade(config, "head")
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, actor_user_id, actor_roles, action, object_type, object_id, "
+                    "result, before_values, after_values) "
+                    "VALUES (:id, :actor_id, :roles, 'action_item.status_changed', "
+                    "'action_item', :object_id, 'SUCCEEDED', :before, :after)"
+                ),
+                {
+                    "id": event_id,
+                    "actor_id": actor_id,
+                    "roles": '["SEKRETARIAT"]',
+                    "object_id": str(uuid4()),
+                    "before": '{"official_status":"BELUM_DIMULAI"}',
+                    "after": '{"official_status":"TERKENDALA"}',
+                },
+            )
+
+        with pytest.raises(RuntimeError, match="status audit events exist"):
+            command.downgrade(config, "0029_minutes_supporting_pic")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0030_action_item_status_audit"
+            )
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
 def test_action_item_disposition_migration_preserves_guards_and_audits_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1731,7 +1833,7 @@ def test_evidence_quarantine_migration_backfills_existing_files(
             ).scalar_one()
 
         assert scan_event == (1, "PENDING")
-        assert migration_head == "0029_minutes_supporting_pic"
+        assert migration_head == "0030_action_item_status_audit"
     finally:
         engine.dispose()
         get_settings.cache_clear()
@@ -2370,7 +2472,7 @@ def test_structured_minutes_migration_preserves_legacy_text_and_bound_review(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
 
-        assert migration_head == "0029_minutes_supporting_pic"
+        assert migration_head == "0030_action_item_status_audit"
         assert (revision.format_version, revision.content) == (1, original_text)
         assert (review.minutes_revision_id, review.result) == (revision_id, "VALID")
         assert {

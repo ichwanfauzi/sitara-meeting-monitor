@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from starlette.middleware import Middleware
 
 from app.api.routes.action_items import router as action_items_router
+from app.api.routes.admin_users import router as admin_users_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.dispositions import router as dispositions_router
 from app.api.routes.health import router as health_router
@@ -29,6 +30,7 @@ app = FastAPI(
 )
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(admin_users_router, prefix="/api/v1")
 app.include_router(action_items_router, prefix="/api/v1")
 app.include_router(dispositions_router, prefix="/api/v1")
 app.include_router(meetings_router, prefix="/api/v1")

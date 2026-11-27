@@ -2,15 +2,25 @@
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.security import (
     generate_session_token,
+    hash_password,
     hash_session_token,
     verify_password,
 )
 from app.models.auth import User, UserSession
+
+
+class InvalidPasswordChange(ValueError):
+    """Raised when a password change does not prove the current credential."""
+
+
+class PasswordChangePersistenceError(RuntimeError):
+    """Raised when a password change transaction cannot be persisted."""
 
 
 def authenticate_user(session: Session, email: str, password: str) -> User | None:
@@ -55,3 +65,35 @@ def find_active_session(session: Session, raw_token: str) -> tuple[UserSession, 
 def revoke_user_session(session: Session, user_session: UserSession) -> None:
     user_session.revoked_at = datetime.now(UTC)
     session.commit()
+
+
+def change_user_password(
+    session: Session,
+    *,
+    user: User,
+    current_session: UserSession,
+    current_password: str,
+    new_password: str,
+) -> None:
+    if not verify_password(current_password, user.password_hash) or verify_password(
+        new_password, user.password_hash
+    ):
+        raise InvalidPasswordChange
+
+    now = datetime.now(UTC)
+    user.password_hash = hash_password(new_password)
+    user.must_change_password = False
+    session.execute(
+        update(UserSession)
+        .where(
+            UserSession.user_id == user.id,
+            UserSession.id != current_session.id,
+            UserSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    try:
+        session.commit()
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise PasswordChangePersistenceError from error

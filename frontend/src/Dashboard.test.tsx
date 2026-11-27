@@ -6,6 +6,16 @@ import Dashboard from './Dashboard';
 
 const unitId = '50000000-0000-4000-8000-000000000001';
 
+function dateOffset(days: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-');
+}
+
 const secretary: AuthenticatedUser = {
   id: '20000000-0000-4000-8000-000000000001',
   email: 'sekretariat@example.test',
@@ -59,7 +69,8 @@ const actionItem: ActionItemSummary = {
       action_item_id: '40000000-0000-4000-8000-000000000001',
       assignee_user_id: '44000000-0000-4000-8000-000000000001',
       assignee_display_name: null,
-      assignee_name: 'PIC Uji',
+      assignee_name: 'Nama Pribadi Sintetis',
+      assignee_job_title: 'Wakil Rektor I',
       pic_origin_unit: { id: unitId, unit_code: 'UNIT-UJI', name: 'Unit Uji' },
       assigned_by_user_id: secretary.id,
       assignment_role: 'MAIN',
@@ -138,15 +149,84 @@ describe('API-backed dashboard', () => {
     const taskButton = await screen.findByRole('button', {
       name: /Menyiapkan laporan sintetis/,
     });
-    expect(taskButton).toHaveTextContent('PIC Uji');
+    expect(taskButton).toHaveTextContent('Wakil Rektor I');
+    expect(taskButton).not.toHaveTextContent('Nama Pribadi Sintetis');
     expect(taskButton).not.toHaveTextContent('Laporan');
     expect(screen.queryByText('67%')).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Rapat terbaru' })).not.toBeInTheDocument();
 
     fireEvent.click(taskButton);
-    expect(await screen.findByRole('dialog', { name: 'Detail tindak lanjut' })).toBeVisible();
+    const detail = await screen.findByRole('dialog', { name: 'Detail tindak lanjut' });
+    expect(detail).toHaveTextContent('Wakil Rektor I');
+    expect(detail).not.toHaveTextContent('Nama Pribadi Sintetis');
     expect(screen.getByText('Progres sintetis')).toBeVisible();
     expect(screen.getByText('Laporan')).toBeVisible();
+  });
+
+  it.each([
+    'Direktur Sekretariat',
+    'Rektor',
+    'Wakil Rektor I',
+    'Wakil Rektor II',
+    'Wakil Rektor III',
+    'Wakil Rektor IV',
+    'Manager Legal',
+  ])('shows recognized role title %s for free-text PIC assignments', async (roleTitle) => {
+    const roleTitleAssignment = {
+      ...actionItem.active_assignments[0],
+      assignee_user_id: null,
+      assignee_display_name: roleTitle,
+      assignee_name: roleTitle,
+      assignee_job_title: null,
+    };
+    const item = { ...actionItem, active_assignments: [roleTitleAssignment] };
+    const detail = {
+      ...actionItemDetail,
+      active_assignments: [roleTitleAssignment],
+      assignment_history: [roleTitleAssignment],
+    };
+    vi.stubGlobal('fetch', apiFetch({ items: [item], details: [detail] }));
+    render(<Dashboard authenticatedUser={secretary} />);
+
+    const taskList = await screen.findByRole('region', { name: 'Tindak lanjut lintas Rapim' });
+    const taskButton = within(taskList).getByRole('button', {
+      name: /Menyiapkan laporan sintetis/,
+    });
+    expect(taskButton).toHaveTextContent(roleTitle);
+
+    fireEvent.click(taskButton);
+    const dialog = await screen.findByRole('dialog', { name: 'Detail tindak lanjut' });
+    expect(dialog).toHaveTextContent(roleTitle);
+  });
+
+  it('does not display a free-text PIC name when no job title is available', async () => {
+    const namedPicAssignment = {
+      ...actionItem.active_assignments[0],
+      assignee_user_id: null,
+      assignee_display_name: 'Nama Pribadi Sintetis Lain',
+      assignee_name: 'Nama Pribadi Sintetis Lain',
+      assignee_job_title: null,
+    };
+    const item = { ...actionItem, active_assignments: [namedPicAssignment] };
+    const detail = {
+      ...actionItemDetail,
+      active_assignments: [namedPicAssignment],
+      assignment_history: [namedPicAssignment],
+    };
+    vi.stubGlobal('fetch', apiFetch({ items: [item], details: [detail] }));
+    render(<Dashboard authenticatedUser={secretary} />);
+
+    const taskList = await screen.findByRole('region', { name: 'Tindak lanjut lintas Rapim' });
+    const taskButton = within(taskList).getByRole('button', {
+      name: /Menyiapkan laporan sintetis/,
+    });
+    expect(taskButton).toHaveTextContent('Jabatan PIC belum dicatat');
+    expect(taskButton).not.toHaveTextContent('Nama Pribadi Sintetis Lain');
+
+    fireEvent.click(taskButton);
+    const dialog = await screen.findByRole('dialog', { name: 'Detail tindak lanjut' });
+    expect(dialog).toHaveTextContent('Jabatan PIC belum dicatat');
+    expect(dialog).not.toHaveTextContent('Nama Pribadi Sintetis Lain');
   });
 
   it('paginates through the complete authorized Action Item collection', async () => {
@@ -196,7 +276,8 @@ describe('API-backed dashboard', () => {
     ).toBeInTheDocument();
     expect(screen.queryByText('Evaluasi Program Uji')).not.toBeInTheDocument();
     expect(screen.queryByText('67%')).not.toBeInTheDocument();
-    expect(screen.getByText('PIC Uji')).toBeInTheDocument();
+    expect(within(taskList).getByText('Wakil Rektor I')).toBeInTheDocument();
+    expect(within(taskList).queryByText('Nama Pribadi Sintetis')).not.toBeInTheDocument();
     expect(screen.queryByText('Rapim mendatang')).not.toBeInTheDocument();
     expect(screen.queryByText('Tindak lanjut', { exact: true })).not.toBeInTheDocument();
     expect(screen.queryByText('Belum selesai', { exact: true })).not.toBeInTheDocument();
@@ -254,6 +335,53 @@ describe('API-backed dashboard', () => {
     expect(within(taskList).getByText(actionItem.title)).toBeInTheDocument();
     expect(within(taskList).getByText(notStartedItem.title)).toBeInTheDocument();
     expect(notStartedFilter).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('counts and filters overdue active tasks without counting completed or future tasks', async () => {
+    const overdueItem = {
+      ...actionItem,
+      id: '40000000-0000-4000-8000-000000000011',
+      title: 'Tugas sintetis terlambat',
+      due_date: dateOffset(-2),
+    };
+    const dueTodayItem = {
+      ...actionItem,
+      id: '40000000-0000-4000-8000-000000000012',
+      title: 'Tugas sintetis jatuh tempo hari ini',
+      due_date: dateOffset(0),
+    };
+    const futureItem = {
+      ...actionItem,
+      id: '40000000-0000-4000-8000-000000000013',
+      title: 'Tugas sintetis mendatang',
+      due_date: dateOffset(1),
+    };
+    const completedItem = {
+      ...actionItem,
+      id: '40000000-0000-4000-8000-000000000014',
+      title: 'Tugas sintetis selesai',
+      official_status: 'SELESAI' as const,
+      due_date: dateOffset(-3),
+    };
+    vi.stubGlobal(
+      'fetch',
+      apiFetch({
+        items: [overdueItem, dueTodayItem, futureItem, completedItem],
+        details: [],
+      }),
+    );
+    render(<Dashboard authenticatedUser={secretary} />);
+
+    const overdueFilter = await screen.findByRole('button', { name: 'Terlambat 1' });
+    expect(screen.getByRole('button', { name: 'Selesai 0' })).toBeInTheDocument();
+    fireEvent.click(overdueFilter);
+
+    const taskList = screen.getByRole('region', { name: 'Tindak lanjut lintas Rapim' });
+    expect(within(taskList).getByText(overdueItem.title)).toBeInTheDocument();
+    expect(within(taskList).queryByText(dueTodayItem.title)).not.toBeInTheDocument();
+    expect(within(taskList).queryByText(futureItem.title)).not.toBeInTheDocument();
+    expect(within(taskList).queryByText(completedItem.title)).not.toBeInTheDocument();
+    expect(overdueFilter).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('shows explicit empty states when the APIs return no records', async () => {

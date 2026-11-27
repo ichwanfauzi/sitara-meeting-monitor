@@ -57,6 +57,12 @@ also update the port in the host-run `DATABASE_URL` to match. Containerized API
 and worker processes use `DATABASE_URL_CONTAINER` with hostname `postgres`. Do
 not use the development override for production.
 
+When Vite runs on the host and the API runs in Docker, use the same override:
+it attaches the API to a development-only host-publish network with IP
+masquerading disabled, while keeping its database connection on the internal
+`api-db` network. The API remains bound to `127.0.0.1`; do not use this override
+for production.
+
 1. Copy `.env.example` to `.env`. The values are local development placeholders only.
    Generate a private limiter key with `python -c "import secrets; print(secrets.token_urlsafe(32))"`
    and set `LOGIN_RATE_LIMIT_HMAC_KEY` in `.env`. Login returns `503` until this key is set.
@@ -151,7 +157,7 @@ pre-commit run --all-files
 
 ### Initial local/test accounts
 
-`backend/app/seed_initial_users.py` creates the seven initial core-user accounts: Rektor, four Wareks, Secretariat, and Manager Legal. The local Manager Legal account uses the synthetic address `herry.zulkarnaen@users.sitara.test`; production provisioning requires an official work email. Run `python -m app.seed_initial_users` from `backend` only after independently creating and migrating a separate local PostgreSQL database. Set `APP_ENV` to `development` or `testing` and `SITARA_SEED_DATABASE_URL` to that local database; the command verifies the database name and migration head (`0029_minutes_supporting_pic`) before writing. It refuses non-PostgreSQL, non-local, production-named, and unversioned targets. The default seed does not create Super Admin. Passwords are written once to a restricted file outside the repository. Never commit or share that file. If upgrading a local database that already has the original six accounts and their credential file, pass a new `--credentials-file` path when adding Manager Legal; existing credential files are never overwritten.
+`backend/app/seed_initial_users.py` creates the seven initial core-user accounts: Rektor, four Wareks, Secretariat, and Manager Legal. The local Manager Legal account uses the synthetic address `herry.zulkarnaen@users.sitara.test`; production provisioning requires an official work email. Run `python -m app.seed_initial_users` from `backend` only after independently creating and migrating a separate local PostgreSQL database. Set `APP_ENV` to `development` or `testing` and `SITARA_SEED_DATABASE_URL` to that local database; the command verifies the database name and migration head (`0030_action_item_status_audit`) before writing. It refuses non-PostgreSQL, non-local, production-named, and unversioned targets. The default seed does not create Super Admin. Passwords are written once to a restricted file outside the repository. Never commit or share that file. If upgrading a local database that already has the original six accounts and their credential file, pass a new `--credentials-file` path when adding Manager Legal; existing credential files are never overwritten.
 
 For an isolated, disposable **testing** database only, `python -m app.seed_initial_users --include-demo-pics` additionally creates synthetic PIC A/B/C accounts in the `SITARA-DEMO` unit and reporting lines from every seeded Rektor/Warek to each PIC. This option requires `APP_ENV=testing` and a local database name ending in `_test` or `_testing`; it is rejected for development databases. If the seven initial accounts were seeded earlier and their credential file already exists, provide a new `--credentials-file` path for the PIC passwords; existing credential files are never overwritten. Do not use demo personas in shared development or production.
 
@@ -159,10 +165,36 @@ For an isolated, disposable **testing** database only, `python -m app.seed_initi
 
 - Back up PostgreSQL and private document storage as separate but coordinated assets.
 - Encrypt backup files and store a copy outside the VPS/account hosting production.
-- Define recovery point objective (RPO) and recovery time objective (RTO) with the institution.
+- Obtain institutional approval for the proposed recovery point objective
+  (RPO) and recovery time objective (RTO) below before production.
 - Restore backups into an isolated environment and verify the data, files, and permissions.
 - Test a release rollback and a database recovery procedure before the first production deployment.
 - Never test destructive migrations or restores on production data.
+- **Draft targets, not approved:** Proposed RPO <=24 hours and RTO <=2 business
+  days, measured against ITPLN's official work calendar. The RPO requires a
+  complete, consistent PostgreSQL and private-file recovery point no older than
+  24 hours. Protect documents and evidence through scheduled backup or
+  versioning, with a cadence that can recover the file state corresponding to
+  each daily database point; a weekly full recovery point alone does not
+  demonstrate the target. For RTO, the clock starts when the responsible IT
+  officer receives an incident report during official work hours; reports
+  received outside work hours are handled starting the next workday, when the
+  RTO clock begins. Do not assume unapproved daily work hours. Recovery is
+  complete when core service is usable and basic validation passes; root-cause
+  investigation may follow. Prove the target in a timed rehearsal.
+- **Draft retention, not approved:** Proposed retention is 14 daily database
+  points, 8 weekly full recovery points, and 12 monthly points. Retention of
+  operational source documents and evidence (separate from backup copies)
+  follows the policy still to be approved. Do not enable automatic pruning
+  before written approval of retention and legal-hold requirements. The
+  contents and alignment of monthly points with weekly full recovery points
+  remain to be defined and approved.
+- If the institution requires RPO <=1 hour, add PostgreSQL WAL/PITR and coordinated
+  private-file snapshots; the current database backup script alone does not
+  provide that recovery point.
+- Current backup/restore scripts and their limits are documented in
+  [`docs/MIGRATION_PLAN.md`](docs/MIGRATION_PLAN.md). They do not yet establish a
+  coordinated production recovery of PostgreSQL and private files.
 
 ## Security review before production
 
@@ -191,3 +223,4 @@ These are draft v1.0 documents. Review explicit open decisions in each document 
 Included: role-scoped Rapim and Action Item screens; meeting status and task verification controls for Secretariat and Manager Legal; searchable meeting lists; structured minutes/Decision Brief linkage; in-app notifications; and named or user-based PIC assignments. SITARA does not capture or play meeting audio and has no ChatGPT integration. Production migration and rollout remain unverified.
 
 Production roster provisioning, migration rollout verification, real-time collaboration, formal Decision Brief publication, OCR, final document templates, production deployment, and backup/restore automation remain incomplete. Meeting and Decision Brief records remain revision-bound. Secretariat, Manager Legal, Rektor, and Warek may edit LIVE minutes; an optional notetaker is recorded for attribution only. PIC and Super Admin remain denied full minutes access.
+ 

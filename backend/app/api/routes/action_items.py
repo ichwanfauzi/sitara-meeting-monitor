@@ -131,6 +131,7 @@ def _serialize_assignment(item: ActionItemAssignment) -> ActionItemAssignmentRes
         assignee_name=(
             item.assignee.full_name if item.assignee is not None else item.assignee_display_name
         ),
+        assignee_job_title=(item.assignee.job_title if item.assignee is not None else None),
         pic_origin_unit=(
             OrganizationUnitReference(
                 id=item.pic_origin_unit.id,
@@ -739,19 +740,33 @@ def get_progress_evidence_file(
 def patch_action_item_status(
     action_item_id: UUID,
     data: ActionItemStatusChange,
+    request: Request,
     identity: CurrentIdentity,
     session: DatabaseSession,
     _csrf: Annotated[None, Depends(require_csrf)],
 ) -> ActionItemResponse:
+    correlation_id = cast(UUID | None, getattr(request.state, "correlation_id", None))
     try:
-        item = change_action_item_status(session, identity[1], action_item_id, data)
+        item = change_action_item_status(
+            session,
+            identity[1],
+            action_item_id,
+            data,
+            correlation_id=correlation_id,
+        )
     except (
         ActionItemNotFound,
         ActionItemPermissionDenied,
         ActionItemConcurrencyConflict,
         ActionItemStatusTransitionInvalid,
         ActionItemVerificationRequired,
+        ActionItemPersistenceError,
     ) as error:
+        if isinstance(error, ActionItemPersistenceError):
+            logger.exception(
+                "Action Item status transaction failed; correlation_id=%s",
+                correlation_id,
+            )
         _raise_action_item_error(error)
     return _serialize_action_item(session, item, include_history=False)  # type: ignore[return-value]
 
@@ -763,17 +778,31 @@ def patch_action_item_status(
 def post_completion_verification(
     action_item_id: UUID,
     data: CompletionReviewCreate,
+    request: Request,
     identity: CurrentIdentity,
     session: DatabaseSession,
     _csrf: Annotated[None, Depends(require_csrf)],
 ) -> ActionItemDetailResponse:
+    correlation_id = cast(UUID | None, getattr(request.state, "correlation_id", None))
     try:
-        item, _ = review_completion(session, identity[1], action_item_id, data)
+        item, _ = review_completion(
+            session,
+            identity[1],
+            action_item_id,
+            data,
+            correlation_id=correlation_id,
+        )
     except (
         ActionItemNotFound,
         ActionItemPermissionDenied,
         ActionItemConcurrencyConflict,
         ActionItemVerificationInvalid,
+        ActionItemPersistenceError,
     ) as error:
+        if isinstance(error, ActionItemPersistenceError):
+            logger.exception(
+                "Action Item completion review failed; correlation_id=%s",
+                correlation_id,
+            )
         _raise_action_item_error(error)
     return _serialize_action_item(session, item, include_history=True)  # type: ignore[return-value]

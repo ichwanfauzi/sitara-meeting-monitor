@@ -176,7 +176,13 @@ Update progres (termasuk persentase jika dipakai) terpisah dari status resmi. De
 - **Keamanan:** HTTPS di lingkungan yang diakses melalui jaringan; password hash kuat; secret di luar Git; validasi input; perlindungan sesi/CSRF sesuai metode autentikasi; rate limiting; upload file privat; least privilege.
 - **Otorisasi:** pemeriksaan server-side pada setiap endpoint, pencarian, ekspor, dan akses dokumen; uji negatif terhadap IDOR/BOLA.
 - **Auditabilitas:** aksi penting, status, persetujuan, perubahan peran, ekspor, dan tindakan Super Admin dapat ditelusuri.
-- **Keandalan:** transaksi database, backup database dan file, uji restore, serta prosedur rollback terdokumentasi.
+- **Keandalan:** transaksi database, backup database dan file, uji restore,
+  serta prosedur rollback terdokumentasi. Target usulan RPO <=24 jam, RTO <=2
+  hari kerja, dan retensi 14/8/12 titik masih berstatus draf dan belum
+  disahkan ITPLN; lihat
+  [ADR-012](./ARCHITECTURE_DECISIONS.md#adr-012-coordinated-encrypted-sitara-backups-specification).
+  Target dan retensi tersebut belum boleh dianggap sudah diterapkan atau
+  terpenuhi.
 - **Kualitas:** unit, integration, API, authorization negative, dan end-to-end tests untuk alur kritis; scanner tidak boleh dimatikan demi build hijau.
 - **Usability:** antarmuka berbahasa Indonesia yang konsisten, istilah tugas/status jelas, responsif untuk desktop dan perangkat mobile.
 - **Aksesibilitas:** target WCAG 2.2 AA sebagai sasaran desain; jangan menyampaikan status hanya melalui warna.
@@ -234,7 +240,7 @@ MVP bisa dipertimbangkan selesai bila alur berikut berhasil diuji pada lingkunga
 6. PIC tidak dapat membaca notulen lengkap atau mengubah status resmi, termasuk lewat request API langsung.
 7. Sekretariat dapat meninjau bukti dan mengubah status resmi dengan jejak audit.
 8. Test, lint, type check, build dan security scans yang disyaratkan lulus atau memiliki pengecualian yang terdokumentasi.
-9. Backup dan restore database serta file telah diuji di lingkungan terpisah.
+9. Backup dan restore database serta file sebagai satu recovery point yang konsisten telah diuji di lingkungan terpisah. Kriteria ini belum terpenuhi sampai uji end-to-end database/file dilakukan; pengujian database saja tidak cukup.
 10. Template ekspor notulen/Decision Brief telah divalidasi terhadap format resmi yang disetujui.
 
 ## 15. Asumsi dan keputusan terbuka

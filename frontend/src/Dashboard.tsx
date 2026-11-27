@@ -4,6 +4,7 @@ import {
   getActionItem,
   getActionItems,
   getMeetings,
+  type ActionItemAssignment,
   type ActionItemStatus,
   type ActionItemDetail,
   type ActionItemSummary,
@@ -32,6 +33,16 @@ const actionStatuses: ActionItemStatus[] = [
   'MENUNGGU_ACC',
   'SELESAI',
 ];
+
+const coreRoleTitles = new Map<string, string>([
+  ['direktur sekretariat', 'Direktur Sekretariat'],
+  ['rektor', 'Rektor'],
+  ['wakil rektor i', 'Wakil Rektor I'],
+  ['wakil rektor ii', 'Wakil Rektor II'],
+  ['wakil rektor iii', 'Wakil Rektor III'],
+  ['wakil rektor iv', 'Wakil Rektor IV'],
+  ['manager legal', 'Manager Legal'],
+]);
 
 const actionStatusLabels: Record<ActionItemStatus, string> = {
   BELUM_DIMULAI: 'Belum dimulai',
@@ -95,6 +106,20 @@ function formatDate(value: string | null): string {
   return new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium' }).format(date);
 }
 
+function picJobTitle(assignment: ActionItemAssignment): string {
+  const jobTitle = assignment.assignee_job_title?.trim();
+  if (jobTitle) return jobTitle;
+  if (assignment.assignee_user_id === null) {
+    const freeTextTitle = assignment.assignee_display_name
+      ?.trim()
+      .replace(/\s+/g, ' ')
+      .toLocaleLowerCase('id-ID');
+    const recognizedTitle = freeTextTitle ? coreRoleTitles.get(freeTextTitle) : undefined;
+    if (recognizedTitle) return recognizedTitle;
+  }
+  return 'Jabatan PIC belum dicatat';
+}
+
 function monthLabel(value: string): string {
   const date = new Date(`${value}-01T00:00:00`);
   return new Intl.DateTimeFormat('id-ID', { month: 'long', year: 'numeric' }).format(date);
@@ -126,7 +151,9 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
   const [search, setSearch] = useState('');
   const [selectedMonth, setSelectedMonth] = useState('SEMUA');
   const [calendarMonth, setCalendarMonth] = useState(() => localDateKey().slice(0, 7));
-  const [selectedStatus, setSelectedStatus] = useState<ActionItemStatus | 'SEMUA'>('SEMUA');
+  const [selectedStatus, setSelectedStatus] = useState<
+    ActionItemStatus | 'TERLAMBAT' | 'SEMUA'
+  >('SEMUA');
   const [showAllActionItems, setShowAllActionItems] = useState(false);
   const [selectedActionItemId, setSelectedActionItemId] = useState('');
   const [selectedActionItemDetail, setSelectedActionItemDetail] = useState<ActionItemDetail | null>(
@@ -255,7 +282,11 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
       );
     });
   const visibleItems = matchingItems.filter(
-    (item) => selectedStatus === 'SEMUA' || item.official_status === selectedStatus,
+    (item) =>
+      selectedStatus === 'SEMUA' ||
+      (selectedStatus === 'TERLAMBAT'
+        ? item.due_date !== null && daysUntilDue(item.due_date, today) < 0
+        : item.official_status === selectedStatus),
   );
   const visibleMeetings =
     data.meetings
@@ -300,6 +331,9 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
       matchingItems.filter((item) => item.official_status === status).length,
     ]),
   ) as Record<ActionItemStatus, number>;
+  const overdueActionCount = matchingItems.filter(
+    (item) => item.due_date !== null && daysUntilDue(item.due_date, today) < 0,
+  ).length;
   const attentionCount = visibleActionCounts.TERKENDALA + visibleActionCounts.MENUNGGU_ACC;
   const displayedItems = showAllActionItems ? visibleItems : visibleItems.slice(0, 5);
   const selectedActionItem = data.actionItems.find((item) => item.id === selectedActionItemId);
@@ -487,6 +521,19 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
                     <strong>{visibleActionCounts[status]}</strong>
                   </button>
                 ))}
+                <button
+                  className="live-status-card live-status-card--overdue"
+                  type="button"
+                  aria-pressed={selectedStatus === 'TERLAMBAT'}
+                  onClick={() =>
+                    setSelectedStatus((current) =>
+                      current === 'TERLAMBAT' ? 'SEMUA' : 'TERLAMBAT',
+                    )
+                  }
+                >
+                  <span>Terlambat</span>
+                  <strong>{overdueActionCount}</strong>
+                </button>
               </div>
             </section>
           </div>
@@ -534,9 +581,14 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
                 <span>Status tindak lanjut</span>
                 <select
                   value={selectedStatus}
-                  onChange={(event) =>
-                    setSelectedStatus(event.target.value as ActionItemStatus | 'SEMUA')
-                  }
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    if (value === 'TERLAMBAT' || value === 'SEMUA') {
+                      setSelectedStatus(value);
+                    } else if (actionStatuses.includes(value as ActionItemStatus)) {
+                      setSelectedStatus(value as ActionItemStatus);
+                    }
+                  }}
                 >
                   <option value="SEMUA">Semua status</option>
                   {actionStatuses.map((status) => (
@@ -544,6 +596,7 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
                       {actionStatusLabels[status]}
                     </option>
                   ))}
+                  <option value="TERLAMBAT">Terlambat</option>
                 </select>
               </label>
             </div>
@@ -559,13 +612,7 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
                   const mainPic = item.active_assignments.find(
                     (assignment) => assignment.assignment_role === 'MAIN',
                   );
-                  const mainPicName = mainPic
-                    ? mainPic.assignee_display_name?.trim() ||
-                      mainPic.assignee_name?.trim() ||
-                      (mainPic.assignee_user_id === authenticatedUser.id
-                        ? 'Anda'
-                        : 'Nama belum tersedia')
-                    : 'Belum ditugaskan';
+                  const mainPicTitle = mainPic ? picJobTitle(mainPic) : 'Belum ditugaskan';
                   return (
                     <article className="rapim-action-card" key={item.id}>
                       <button
@@ -587,7 +634,7 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
                         </span>
                         <span className="rapim-action-summary-pic">
                           <small>PIC utama</small>
-                          <strong>{mainPicName}</strong>
+                          <strong>{mainPicTitle}</strong>
                         </span>
                       </button>
                     </article>
@@ -678,11 +725,7 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
                   <div>
                     <dt>PIC utama</dt>
                     <dd>
-                      {selectedMainPic?.assignee_display_name?.trim() ||
-                        selectedMainPic?.assignee_name?.trim() ||
-                        (selectedMainPic?.assignee_user_id === authenticatedUser.id
-                          ? 'Anda'
-                          : 'Belum ditugaskan')}
+                      {selectedMainPic ? picJobTitle(selectedMainPic) : 'Belum ditugaskan'}
                     </dd>
                   </div>
                   {selectedSupportingPics.length > 0 && (
@@ -690,12 +733,7 @@ function Dashboard({ authenticatedUser }: { authenticatedUser: AuthenticatedUser
                       <dt>PIC pendukung</dt>
                       <dd>
                         {selectedSupportingPics
-                          .map(
-                            (assignment) =>
-                              assignment.assignee_display_name ||
-                              assignment.assignee_name ||
-                              'Belum ditentukan',
-                          )
+                          .map(picJobTitle)
                           .join(', ')}
                       </dd>
                     </div>

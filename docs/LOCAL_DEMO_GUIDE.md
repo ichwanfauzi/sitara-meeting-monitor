@@ -7,7 +7,7 @@ Panduan ini menyiapkan demo di komputer lokal. Gunakan hanya data sintetis; jang
 - Frontend tersedia di `http://127.0.0.1:5173/`.
 - API lokal merespons `http://127.0.0.1:8000/api/v1/health`.
 - Database yang dipakai saat panduan ini diverifikasi adalah `sitara_dev`, dengan migrasi `0026_notification_email_delivery`; ini adalah snapshot saat panduan dibuat, bukan status migrasi terbaru.
-- Source saat ini memerlukan migration head `0029_minutes_supporting_pic`, termasuk migrasi `0027` sampai `0029`. Terapkan ke database lokal setelah memastikan targetnya `sitara_dev` sebelum mencoba fitur PIC pendukung di notulensi.
+- Source saat ini memerlukan migration head `0030_action_item_status_audit`, termasuk migrasi `0027` sampai `0030`. Terapkan ke database lokal setelah memastikan targetnya `sitara_dev` sebelum mencoba fitur PIC pendukung di notulensi.
 - Sudah ada dua rapat sintetis:
   - `DEMO-RAPIM-2026-11-01` — Monitoring Program Prioritas Semester Genap.
   - `DEMO-RAPIM-2026-11-02` — Koordinasi Kemitraan dan Komunikasi Internal.
@@ -20,8 +20,13 @@ Status di atas menggambarkan komputer lokal saat panduan ini disiapkan dan dapat
 Jika layanan belum berjalan, dari PowerShell di root repository:
 
 ```powershell
-docker compose up -d
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
+
+Gunakan override development ini jika Vite berjalan di host dan API berjalan
+di Docker. Tanpanya, API hanya berada pada jaringan internal dan host tidak
+dapat mengaksesnya. Port API dan proxy PostgreSQL dibatasi ke `127.0.0.1`;
+jangan gunakan override ini di production.
 
 Jika frontend belum berjalan:
 
@@ -51,9 +56,9 @@ Jangan mengaktifkan profile `notification-email` untuk demo. Worker email sudah 
 Perubahan source di folder repository tidak otomatis memperbarui image API Docker. Untuk memakai fitur terbaru, pastikan dahulu konfigurasi Compose mengarah ke database lokal `sitara_dev`, lalu dari root repository jalankan:
 
 ```powershell
-docker compose build api
-docker compose run --rm api alembic upgrade head
-docker compose up -d api
+docker compose -f docker-compose.yml -f docker-compose.dev.yml build api
+docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm api alembic upgrade head
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d api
 ```
 
 Ini menerapkan migrasi skema terbaru; jangan jalankan pada database production atau database bersama. Jika Vite sedang berjalan dari folder `frontend` repository ini, refresh browser setelah API sehat. Jika tidak, mulai ulang Vite dengan perintah di atas.

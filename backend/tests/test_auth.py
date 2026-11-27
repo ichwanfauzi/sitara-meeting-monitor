@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.core.config import get_settings
-from app.core.security import hash_password, hash_session_token
+from app.core.security import hash_password, hash_session_token, verify_password
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
@@ -64,6 +64,7 @@ def test_login_sets_hardened_session_cookie_and_returns_role(
         "email": user.email,
         "full_name": user.full_name,
         "roles": ["PIC"],
+        "must_change_password": False,
     }
     session_token = client.cookies.get("sitara_session")
     csrf_token = client.cookies.get("sitara_csrf")
@@ -153,6 +154,41 @@ def test_current_user_requires_a_session_and_logout_checks_csrf(
     stored_session = session.scalar(select(UserSession))
     assert stored_session is not None
     assert stored_session.revoked_at is not None
+
+
+def test_temporary_password_requires_change_before_protected_api_access(
+    auth_context: tuple[TestClient, Session, User],
+) -> None:
+    client, session, user = auth_context
+    user.must_change_password = True
+    session.commit()
+
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": user.email, "password": "synthetic-password"},
+    )
+    assert login.status_code == 200
+    assert login.json()["must_change_password"] is True
+    assert client.get("/api/v1/auth/me").json()["must_change_password"] is True
+    assert client.get("/api/v1/action-items?limit=100&offset=0").status_code == 403
+
+    csrf_token = client.cookies.get("sitara_csrf")
+    assert csrf_token
+    changed = client.post(
+        "/api/v1/auth/change-password",
+        headers={"X-CSRF-Token": csrf_token},
+        json={
+            "current_password": "synthetic-password",
+            "new_password": "new-strong-synthetic-password",
+        },
+    )
+
+    assert changed.status_code == 204
+    assert client.get("/api/v1/auth/me").json()["must_change_password"] is False
+    assert client.get("/api/v1/action-items?limit=100&offset=0").status_code != 403
+    assert user.must_change_password is False
+    assert verify_password("new-strong-synthetic-password", user.password_hash)
+    assert not verify_password("synthetic-password", user.password_hash)
 
 
 def test_expired_session_is_rejected(

@@ -10,9 +10,11 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.models.auth import User, UserSession
-from app.schemas.auth import LoginRequest, UserResponse
+from app.schemas.auth import ChangePasswordRequest, LoginRequest, UserResponse
 from app.services.auth import (
+    InvalidPasswordChange,
     authenticate_user,
+    change_user_password,
     create_user_session,
     find_active_session,
     revoke_user_session,
@@ -35,6 +37,7 @@ def serialize_user(user: User) -> UserResponse:
         email=user.email,
         full_name=user.full_name,
         roles=sorted(role.role_code for role in user.roles),
+        must_change_password=user.must_change_password,
     )
 
 
@@ -116,6 +119,19 @@ def get_current_identity(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
         )
+    user = identity[1]
+    allowed_while_password_change_required = {
+        ("GET", "/api/v1/auth/me"),
+        ("POST", "/api/v1/auth/logout"),
+        ("POST", "/api/v1/auth/change-password"),
+    }
+    if user.must_change_password and (request.method, request.url.path) not in (
+        allowed_while_password_change_required
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password change required before using SITARA",
+        )
     return identity
 
 
@@ -148,3 +164,26 @@ def logout(
     response.delete_cookie(CSRF_COOKIE, path="/api/v1", secure=secure_cookie)
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
+
+
+@router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
+def change_password(
+    payload: ChangePasswordRequest,
+    identity: Annotated[tuple[UserSession, User], Depends(get_current_identity)],
+    session: Annotated[Session, Depends(get_db)],
+    _csrf: Annotated[None, Depends(require_csrf)],
+) -> Response:
+    try:
+        change_user_password(
+            session,
+            user=identity[1],
+            current_session=identity[0],
+            current_password=payload.current_password,
+            new_password=payload.new_password,
+        )
+    except InvalidPasswordChange as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is invalid or the new password is unchanged",
+        ) from error
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

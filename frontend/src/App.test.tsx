@@ -731,6 +731,35 @@ describe('SITARA authentication', () => {
     expect(screen.getAllByText('Sekretariat, Super Admin')).toHaveLength(2);
   });
 
+  it('shows account-management navigation only to a standalone Super Admin', async () => {
+    vi.stubGlobal(
+      'fetch',
+      authenticatedFetch({ ...secretary, roles: ['SUPER_ADMIN'] }),
+    );
+    render(<App />);
+
+    expect(await screen.findByRole('link', { name: 'Pengguna' })).toHaveAttribute(
+      'href',
+      '#admin/users',
+    );
+    expect(screen.queryByRole('link', { name: 'Notulensi' })).not.toBeInTheDocument();
+  });
+
+  it('denies direct account-management navigation to operational roles', async () => {
+    window.history.replaceState(null, '', '#admin/users');
+    const fetchMock = authenticatedFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Halaman ini hanya tersedia untuk Super Admin.',
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      '/api/v1/admin/users',
+      expect.anything(),
+    );
+  });
+
   it('blocks direct editor navigation for a PIC session', async () => {
     window.history.replaceState(null, '', '/#notulensi');
     vi.stubGlobal('fetch', authenticatedFetch({ ...secretary, roles: ['PIC'] }));

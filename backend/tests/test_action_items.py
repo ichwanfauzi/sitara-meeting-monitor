@@ -35,6 +35,7 @@ from app.models.meeting import (
     MinutesDiscussion,
     MinutesRevision,
 )
+from app.models.notification import Notification
 from app.models.organization import OrganizationUnit, ReportingLine, UserUnitMembership
 from app.schemas.action_items import ActionItemStatusChange
 from app.schemas.audit import AuditEventCreate
@@ -125,6 +126,7 @@ def action_item_context() -> Iterator[tuple[Session, dict[str, User], dict[str, 
         user = User(
             email=f"{name}@example.test",
             full_name=name.replace("_", " ").title(),
+            job_title="Wakil Rektor I" if name == "pic_main" else None,
             password_hash=hash_password("synthetic-password"),
             is_active=name != "pic_unassigned",
         )
@@ -430,6 +432,8 @@ def test_action_item_creation_records_responsible_and_pic_origin_units(
         "unit_code": unit.unit_code,
         "name": unit.name,
     }
+    assert created["active_assignments"][0]["assignee_name"] == users["pic_main"].full_name
+    assert created["active_assignments"][0]["assignee_job_title"] == "Wakil Rektor I"
     persisted_item = session.get(ActionItem, UUID(created["id"]))
     assert persisted_item is not None
     assert persisted_item.responsible_unit_id == unit.id
@@ -579,6 +583,24 @@ def test_operational_managers_may_select_any_official_status_and_each_change_is_
         .all()
     )
     assert [row.new_status for row in history] == ["BELUM_DIMULAI", "TERKENDALA", "BELUM_DIMULAI"]
+    audit_events = (
+        session.query(AuditEvent)
+        .filter_by(action="action_item.status_changed", object_id=UUID(created["id"]))
+        .all()
+    )
+    assert len(audit_events) == 2
+    assert {
+        (event.before_values["official_status"], event.after_values["official_status"])
+        for event in audit_events
+    } == {
+        ("BELUM_DIMULAI", "TERKENDALA"),
+        ("TERKENDALA", "BELUM_DIMULAI"),
+    }
+    assert all(
+        event.actor_roles == [users[operator_name].roles[0].role_code]
+        for event in audit_events
+    )
+    assert all(event.correlation_id is not None for event in audit_events)
 
 
 def test_status_change_notifies_only_active_assignees_with_private_task_target(
@@ -1157,6 +1179,54 @@ def test_assignment_audit_failure_rolls_back_assignment_and_version(
             action="action_item.assignment_changed",
             object_id=UUID(created["id"]),
         )
+        .count()
+        == 0
+    )
+
+
+def test_status_audit_failure_rolls_back_status_and_history(
+    action_item_context: tuple[Session, dict[str, User], dict[str, UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import action_items as action_item_service
+
+    session, users, refs = action_item_context
+
+    def fail_audit(*args: object, **kwargs: object) -> None:
+        raise SQLAlchemyError("synthetic status audit failure")
+
+    monkeypatch.setattr(
+        action_item_service,
+        "append_action_item_status_changed_event",
+        fail_audit,
+        raising=False,
+    )
+    with TestClient(app) as client:
+        _login(client, users["secretariat"])
+        created = _create_task(client, refs, users["pic_main"])
+    notifications_before = session.query(Notification).count()
+    with TestClient(app, raise_server_exceptions=False) as client:
+        _login(client, users["secretariat"])
+        response = client.patch(
+            f"/api/v1/action-items/{created['id']}/status",
+            json={"expected_version": 1, "to_status": "TERKENDALA"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Action Item and audit event could not be saved"
+    item = session.get(ActionItem, UUID(created["id"]))
+    assert item is not None and item.official_status == ActionItemStatus.BELUM_DIMULAI
+    history = (
+        session.query(ActionItemStatusHistory)
+        .filter_by(action_item_id=UUID(created["id"]))
+        .order_by(ActionItemStatusHistory.event_number)
+        .all()
+    )
+    assert [row.new_status for row in history] == [ActionItemStatus.BELUM_DIMULAI]
+    assert session.query(Notification).count() == notifications_before
+    assert (
+        session.query(AuditEvent)
+        .filter_by(action="action_item.status_changed", object_id=UUID(created["id"]))
         .count()
         == 0
     )
@@ -2534,6 +2604,19 @@ def test_completion_requires_verification_and_is_bound_to_report(
     assert verification["progress_update_id"] == report.json()["id"]
     task = session.get(ActionItem, UUID(created_id))
     assert task is not None and task.official_status == "SELESAI"
+    status_audit = (
+        session.query(AuditEvent)
+        .filter_by(
+            action="action_item.status_changed",
+            object_id=UUID(created_id),
+        )
+        .one()
+    )
+    assert status_audit.before_values == {"official_status": "BELUM_DIMULAI"}
+    assert status_audit.after_values == {
+        "official_status": "SELESAI",
+        "verification_id": verification["id"],
+    }
     get_settings.cache_clear()
 
 

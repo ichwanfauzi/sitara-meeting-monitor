@@ -411,7 +411,7 @@ def test_seed_accepts_database_at_current_migration_head(
             return self
 
         def one(self) -> tuple[str, str]:
-            return ("sitara_dev", "0029_minutes_supporting_pic")
+            return ("sitara_dev", "0031_super_admin_account_management")
 
     class FakeEngine:
         def connect(self) -> FakeConnection:

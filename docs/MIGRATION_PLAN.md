@@ -537,9 +537,13 @@ exact encrypted files have been restored and verified from that destination.
    never claim secure erasure on storage that cannot prove it.
 8. **Retention.** Apply only the institution-approved retention and legal
    hold policy. As a proposal for owner review—not an approved schedule—retain
-   14 daily, 8 weekly, and 12 monthly recovery points, with an explicit
-   deletion/hold audit. Until a schedule and deletion authority are approved,
-   do not automate pruning or delete any operational backup.
+   14 daily PostgreSQL points, 8 weekly full database/private-file recovery
+   points, and 12 monthly points. The contents and alignment of monthly points
+   with weekly full recovery points remain to be defined; retention of
+   operational source documents/evidence, separate from backup copies, follows
+   the policy to be approved. Record deletion/hold actions explicitly. Until
+   a schedule and deletion authority are approved, do not automate pruning or
+   delete any operational backup.
 9. **Restore the exact remote backup.** Fetch the selected encrypted set from
    the off-device destination, verify ciphertext hashes, decrypt using the
    authorized recovery identity, and verify plaintext hashes. Restore the
@@ -883,11 +887,38 @@ timestamps, destination identifier, ciphertext hashes, validation result,
 restore target, and failure/deletion events. Never log credentials, key
 material, evidence contents, meeting contents, or raw storage keys.
 
-Initial retention proposal, **not approved**:
+Retention design, **DRAFT / NOT APPROVED**:
 
-- daily: 14 days;
-- weekly: 8 weeks;
-- monthly: 12 months.
+| Recovery set | Frequency | Retention |
+|---|---|---|
+| PostgreSQL database | Daily | 14 recovery points |
+| Full recovery point (database and related private files) | Weekly | 8 recovery points |
+| Monthly recovery points | Monthly | 12 points; contents and alignment with weekly full recovery points TBD |
+| Operational source documents and evidence (not backup copies) | Policy-defined | To be set by the approved retention policy |
+
+Do not enable automatic pruning before written approval of retention,
+deletion authority, legal holds, and minimum recovery-point counts.
+
+Recovery objectives, **DRAFT / NOT APPROVED**:
+
+- **RPO <=24 hours.** This requires a complete, consistent PostgreSQL and
+  private-file recovery point no older than 24 hours, encrypted and stored
+  off-host. Documents and evidence must be protected by scheduled backup or
+  versioning, with a cadence that makes the corresponding file state
+  recoverable for each daily database point. A weekly full recovery point
+  alone does not demonstrate this RPO. Database-only backups do not satisfy
+  it.
+- **RTO <=2 business days**, measured using ITPLN's official operating
+  calendar. The clock starts when the responsible IT officer receives the
+  incident report during official work hours. Reports received outside work
+  hours are handled starting the next workday, when the RTO clock begins. Do
+  not assume unapproved daily work hours. Recovery is complete when core
+  SITARA service is usable and passes basic validation. Root-cause
+  investigation and permanent remediation may continue afterward. Validate
+  the target with a timed end-to-end rehearsal.
+- If the institution requires **RPO <=1 hour**, add PostgreSQL WAL/PITR and
+  coordinated private-evidence snapshots; the current full-dump script alone
+  cannot provide that recovery point.
 
 The Director/policy owner must approve retention, legal holds, deletion
 authority, and minimum recovery-point count. **Do not implement automatic
@@ -898,8 +929,12 @@ approval.
 Monitoring should alert on missed schedules, non-zero command exits, stale
 last-success time, insufficient space, failed hash/read-back, incomplete
 manual OneDrive upload/read-back, missing HDD custody/check-in, key-recovery
-failure, and overdue monthly restore test. RPO/RTO targets remain decisions
-for the policy owner.
+failure, and overdue restore test at the cadence approved by the policy owner.
+These recovery objectives and backup retention tiers remain recommendations
+until approved by the authorized ITPLN policy owner. Monthly recovery-point
+contents and alignment with the weekly full recovery set remain open design
+decisions. Retention of operational source documents and evidence is a
+separate policy decision.
 
 ### Restore and disaster-recovery procedure
 
@@ -931,7 +966,7 @@ for the policy owner.
 
 | Gate | Current status |
 |---|---|
-| Initial operational role decision and media priority (external HDD first; campus OneDrive fallback) | **AGREED AS DESIGN INPUT**; does not establish device/account availability or authorize backup/production restore |
+| Proposed responsibility model and media priority (external HDD first; campus OneDrive fallback) | **DRAFT DESIGN INPUT / NOT APPROVED BY ITPLN**; does not establish device/account availability or authorize backup/production restore |
 | VPS provisioned and production storage path verified | **NOT VERIFIED**; VPS is not available |
 | External HDD available, capacity/custody/location/access, and separate failure domain | **NOT VERIFIED / BLOCKED** |
 | Campus Microsoft 365 OneDrive fallback, folder ACL, capacity/retention/recovery | **NOT VERIFIED / BLOCKED**; SharePoint library unavailable; manual upload only is planned |
@@ -940,7 +975,8 @@ for the policy owner.
 | Key recovery, rotation/revocation, authorized restore | **NOT VERIFIED / BLOCKED pending formal custodian and approval procedure** |
 | Retention, deletion, monthly restore testing, audit, RPO/RTO | **PROPOSED / BLOCKED pending policy approval** |
 | Main evidence schema/storage and coordinated source recovery point | **NOT READY**; current main revision/storage state above |
-| Backup implementation, remote-copy verification, and restore rehearsal | **NOT IMPLEMENTED / NOT VERIFIED** |
+| PostgreSQL backup and disposable-database restore utilities | **IMPLEMENTED; isolated script tests pass, but no operational backup was created** |
+| Private-evidence backup, coordinated database/file recovery, approved remote-copy verification, and full restore rehearsal | **NOT IMPLEMENTED / NOT VERIFIED** |
 
 Before any operational run, obtain written IT/policy approval, provision and
 verify the destinations and key recovery, establish source write-quiesce
@@ -950,23 +986,28 @@ evidence-volume provisioning, backup execution, or Stage 7.5.
 
 ### Stage 7.4.13 — Backup policy alignment
 
-The approved design inputs now prioritize the external HDD as the planned
+The current design proposal prioritizes the external HDD as the planned
 offline medium and campus Microsoft 365 OneDrive as a fallback/last resort.
+This is a design proposal only, not an ITPLN-approved policy or destination.
 SharePoint Document Library is unavailable; no Microsoft Entra ID application
 for Graph has been provided, so OneDrive transfer is manual and ciphertext-
 only. Folder access can be restricted, but retention, capacity, campus
 recovery behavior, and the suitability of either medium for production remain
 unverified. Neither medium is asserted to be available or production-approved.
 
-The Director Sekretariat/Rektorat approves policy and production recovery;
-Super Admin is responsible for backup operations and monitoring; IT provides
+Proposed responsibility split, pending confirmation by the authorized ITPLN
+owner: the Director Sekretariat/Rektorat approves policy and production
+recovery; Super Admin operates and monitors backups; IT provides
 infrastructure/storage and confirms capabilities; a formally appointed
 recovery key custodian holds and releases the decryption identity under
-approved controls. The proposed `age` recipient-encryption design, separate
-key recovery, and post-decryption digest verification remain subject to
-institutional approval. Proposed retention remains 14 daily, 8 weekly, and
-12 monthly points, with monthly restore testing. All are **PROPOSED**; do not
-enable automatic pruning.
+approved controls. The repository has an `age` encryption/decryption code
+path for database archives, but its tests stub the external executable; real
+cryptography, key recovery, destination integration, and post-decryption
+verification remain unverified and require institutional approval. Proposed
+retention remains 14 daily database points, 8 weekly full database/private-file
+points, and 12 monthly points. Monthly point contents and monthly restore-test
+cadence remain open proposals. All are **PROPOSED / NOT APPROVED BY ITPLN**;
+do not enable automatic pruning.
 
 Database and evidence must still be captured as one quiesced recovery point.
 The current main database lacks evidence metadata tables and the main evidence

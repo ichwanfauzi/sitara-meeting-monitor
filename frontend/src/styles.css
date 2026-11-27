@@ -7044,6 +7044,186 @@ textarea:focus-visible {
   font-size: 23px;
 }
 
+.admin-users-page {
+  display: grid;
+  gap: 16px;
+}
+
+.admin-users-page .admin-users-heading,
+.admin-users-page .admin-account-form,
+.admin-users-page .admin-account-list {
+  padding: clamp(18px, 2.5vw, 26px);
+  border-color: #e0e7ef;
+  border-radius: 14px;
+  box-shadow: 0 6px 20px rgb(27 49 76 / 4%);
+}
+
+.admin-users-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.admin-users-heading h1,
+.admin-account-form h2,
+.admin-account-list h2 {
+  margin: 0;
+  color: #1b3049;
+}
+
+.admin-users-heading p:last-child,
+.admin-account-form-heading p {
+  margin: 7px 0 0;
+  color: #718198;
+  font-size: 13px;
+}
+
+.admin-account-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.admin-account-form-heading,
+.admin-account-form-error {
+  grid-column: 1 / -1;
+}
+
+.admin-account-form label {
+  display: grid;
+  gap: 7px;
+  color: #40546d;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.admin-account-form input,
+.admin-account-form select {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 11px;
+  border: 1px solid #d4dee8;
+  border-radius: 8px;
+  color: #263449;
+  background: #fff;
+  font: inherit;
+  font-weight: 400;
+}
+
+.admin-account-form .meeting-form-actions {
+  grid-column: 1 / -1;
+}
+
+.admin-account-table-wrap {
+  overflow-x: auto;
+}
+
+.admin-account-table {
+  width: 100%;
+  min-width: 860px;
+  margin-top: 16px;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.admin-account-table th,
+.admin-account-table td {
+  padding: 13px 12px;
+  border-bottom: 1px solid #e8edf2;
+  vertical-align: middle;
+}
+
+.admin-account-table th {
+  color: #65768b;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.admin-account-table td {
+  color: #34465d;
+  font-size: 12px;
+}
+
+.admin-account-table td span:not(.admin-account-status) {
+  display: block;
+  margin-top: 4px;
+  color: #718198;
+}
+
+.admin-account-status {
+  display: inline-flex;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.admin-account-status.is-active {
+  color: #256348;
+  background: #eaf6ef;
+}
+
+.admin-account-status.is-inactive {
+  color: #7a5360;
+  background: #f7edf0;
+}
+
+.admin-account-actions {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+}
+
+.admin-account-actions button {
+  min-height: 34px;
+  font-size: 11px;
+}
+
+.admin-temporary-password {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 17px 19px;
+  border: 1px solid #cfe4d5;
+  border-radius: 12px;
+  color: #275b3f;
+  background: #f3fbf5;
+}
+
+.admin-temporary-password p {
+  margin: 5px 0 10px;
+  font-size: 12px;
+}
+
+.admin-temporary-password code {
+  display: inline-block;
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: #18395b;
+  background: #fff;
+  font-size: 14px;
+  user-select: all;
+}
+
+@media (max-width: 640px) {
+  .admin-users-heading,
+  .admin-temporary-password {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .admin-account-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.dashboard-page .live-status-card--overdue {
+  border-color: #f0d7d9;
+  background: #fff8f8;
+}
+
 .dashboard-page .live-tasks-panel .section-heading {
   align-items: center;
   padding-bottom: 15px;

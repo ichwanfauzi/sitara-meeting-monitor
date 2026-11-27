@@ -28,6 +28,7 @@ export interface ActionItemAssignment {
   assignee_user_id: string | null;
   assignee_display_name: string | null;
   assignee_name: string | null;
+  assignee_job_title: string | null;
   pic_origin_unit: OrganizationUnitReference | null;
   assigned_by_user_id: string;
   assignment_role: 'MAIN' | 'SUPPORTING';
@@ -244,6 +245,41 @@ export interface AuthenticatedUser {
   email: string;
   full_name: string;
   roles: string[];
+  must_change_password?: boolean;
+}
+
+export type AdminOperationalRole = 'REKTOR' | 'WAREK' | 'SEKRETARIAT' | 'MANAGER_LEGAL';
+
+export interface AdminManagedUser {
+  id: string;
+  email: string;
+  full_name: string;
+  job_title: string | null;
+  roles: string[];
+  is_active: boolean;
+  must_change_password: boolean;
+  created_at: string;
+}
+
+export interface AdminUserList {
+  items: AdminManagedUser[];
+  total: number;
+}
+
+export interface AdminUserCreateInput {
+  email: string;
+  full_name: string;
+  job_title: string | null;
+  role_code: AdminOperationalRole;
+}
+
+export interface AdminUserCreateResult {
+  user: AdminManagedUser;
+  temporary_password: string;
+}
+
+export interface AdminPasswordResetResult {
+  temporary_password: string;
 }
 
 export interface MeetingAgenda {
@@ -607,7 +643,9 @@ function isAuthenticatedUser(payload: unknown): payload is AuthenticatedUser {
     typeof payload.full_name === 'string' &&
     'roles' in payload &&
     Array.isArray(payload.roles) &&
-    payload.roles.every((role) => typeof role === 'string')
+    payload.roles.every((role) => typeof role === 'string') &&
+    (!('must_change_password' in payload) ||
+      typeof payload.must_change_password === 'boolean')
   );
 }
 
@@ -635,6 +673,54 @@ export function login(email: string, password: string): Promise<AuthenticatedUse
 
 export function logout(): Promise<void> {
   return requestJson<void>('/api/v1/auth/logout', { method: 'POST' });
+}
+
+export function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  return requestJson<void>('/api/v1/auth/change-password', {
+    method: 'POST',
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
+  });
+}
+
+export function getAdminUsers(): Promise<AdminUserList> {
+  return requestJson<AdminUserList>('/api/v1/admin/users');
+}
+
+export function createAdminUser(
+  input: AdminUserCreateInput,
+): Promise<AdminUserCreateResult> {
+  return requestJson<AdminUserCreateResult>('/api/v1/admin/users', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateAdminUserStatus(
+  userId: string,
+  isActive: boolean,
+): Promise<AdminManagedUser> {
+  return requestJson<AdminManagedUser>(
+    `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ is_active: isActive }),
+    },
+  );
+}
+
+export function resetAdminUserPassword(
+  userId: string,
+): Promise<AdminPasswordResetResult> {
+  return requestJson<AdminPasswordResetResult>(
+    `/api/v1/admin/users/${encodeURIComponent(userId)}/reset-password`,
+    { method: 'POST' },
+  );
 }
 
 export async function getActionItems(

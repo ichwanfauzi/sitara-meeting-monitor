@@ -192,6 +192,7 @@ class ActionItemAssignmentResponse(BaseModel):
     assignee_user_id: UUID | None
     assignee_display_name: str | None
     assignee_name: str | None
+    assignee_job_title: str | None
     pic_origin_unit: OrganizationUnitReference | None
     assigned_by_user_id: UUID
     assignment_role: AssignmentRole

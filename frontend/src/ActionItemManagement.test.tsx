@@ -85,6 +85,7 @@ const assignment = {
   assignee_user_id: picId,
   assignee_display_name: null,
   assignee_name: 'PIC Uji',
+  assignee_job_title: null,
   pic_origin_unit: unitSummary,
   assigned_by_user_id: secretaryId,
   assignment_role: 'MAIN' as const,

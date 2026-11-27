@@ -27,7 +27,7 @@ from app.models import meeting as meeting_models
 from app.models.auth import Role, User
 from app.models.organization import OrganizationUnit, ReportingLine, UserUnitMembership
 
-LATEST_MIGRATION = "0029_minutes_supporting_pic"
+LATEST_MIGRATION = "0031_super_admin_account_management"
 UNIT_CODE = "REKTORAT"
 UNIT_NAME = "Rektorat ITPLN"
 DEMO_UNIT_CODE = "SITARA-DEMO"
@@ -393,6 +393,7 @@ def provision_initial_users(
                     job_title=specification.job_title,
                     password_hash=hash_password(password),
                     is_active=True,
+                    must_change_password=True,
                     roles=[roles[specification.role_code]],
                 )
                 session.add(user)

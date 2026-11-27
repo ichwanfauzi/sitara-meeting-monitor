@@ -48,6 +48,9 @@ class User(Base):
     job_title: Mapped[str | None] = mapped_column(String(200))
     password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     roles: Mapped[list[Role]] = relationship(secondary=user_roles, back_populates="users")
     sessions: Mapped[list["UserSession"]] = relationship(back_populates="user")
